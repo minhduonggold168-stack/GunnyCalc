@@ -73,6 +73,99 @@ public struct BallisticsEngine: Sendable {
         return (clampedPower / 100.0) * max(0.0, maxHoldSeconds)
     }
 
+    /// Tạo danh sách 30 điểm quỹ đạo parabol ném xiên 2D chuẩn hóa trong khung `0.0 - 1.0` (chừa lề 10% xung quanh).
+    public func generateTrajectoryPoints(
+        dx: Double,
+        dy: Double,
+        angleDeg: Double,
+        wind: Double,
+        power: Double
+    ) -> [TrajectoryPoint] {
+        let stepCount = 30
+        let targetX = dx * Self.horizontalRangeScale
+        let targetY = dy * Self.verticalElevationScale
+        let distance = abs(targetX)
+
+        guard distance > 0.0001 || abs(targetY) > 0.0001 else {
+            return []
+        }
+
+        let safeAngle = min(max(angleDeg, 1.0), 89.0)
+        let theta = safeAngle * .pi / 180.0
+        let sinTheta = sin(theta)
+        let cosTheta = cos(theta)
+        let shotSign = dx >= 0.0 ? 1.0 : -1.0
+
+        let speed = max(power, 1.0)
+        let vx0 = shotSign * speed * cosTheta
+        let vy0 = speed * sinTheta
+        let ax = wind * Self.windAccelerationScale
+
+        // Giải thời gian bay T để đạn đi hết quãng đường ngang targetX dưới gia tốc gió ax:
+        // 0.5 * ax * T^2 + vx0 * T - targetX = 0
+        let flightTime: Double
+        if abs(ax) > 1e-6 {
+            let discriminant = vx0 * vx0 + 2.0 * ax * targetX
+            if discriminant >= 0.0 {
+                let sqrtDisc = sqrt(discriminant)
+                let t1 = (-vx0 + sqrtDisc) / ax
+                let t2 = (-vx0 - sqrtDisc) / ax
+                let candidates = [t1, t2].filter { $0 > 0.0001 }
+                flightTime = candidates.min() ?? max(distance / max(abs(vx0), 1.0), 0.1)
+            } else {
+                flightTime = max(distance / max(abs(vx0), 1.0), 0.1)
+            }
+        } else {
+            flightTime = max(distance / max(abs(vx0), 1.0), 0.1)
+        }
+
+        // Hiệu chỉnh trọng lực tương đương sao cho ở thời điểm T đường cong chạm chính xác (targetX, targetY).
+        let rawGravity = 2.0 * (vy0 * flightTime - targetY) / (flightTime * flightTime)
+        let effectiveGravity = rawGravity > 0.05 ? rawGravity : Self.gravity
+
+        var rawPoints: [(x: Double, y: Double)] = []
+        rawPoints.reserveCapacity(stepCount)
+
+        for i in 0..<stepCount {
+            let u = Double(i) / Double(stepCount - 1)
+            let t = u * flightTime
+            let px = vx0 * t + 0.5 * ax * t * t
+            let py = vy0 * t - 0.5 * effectiveGravity * t * t
+            rawPoints.append((px, py))
+        }
+
+        guard let minX = rawPoints.map(\.x).min(),
+              let maxX = rawPoints.map(\.x).max(),
+              let minY = rawPoints.map(\.y).min(),
+              let maxY = rawPoints.map(\.y).max() else {
+            return []
+        }
+
+        let spanX = maxX - minX
+        let spanY = maxY - minY
+        let margin = 0.10
+        let usableSpan = 1.0 - 2.0 * margin
+
+        return rawPoints.map { pt in
+            let normX: Double
+            if spanX > 1e-6 {
+                normX = margin + ((pt.x - minX) / spanX) * usableSpan
+            } else {
+                normX = 0.5
+            }
+
+            // Đảo trục Y về hệ tọa độ màn hình (y = 0 ở trên, y = 1 ở dưới) để đỉnh parabol nằm gần mép trên 0.10.
+            let normY: Double
+            if spanY > 1e-6 {
+                normY = margin + ((maxY - pt.y) / spanY) * usableSpan
+            } else {
+                normY = 0.5
+            }
+
+            return TrajectoryPoint(x: normX, y: normY)
+        }
+    }
+
     /// Tạo gói `TelemetryData` hoàn chỉnh từ kết quả quan sát hình ảnh và cấu hình hiện hành.
     public func computeTelemetry(
         dx: Double,
@@ -94,6 +187,13 @@ public struct BallisticsEngine: Sendable {
             power: power,
             maxHoldSeconds: config.maxHoldSeconds
         )
+        let trajectory = generateTrajectoryPoints(
+            dx: dx,
+            dy: dy,
+            angleDeg: effectiveAngle,
+            wind: wind * config.windFactor,
+            power: power
+        )
 
         return TelemetryData(
             dx: dx,
@@ -102,7 +202,8 @@ public struct BallisticsEngine: Sendable {
             angle: effectiveAngle,
             calculatedPower: power,
             holdSeconds: holdSeconds,
-            timestamp: timestamp
+            timestamp: timestamp,
+            trajectoryPoints: trajectory
         )
     }
 }

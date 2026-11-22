@@ -43,13 +43,13 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     @Published private(set) var isPiPSupported = AVPictureInPictureController.isPictureInPictureSupported()
     @Published private(set) var statusMessage: String?
 
-    let sampleBufferView = PiPSampleBufferView(frame: CGRect(x: 0, y: 0, width: 440, height: 148))
+    let sampleBufferView = PiPSampleBufferView(frame: CGRect(x: 0, y: 0, width: 640, height: 280))
 
     private var pipController: AVPictureInPictureController?
     private var currentTelemetry: TelemetryData = .placeholder
     private var keepAliveTimer: Timer?
 
-    private let renderSize = CGSize(width: 440, height: 148)
+    private let renderSize = CGSize(width: 640, height: 280)
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
 
     private override init() {
@@ -111,10 +111,14 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         pipController.stopPictureInPicture()
     }
 
-    func updateTelemetry(_ telemetry: TelemetryData) {
+    func updateOverlay(with telemetry: TelemetryData) {
         currentTelemetry = telemetry
         configureIfNeeded()
         enqueueHUDFrame(for: telemetry)
+    }
+
+    func updateTelemetry(_ telemetry: TelemetryData) {
+        updateOverlay(with: telemetry)
     }
 
     // MARK: - Private Audio & Keep-Alive
@@ -247,67 +251,343 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     }
 
     private func drawHUD(in rect: CGRect, telemetry: TelemetryData) {
-        UIColor(red: 0.07, green: 0.08, blue: 0.11, alpha: 1.0).setFill()
+        let cgContext = UIGraphicsGetCurrentContext()
+
+        // Nền tối bán trong suốt & viền sáng sắc nét kích thước 640 x 280.
+        UIColor(red: 0.03, green: 0.04, blue: 0.06, alpha: 0.88).setFill()
         UIRectFill(rect)
 
-        let cardRect = rect.insetBy(dx: 8, dy: 8)
-        let cardPath = UIBezierPath(roundedRect: cardRect, cornerRadius: 16)
-        UIColor(red: 0.12, green: 0.14, blue: 0.19, alpha: 1.0).setFill()
-        cardPath.fill()
-        UIColor(white: 1.0, alpha: 0.12).setStroke()
-        cardPath.lineWidth = 1.5
-        cardPath.stroke()
+        let outerRect = rect.insetBy(dx: 2, dy: 2)
+        let outerPath = UIBezierPath(roundedRect: outerRect, cornerRadius: 16)
+        UIColor(red: 0.06, green: 0.08, blue: 0.12, alpha: 0.94).setFill()
+        outerPath.fill()
 
-        // Thanh phân cách giữa Lực/Giữ và Gió/Góc.
-        let dividerX = rect.width * 0.62
+        UIColor(white: 1.0, alpha: 0.45).setStroke()
+        outerPath.lineWidth = 2.0
+        outerPath.stroke()
+
+        let innerBorderPath = UIBezierPath(roundedRect: rect.insetBy(dx: 4, dy: 4), cornerRadius: 14)
+        UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 0.22).setStroke()
+        innerBorderPath.lineWidth = 1.0
+        innerBorderPath.stroke()
+
+        // Chia rõ 2 vùng: phần trên 185px (quỹ đạo) và phần dưới 95px (thanh lực).
+        let splitY: CGFloat = 185.0
         let dividerPath = UIBezierPath()
-        dividerPath.move(to: CGPoint(x: dividerX, y: 20))
-        dividerPath.addLine(to: CGPoint(x: dividerX, y: rect.height - 20))
-        UIColor(white: 1.0, alpha: 0.10).setStroke()
-        dividerPath.lineWidth = 1
+        dividerPath.move(to: CGPoint(x: 14, y: splitY))
+        dividerPath.addLine(to: CGPoint(x: rect.width - 14, y: splitY))
+        UIColor(white: 1.0, alpha: 0.20).setStroke()
+        dividerPath.lineWidth = 1.0
         dividerPath.stroke()
 
-        let titleAttrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.systemFont(ofSize: 13, weight: .semibold),
-            .foregroundColor: UIColor(white: 0.68, alpha: 1.0)
-        ]
+        drawTrajectorySection(
+            in: CGRect(x: 0, y: 0, width: rect.width, height: splitY),
+            telemetry: telemetry,
+            cgContext: cgContext
+        )
 
-        let powerAttrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.monospacedDigitSystemFont(ofSize: 44, weight: .bold),
-            .foregroundColor: UIColor(red: 0.22, green: 0.88, blue: 0.56, alpha: 1.0)
-        ]
+        drawPowerGaugeSection(
+            in: CGRect(x: 0, y: splitY, width: rect.width, height: rect.height - splitY),
+            telemetry: telemetry,
+            cgContext: cgContext
+        )
+    }
 
-        let holdAttrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.monospacedDigitSystemFont(ofSize: 22, weight: .bold),
-            .foregroundColor: UIColor(red: 1.0, green: 0.78, blue: 0.24, alpha: 1.0)
-        ]
+    // MARK: - Phần trên (185px): Khung đường kẻ quỹ đạo đến địch
 
-        let metaLabelAttrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.systemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: UIColor(white: 0.62, alpha: 1.0)
-        ]
+    private func drawTrajectorySection(in sectionRect: CGRect, telemetry: TelemetryData, cgContext: CGContext?) {
+        let plotRect = CGRect(
+            x: 16,
+            y: 36,
+            width: sectionRect.width - 32,
+            height: sectionRect.height - 44
+        )
 
-        let metaValueAttrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.monospacedDigitSystemFont(ofSize: 22, weight: .bold),
+        // Nền vùng plot quỹ đạo & lưới tọa độ mờ.
+        let plotBg = UIBezierPath(roundedRect: plotRect, cornerRadius: 10)
+        UIColor(red: 0.04, green: 0.05, blue: 0.08, alpha: 0.85).setFill()
+        plotBg.fill()
+        UIColor(white: 1.0, alpha: 0.10).setStroke()
+        plotBg.lineWidth = 1.0
+        plotBg.stroke()
+
+        cgContext?.saveGState()
+        plotBg.addClip()
+
+        let gridPath = UIBezierPath()
+        let verticalDivisions = 8
+        for idx in 1..<verticalDivisions {
+            let gx = plotRect.minX + (plotRect.width * CGFloat(idx) / CGFloat(verticalDivisions))
+            gridPath.move(to: CGPoint(x: gx, y: plotRect.minY))
+            gridPath.addLine(to: CGPoint(x: gx, y: plotRect.maxY))
+        }
+        let horizontalDivisions = 4
+        for idx in 1..<horizontalDivisions {
+            let gy = plotRect.minY + (plotRect.height * CGFloat(idx) / CGFloat(horizontalDivisions))
+            gridPath.move(to: CGPoint(x: plotRect.minX, y: gy))
+            gridPath.addLine(to: CGPoint(x: plotRect.maxX, y: gy))
+        }
+        UIColor(white: 1.0, alpha: 0.07).setStroke()
+        gridPath.lineWidth = 0.8
+        gridPath.stroke()
+
+        // Xác định danh sách điểm quỹ đạo hoặc điểm người chơi / mục tiêu mặc định.
+        let mappedPoints: [CGPoint] = telemetry.trajectoryPoints.map { pt in
+            CGPoint(
+                x: plotRect.minX + CGFloat(pt.x) * plotRect.width,
+                y: plotRect.minY + CGFloat(pt.y) * plotRect.height
+            )
+        }
+
+        let playerPoint: CGPoint
+        let targetPoint: CGPoint
+        if let first = mappedPoints.first, let last = mappedPoints.last, mappedPoints.count >= 2 {
+            playerPoint = first
+            targetPoint = last
+        } else {
+            let shootsRight = telemetry.dx >= 0.0
+            let leftX = plotRect.minX + plotRect.width * 0.12
+            let rightX = plotRect.minX + plotRect.width * 0.88
+            let baselineY = plotRect.minY + plotRect.height * 0.78
+            playerPoint = CGPoint(x: shootsRight ? leftX : rightX, y: baselineY)
+            let clampedDy = min(max(telemetry.dy, -0.5), 0.5)
+            let targetY = min(max(baselineY - CGFloat(clampedDy) * plotRect.height * 0.7, plotRect.minY + 18), plotRect.maxY - 14)
+            targetPoint = CGPoint(x: shootsRight ? rightX : leftX, y: targetY)
+        }
+
+        // Đường mặt đất ngang tại cao độ người chơi.
+        let groundY = min(max(playerPoint.y, plotRect.minY + 14), plotRect.maxY - 10)
+        let groundPath = UIBezierPath()
+        groundPath.move(to: CGPoint(x: plotRect.minX, y: groundY))
+        groundPath.addLine(to: CGPoint(x: plotRect.maxX, y: groundY))
+        UIColor(red: 0.35, green: 0.75, blue: 0.55, alpha: 0.32).setStroke()
+        groundPath.lineWidth = 1.4
+        groundPath.stroke()
+
+        // Đường cong parabol nét đứt màu xanh lá neon (#00FF88).
+        if mappedPoints.count >= 2 {
+            let curvePath = UIBezierPath()
+            curvePath.move(to: mappedPoints[0])
+            for pt in mappedPoints.dropFirst() {
+                curvePath.addLine(to: pt)
+            }
+
+            let dashPattern: [CGFloat] = [8.0, 5.0]
+            curvePath.lineCapStyle = .round
+            curvePath.setLineDash(dashPattern, count: dashPattern.count, phase: 0)
+
+            // Lớp phát sáng nhẹ bên ngoài.
+            UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 0.28).setStroke()
+            curvePath.lineWidth = 5.5
+            curvePath.stroke()
+
+            // Đường nét đứt neon chính sắc nét.
+            UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 1.0).setStroke()
+            curvePath.lineWidth = 2.4
+            curvePath.stroke()
+        }
+
+        // Điểm người chơi: hình tròn xanh dương phát sáng.
+        let playerGlow = UIBezierPath(arcCenter: playerPoint, radius: 11, startAngle: 0, endAngle: .pi * 2, clockwise: true)
+        UIColor(red: 0.18, green: 0.62, blue: 1.0, alpha: 0.32).setFill()
+        playerGlow.fill()
+
+        let playerCircle = UIBezierPath(arcCenter: playerPoint, radius: 6, startAngle: 0, endAngle: .pi * 2, clockwise: true)
+        UIColor(red: 0.16, green: 0.65, blue: 1.0, alpha: 1.0).setFill()
+        playerCircle.fill()
+        UIColor.white.setStroke()
+        playerCircle.lineWidth = 1.6
+        playerCircle.stroke()
+
+        // Điểm mục tiêu địch: hình tròn đỏ có tâm ngắm.
+        let enemyGlow = UIBezierPath(arcCenter: targetPoint, radius: 11, startAngle: 0, endAngle: .pi * 2, clockwise: true)
+        UIColor(red: 1.0, green: 0.22, blue: 0.22, alpha: 0.28).setFill()
+        enemyGlow.fill()
+
+        let enemyRing = UIBezierPath(arcCenter: targetPoint, radius: 6.5, startAngle: 0, endAngle: .pi * 2, clockwise: true)
+        UIColor(red: 1.0, green: 0.24, blue: 0.24, alpha: 0.95).setFill()
+        enemyRing.fill()
+        UIColor.white.setStroke()
+        enemyRing.lineWidth = 1.4
+        enemyRing.stroke()
+
+        let reticlePath = UIBezierPath()
+        let arm: CGFloat = 10.5
+        reticlePath.move(to: CGPoint(x: targetPoint.x - arm, y: targetPoint.y))
+        reticlePath.addLine(to: CGPoint(x: targetPoint.x + arm, y: targetPoint.y))
+        reticlePath.move(to: CGPoint(x: targetPoint.x, y: targetPoint.y - arm))
+        reticlePath.addLine(to: CGPoint(x: targetPoint.x, y: targetPoint.y + arm))
+        UIColor(red: 1.0, green: 0.85, blue: 0.85, alpha: 0.95).setStroke()
+        reticlePath.lineWidth = 1.2
+        reticlePath.stroke()
+
+        cgContext?.restoreGState()
+
+        // Thanh thông số gọn ở góc trên: Góc | Gió | Giữ.
+        let windSign = telemetry.wind > 0 ? "+" : ""
+        let headerText = String(
+            format: "Góc: %.0f°  |  Gió: %@%.1f  |  Giữ: %.2fs",
+            telemetry.angle,
+            windSign,
+            telemetry.wind,
+            telemetry.holdSeconds
+        )
+        let headerAttrs: [NSAttributedString.Key: Any] = [
+            .font: UIFont.monospacedDigitSystemFont(ofSize: 13.5, weight: .bold),
             .foregroundColor: UIColor.white
         ]
+        let attrHeader = NSAttributedString(string: headerText, attributes: headerAttrs)
+        let headerSize = attrHeader.size()
+        let pillRect = CGRect(
+            x: 16,
+            y: 8,
+            width: min(sectionRect.width - 32, headerSize.width + 20),
+            height: 22
+        )
+        let pillPath = UIBezierPath(roundedRect: pillRect, cornerRadius: 7)
+        UIColor(red: 0.12, green: 0.15, blue: 0.22, alpha: 0.95).setFill()
+        pillPath.fill()
+        UIColor(white: 1.0, alpha: 0.18).setStroke()
+        pillPath.lineWidth = 1.0
+        pillPath.stroke()
 
-        NSString(string: "LỰC BẮN").draw(at: CGPoint(x: 24, y: 20), withAttributes: titleAttrs)
-        NSString(string: String(format: "%.1f", telemetry.calculatedPower))
-            .draw(at: CGPoint(x: 22, y: 38), withAttributes: powerAttrs)
+        attrHeader.draw(at: CGPoint(x: pillRect.minX + 10, y: pillRect.minY + (pillRect.height - headerSize.height) / 2.0))
+    }
 
-        let holdText = String(format: "GIỮ: %.2fs", telemetry.holdSeconds)
-        NSString(string: holdText).draw(at: CGPoint(x: 24, y: 96), withAttributes: holdAttrs)
+    // MARK: - Phần dưới (95px): Thanh vạch lực bắn trực quan (0 - 100)
 
-        let rightX = dividerX + 18
-        let windSign = telemetry.wind > 0 ? "+" : ""
-        let windText = String(format: "%@%.1f", windSign, telemetry.wind)
-        NSString(string: "GIÓ").draw(at: CGPoint(x: rightX, y: 22), withAttributes: metaLabelAttrs)
-        NSString(string: windText).draw(at: CGPoint(x: rightX, y: 38), withAttributes: metaValueAttrs)
+    private func drawPowerGaugeSection(in sectionRect: CGRect, telemetry: TelemetryData, cgContext: CGContext?) {
+        let barMarginX: CGFloat = 22.0
+        let barRect = CGRect(
+            x: barMarginX,
+            y: sectionRect.minY + 42.0,
+            width: sectionRect.width - barMarginX * 2.0,
+            height: 22.0
+        )
 
-        let angleText = String(format: "%.0f°", telemetry.angle)
-        NSString(string: "GÓC").draw(at: CGPoint(x: rightX, y: 78), withAttributes: metaLabelAttrs)
-        NSString(string: angleText).draw(at: CGPoint(x: rightX, y: 94), withAttributes: metaValueAttrs)
+        let clampedPower = CGFloat(min(max(telemetry.calculatedPower, 0.0), 100.0))
+        let fillWidth = barRect.width * (clampedPower / 100.0)
+        let markerX = barRect.minX + fillWidth
+
+        // Nền thanh lực tối.
+        let trackPath = UIBezierPath(roundedRect: barRect, cornerRadius: 6)
+        UIColor(red: 0.12, green: 0.14, blue: 0.19, alpha: 1.0).setFill()
+        trackPath.fill()
+
+        // Tô màu từ 0 đến calculatedPower bằng gradient Vàng -> Cam -> Đỏ.
+        if fillWidth > 0.5, let cgContext {
+            cgContext.saveGState()
+            let fillClipRect = CGRect(x: barRect.minX, y: barRect.minY, width: fillWidth, height: barRect.height)
+            trackPath.addClip()
+            cgContext.clip(to: fillClipRect)
+
+            let colors = [
+                UIColor(red: 1.0, green: 0.90, blue: 0.12, alpha: 1.0).cgColor,
+                UIColor(red: 1.0, green: 0.52, blue: 0.05, alpha: 1.0).cgColor,
+                UIColor(red: 1.0, green: 0.16, blue: 0.05, alpha: 1.0).cgColor
+            ] as CFArray
+            let locations: [CGFloat] = [0.0, 0.55, 1.0]
+            if let gradient = CGGradient(colorsSpace: rgbColorSpace, colors: colors, locations: locations) {
+                cgContext.drawLinearGradient(
+                    gradient,
+                    start: CGPoint(x: barRect.minX, y: barRect.midY),
+                    end: CGPoint(x: barRect.maxX, y: barRect.midY),
+                    options: []
+                )
+            }
+            cgContext.restoreGState()
+        }
+
+        // Viền ngoài thanh lực.
+        UIColor(white: 1.0, alpha: 0.35).setStroke()
+        trackPath.lineWidth = 1.2
+        trackPath.stroke()
+
+        // Chia vạch nhỏ mỗi 5 đơn vị và vạch lớn + nhãn tại 0, 25, 50, 75, 100.
+        let tickLabelAttrs: [NSAttributedString.Key: Any] = [
+            .font: UIFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: UIColor(white: 0.78, alpha: 1.0)
+        ]
+
+        for step in stride(from: 0, through: 100, by: 5) {
+            let ratio = CGFloat(step) / 100.0
+            let tx = barRect.minX + barRect.width * ratio
+            let isMajor = step % 25 == 0
+
+            let tickPath = UIBezierPath()
+            if isMajor {
+                tickPath.move(to: CGPoint(x: tx, y: barRect.minY))
+                tickPath.addLine(to: CGPoint(x: tx, y: barRect.maxY + 4))
+                UIColor(white: 1.0, alpha: 0.72).setStroke()
+                tickPath.lineWidth = 1.4
+                tickPath.stroke()
+
+                let label = NSAttributedString(string: "\(step)", attributes: tickLabelAttrs)
+                let labelSize = label.size()
+                let labelX: CGFloat
+                if step == 0 {
+                    labelX = tx
+                } else if step == 100 {
+                    labelX = tx - labelSize.width
+                } else {
+                    labelX = tx - labelSize.width / 2.0
+                }
+                label.draw(at: CGPoint(x: labelX, y: barRect.maxY + 6))
+            } else {
+                tickPath.move(to: CGPoint(x: tx, y: barRect.maxY - 6))
+                tickPath.addLine(to: CGPoint(x: tx, y: barRect.maxY))
+                UIColor(white: 1.0, alpha: 0.25).setStroke()
+                tickPath.lineWidth = 0.8
+                tickPath.stroke()
+            }
+        }
+
+        // Vạch chỉ thị dọc màu trắng/đỏ nổi bật tại vị trí lực cần bắn.
+        let markerTop = barRect.minY - 5
+        let markerBottom = barRect.maxY + 5
+
+        let redMarkerPath = UIBezierPath()
+        redMarkerPath.move(to: CGPoint(x: markerX, y: markerTop))
+        redMarkerPath.addLine(to: CGPoint(x: markerX, y: markerBottom))
+        redMarkerPath.lineCapStyle = .round
+        UIColor(red: 1.0, green: 0.18, blue: 0.18, alpha: 0.95).setStroke()
+        redMarkerPath.lineWidth = 5.0
+        redMarkerPath.stroke()
+
+        let whiteMarkerPath = UIBezierPath()
+        whiteMarkerPath.move(to: CGPoint(x: markerX, y: markerTop + 1))
+        whiteMarkerPath.addLine(to: CGPoint(x: markerX, y: markerBottom - 1))
+        whiteMarkerPath.lineCapStyle = .round
+        UIColor.white.setStroke()
+        whiteMarkerPath.lineWidth = 2.2
+        whiteMarkerPath.stroke()
+
+        // Con số lực lớn ngay phía trên vạch chỉ thị.
+        let powerText = String(format: "%.1f", clampedPower)
+        let powerAttrs: [NSAttributedString.Key: Any] = [
+            .font: UIFont.monospacedDigitSystemFont(ofSize: 24, weight: .heavy),
+            .foregroundColor: UIColor.white
+        ]
+        let attrPower = NSAttributedString(string: powerText, attributes: powerAttrs)
+        let powerSize = attrPower.size()
+        let desiredPowerX = markerX - powerSize.width / 2.0
+        let clampedPowerX = min(max(desiredPowerX, barRect.minX), barRect.maxX - powerSize.width)
+        let powerY = sectionRect.minY + 7.0
+
+        let badgeRect = CGRect(
+            x: clampedPowerX - 7,
+            y: powerY - 1,
+            width: powerSize.width + 14,
+            height: powerSize.height + 2
+        )
+        let badgePath = UIBezierPath(roundedRect: badgeRect, cornerRadius: 6)
+        UIColor(red: 0.88, green: 0.18, blue: 0.14, alpha: 0.92).setFill()
+        badgePath.fill()
+        UIColor(white: 1.0, alpha: 0.85).setStroke()
+        badgePath.lineWidth = 1.0
+        badgePath.stroke()
+
+        attrPower.draw(at: CGPoint(x: clampedPowerX, y: powerY))
     }
 }
 

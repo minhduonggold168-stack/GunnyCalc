@@ -2,13 +2,12 @@ import ReplayKit
 import SwiftUI
 import UIKit
 
-/// Quản lý trạng thái dùng chung trên màn hình chính và đồng bộ hóa với `SharedIPC` + `PiPOverlayManager`.
+/// Quản lý trạng thái dùng chung và đồng bộ hóa với `SharedIPC` + `PiPOverlayManager`.
 @MainActor
 final class GunnyCalcViewModel: ObservableObject {
     @Published var telemetry: TelemetryData
     @Published var ballisticsConfig: BallisticsConfig
     @Published var roiConfig: ROIConfig
-    @Published var lastUpdatedText: String = "Chưa có khung hình ReplayKit"
 
     private let engine = BallisticsEngine()
     private let ipc = SharedIPC.shared
@@ -29,7 +28,6 @@ final class GunnyCalcViewModel: ObservableObject {
         self.ballisticsConfig = savedConfig
         self.roiConfig = savedROI
         self.telemetry = savedTelemetry
-        updateTimestampLabel(for: savedTelemetry)
     }
 
     func startListening() {
@@ -60,7 +58,7 @@ final class GunnyCalcViewModel: ObservableObject {
         if let latest = ipc.loadTelemetry() {
             applyTelemetry(latest)
         } else {
-            PiPOverlayManager.shared.updateTelemetry(telemetry)
+            PiPOverlayManager.shared.updateOverlay(with: telemetry)
         }
     }
 
@@ -73,6 +71,10 @@ final class GunnyCalcViewModel: ObservableObject {
     func enableOCRAngleMode() {
         ballisticsConfig.useOCRAngle = true
         persistAndRecalculate()
+    }
+
+    func saveConfigOnly() {
+        ipc.saveBallisticsConfig(ballisticsConfig)
     }
 
     func persistAndRecalculate() {
@@ -89,329 +91,473 @@ final class GunnyCalcViewModel: ObservableObject {
         )
 
         telemetry = updated
-        PiPOverlayManager.shared.updateTelemetry(updated)
+        PiPOverlayManager.shared.updateOverlay(with: updated)
     }
 
     private func applyTelemetry(_ latest: TelemetryData?) {
         guard let latest else { return }
         telemetry = latest
-        updateTimestampLabel(for: latest)
-        PiPOverlayManager.shared.updateTelemetry(latest)
-    }
-
-    private func updateTimestampLabel(for data: TelemetryData) {
-        guard data.timestamp > 0 else {
-            lastUpdatedText = "Chờ dữ liệu từ ReplayKit"
-            return
-        }
-        let date = Date(timeIntervalSince1970: data.timestamp)
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        lastUpdatedText = "Cập nhật lúc \(formatter.string(from: date))"
+        PiPOverlayManager.shared.updateOverlay(with: latest)
     }
 }
 
-/// Màn hình chính Dark Mode của `GunnyCalcApp`.
+/// Màn hình chính tối giản (Minimalist Dark Mode) gồm phần Giới thiệu/Hướng dẫn ở nửa trên
+/// và đúng 3 nút điều khiển cốt lõi ở nửa dưới.
 struct ContentView: View {
     @ObservedObject var viewModel: GunnyCalcViewModel
     @ObservedObject var pipManager: PiPOverlayManager = .shared
 
     @State private var isShowingCalibrator = false
-    @State private var isSwitchGuideExpanded = true
+    @State private var isShowingSettings = false
+    @State private var launchFailureMessage: String?
+
+    private let neonGreen = Color(red: 0.0, green: 1.0, blue: 0.533)
+
+    var body: some View {
+        ZStack {
+            // Giữ AVSampleBufferDisplayLayer gắn trong hệ thống phân cấp view để PiP chạy nền ổn định.
+            PiPHostView(manager: pipManager)
+                .frame(width: 240, height: 105)
+                .opacity(0.01)
+                .allowsHitTesting(false)
+
+            // Nền tối tối giản kèm ánh sáng nhẹ phía trên.
+            LinearGradient(
+                colors: [
+                    Color(red: 0.04, green: 0.06, blue: 0.09),
+                    Color(red: 0.02, green: 0.03, blue: 0.05)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                topBar
+
+                Spacer(minLength: 8)
+
+                heroAndGuideSection
+
+                Spacer(minLength: 20)
+
+                compactControlButtonsSection
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 8)
+            .padding(.bottom, 22)
+        }
+        .preferredColorScheme(.dark)
+        .sheet(isPresented: $isShowingCalibrator) {
+            ROICalibratorView { updatedROI in
+                viewModel.roiConfig = updatedROI
+            }
+        }
+        .sheet(isPresented: $isShowingSettings) {
+            QuickSettingsSheetView(viewModel: viewModel)
+        }
+        .alert("Không thể mở Gunny Mobi", isPresented: Binding(
+            get: { launchFailureMessage != nil },
+            set: { if !$0 { launchFailureMessage = nil } }
+        )) {
+            Button("Mở Cài đặt") {
+                launchFailureMessage = nil
+                isShowingSettings = true
+            }
+            Button("Đóng", role: .cancel) {
+                launchFailureMessage = nil
+            }
+        } message: {
+            Text(launchFailureMessage ?? "")
+        }
+    }
+
+    // MARK: - Top Bar (Icon bánh răng góc trên bên phải)
+
+    private var topBar: some View {
+        HStack {
+            Spacer()
+            Button {
+                isShowingSettings = true
+            } label: {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.82))
+                    .frame(width: 38, height: 38)
+                    .background(Color.white.opacity(0.08))
+                    .clipShape(Circle())
+                    .overlay(
+                        Circle()
+                            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                    )
+            }
+            .accessibilityLabel("Cài đặt nâng cao")
+        }
+    }
+
+    // MARK: - 1. Nửa trên: Giới thiệu & Hướng dẫn nhanh
+
+    private var heroAndGuideSection: some View {
+        VStack(spacing: 16) {
+            // Biểu tượng tâm ngắm phát sáng.
+            ZStack {
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [neonGreen.opacity(0.32), Color.clear],
+                            center: .center,
+                            startRadius: 4,
+                            endRadius: 56
+                        )
+                    )
+                    .frame(width: 112, height: 112)
+
+                Circle()
+                    .fill(Color(red: 0.08, green: 0.11, blue: 0.16))
+                    .frame(width: 72, height: 72)
+                    .overlay(
+                        Circle()
+                            .stroke(neonGreen.opacity(0.65), lineWidth: 1.5)
+                    )
+                    .shadow(color: neonGreen.opacity(0.45), radius: 14)
+
+                Image(systemName: "scope")
+                    .font(.system(size: 32, weight: .semibold))
+                    .foregroundStyle(neonGreen)
+            }
+
+            VStack(spacing: 8) {
+                Text("Gunny Aim Assist")
+                    .font(.system(size: 26, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(neonGreen)
+                        .frame(width: 6, height: 6)
+                    Text("An toàn • Không can thiệp game")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.white.opacity(0.78))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                .background(Color.white.opacity(0.07))
+                .clipShape(Capsule())
+                .overlay(
+                    Capsule()
+                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
+            }
+
+            Text("Tự động phân tích góc, gió và khoảng cách từ màn hình để vẽ đường cong parabol cùng vạch lực bắn chuẩn xác qua cửa sổ nổi Picture-in-Picture.")
+                .font(.subheadline)
+                .foregroundStyle(Color.white.opacity(0.66))
+                .multilineTextAlignment(.center)
+                .lineSpacing(3)
+                .padding(.horizontal, 6)
+
+            // Thẻ hướng dẫn 3 bước siêu gọn.
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    stepPill("1. Căn khung Minimap")
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.secondary)
+                    stepPill("2. Bấm Phát màn hình")
+                }
+
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.secondary)
+                    stepPill("3. Bấm Bật Ngắm & Vào Game", highlight: true)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(Color.white.opacity(0.04))
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(Color.white.opacity(0.10), lineWidth: 1)
+            )
+        }
+    }
+
+    private func stepPill(_ text: String, highlight: Bool = false) -> some View {
+        Text(text)
+            .font(.caption.weight(.semibold))
+            .lineLimit(1)
+            .minimumScaleFactor(0.85)
+            .foregroundStyle(highlight ? neonGreen : Color.white.opacity(0.88))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(highlight ? neonGreen.opacity(0.14) : Color.white.opacity(0.06))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    // MARK: - 2. Nửa dưới: Khu vực Điều khiển tinh gọn (Duy nhất 3 nút bấm)
+
+    private var compactControlButtonsSection: some View {
+        VStack(spacing: 12) {
+            // Nút 1 (Nền tối viền sáng): Căn khung Minimap & Gió
+            Button {
+                isShowingCalibrator = true
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "crop")
+                        .font(.system(size: 17, weight: .semibold))
+                    Text("Căn khung Minimap & Gió")
+                        .font(.system(size: 16, weight: .semibold))
+                }
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 54)
+                .background(Color(red: 0.09, green: 0.11, blue: 0.15))
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .stroke(Color.white.opacity(0.32), lineWidth: 1.2)
+                )
+            }
+
+            // Nút 2 (Nền xanh dương): Bật Phát Màn Hình (ReplayKit) phủ toàn bộ nút
+            ZStack {
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color(red: 0.08, green: 0.44, blue: 0.94), Color(red: 0.05, green: 0.32, blue: 0.78)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14)
+                            .stroke(Color.cyan.opacity(0.45), lineWidth: 1)
+                    )
+
+                HStack(spacing: 10) {
+                    Image(systemName: "record.circle.fill")
+                        .font(.system(size: 18, weight: .bold))
+                    Text("Bật Phát Màn Hình (ReplayKit)")
+                        .font(.system(size: 16, weight: .bold))
+                }
+                .foregroundStyle(.white)
+                .allowsHitTesting(false)
+
+                BroadcastPickerView(preferredExtension: "com.gunny.pipcalc.BroadcastExtension")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .opacity(0.02)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 54)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+
+            // Nút 3 (Nút chính nổi bật màu xanh lá neon): Bật Ngắm & Chuyển Sang Gunny Mobi
+            Button {
+                launchAimAndSwitchToGame()
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "scope")
+                        .font(.system(size: 19, weight: .heavy))
+                    Text("Bật Ngắm & Chuyển Sang Gunny Mobi")
+                        .font(.system(size: 16, weight: .heavy))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.84)
+                }
+                .foregroundStyle(Color.black)
+                .frame(maxWidth: .infinity)
+                .frame(height: 58)
+                .background(
+                    LinearGradient(
+                        colors: [neonGreen, Color(red: 0.0, green: 0.84, blue: 0.44)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 15))
+                .shadow(color: neonGreen.opacity(0.38), radius: 14, y: 4)
+            }
+        }
+    }
+
+    // MARK: - Actions
+
+    private func launchAimAndSwitchToGame() {
+        pipManager.startPiP()
+
+        let rawScheme = viewModel.ballisticsConfig.gameURLScheme
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            guard !rawScheme.isEmpty, let url = URL(string: rawScheme) else {
+                launchFailureMessage = "URL Scheme không hợp lệ. Bạn có thể gạt thanh Home để tự chuyển sang Gunny Mobi hoặc chỉnh lại URL Scheme trong mục Cài đặt."
+                return
+            }
+
+            UIApplication.shared.open(url, options: [:]) { success in
+                if !success {
+                    DispatchQueue.main.async {
+                        launchFailureMessage = "Không mở được game bằng scheme \"\(rawScheme)\". Hãy gạt thanh Home để chuyển sang Gunny Mobi hoặc nhập URL Scheme tùy chỉnh trong Cài đặt."
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Cửa sổ cài đặt phụ (Mở từ nút bánh răng góc trên bên phải)
+
+private struct QuickSettingsSheetView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var viewModel: GunnyCalcViewModel
 
     private let presetAngles: [Double] = [20, 30, 50, 65]
+    private let presetURLSchemes: [String] = ["gunnymobi://", "vnggunny://", "garena://"]
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                // Giữ AVSampleBufferDisplayLayer trong cây view hoạt động để PiP chạy nền ổn định.
-                PiPHostView(manager: pipManager)
-                    .frame(width: 220, height: 74)
-                    .opacity(0.01)
-                    .allowsHitTesting(false)
+            Form {
+                Section("Góc bắn mặc định") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(presetAngles, id: \.self) { angle in
+                                let isSelected = !viewModel.ballisticsConfig.useOCRAngle
+                                    && abs(viewModel.ballisticsConfig.selectedAngle - angle) < 0.1
+                                Button {
+                                    viewModel.selectFixedAngle(angle)
+                                } label: {
+                                    Text("\(Int(angle))°")
+                                        .font(.subheadline.weight(.bold))
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 8)
+                                        .background(isSelected ? Color.orange : Color.white.opacity(0.10))
+                                        .foregroundStyle(isSelected ? .black : .white)
+                                        .clipShape(RoundedRectangle(cornerRadius: 9))
+                                }
+                                .buttonStyle(.plain)
+                            }
 
-                ScrollView(showsIndicators: false) {
-                    VStack(spacing: 16) {
-                        activationSection
-                        liveTelemetrySection
-                        quickTuningSection
-                        calibratorAndGuideSection
+                            Button {
+                                viewModel.enableOCRAngleMode()
+                            } label: {
+                                Text("Tự đọc OCR")
+                                    .font(.subheadline.weight(.bold))
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(viewModel.ballisticsConfig.useOCRAngle ? Color.cyan : Color.white.opacity(0.10))
+                                    .foregroundStyle(viewModel.ballisticsConfig.useOCRAngle ? .black : .white)
+                                    .clipShape(RoundedRectangle(cornerRadius: 9))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.vertical, 4)
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
+                }
+
+                Section("Hiệu chỉnh đạn đạo") {
+                    sliderRow(
+                        title: "Hệ số lực",
+                        value: Binding(
+                            get: { viewModel.ballisticsConfig.powerFactor },
+                            set: {
+                                viewModel.ballisticsConfig.powerFactor = $0
+                                viewModel.persistAndRecalculate()
+                            }
+                        ),
+                        range: 0.50...2.00,
+                        format: "%.2fx",
+                        tint: .green
+                    )
+
+                    sliderRow(
+                        title: "Hệ số gió",
+                        value: Binding(
+                            get: { viewModel.ballisticsConfig.windFactor },
+                            set: {
+                                viewModel.ballisticsConfig.windFactor = $0
+                                viewModel.persistAndRecalculate()
+                            }
+                        ),
+                        range: 0.00...2.50,
+                        format: "%.2fx",
+                        tint: .cyan
+                    )
+
+                    sliderRow(
+                        title: "Thời gian giữ Full 100",
+                        value: Binding(
+                            get: { viewModel.ballisticsConfig.maxHoldSeconds },
+                            set: {
+                                viewModel.ballisticsConfig.maxHoldSeconds = $0
+                                viewModel.persistAndRecalculate()
+                            }
+                        ),
+                        range: 1.00...4.00,
+                        format: "%.2fs",
+                        tint: .yellow
+                    )
+                }
+
+                Section("URL Scheme mở game") {
+                    TextField(
+                        "gunnymobi://",
+                        text: Binding(
+                            get: { viewModel.ballisticsConfig.gameURLScheme },
+                            set: {
+                                viewModel.ballisticsConfig.gameURLScheme = $0
+                                viewModel.saveConfigOnly()
+                            }
+                        )
+                    )
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .keyboardType(.URL)
+                    .font(.system(.subheadline, design: .monospaced))
+
+                    HStack(spacing: 8) {
+                        ForEach(presetURLSchemes, id: \.self) { scheme in
+                            let isSelected = viewModel.ballisticsConfig.gameURLScheme == scheme
+                            Button {
+                                viewModel.ballisticsConfig.gameURLScheme = scheme
+                                viewModel.saveConfigOnly()
+                            } label: {
+                                Text(scheme)
+                                    .font(.caption2.monospaced())
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(isSelected ? Color.green.opacity(0.28) : Color.white.opacity(0.08))
+                                    .foregroundStyle(isSelected ? Color.green : .secondary)
+                                    .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
                 }
             }
-            .background(Color(red: 0.05, green: 0.06, blue: 0.09).ignoresSafeArea())
-            .navigationTitle("GunnyCalc")
+            .navigationTitle("Cài đặt nhanh")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Text("iOS 16 - 18.7+")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Color.white.opacity(0.08))
-                        .clipShape(Capsule())
+                    Button("Xong") {
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
                 }
             }
-            .sheet(isPresented: $isShowingCalibrator) {
-                ROICalibratorView { updatedROI in
-                    viewModel.roiConfig = updatedROI
-                }
-            }
+            .preferredColorScheme(.dark)
         }
-        .preferredColorScheme(.dark)
     }
 
-    // MARK: - 1. Khu vực kích hoạt
-
-    private var activationSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionHeader(title: "Kích hoạt hỗ trợ", icon: "bolt.circle.fill", tint: .green)
-
-            HStack(spacing: 10) {
-                Button {
-                    pipManager.togglePiP()
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: pipManager.isPiPActive ? "pip.exit" : "pip.enter")
-                            .font(.subheadline.weight(.bold))
-                        Text(pipManager.isPiPActive ? "Tắt Cửa Sổ PiP" : "Bật Cửa Sổ Nổi PiP")
-                            .font(.subheadline.weight(.semibold))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.85)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 48)
-                    .background(pipManager.isPiPActive ? Color.orange.opacity(0.25) : Color.green.opacity(0.24))
-                    .foregroundStyle(pipManager.isPiPActive ? Color.orange : Color.green)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(pipManager.isPiPActive ? Color.orange.opacity(0.6) : Color.green.opacity(0.6), lineWidth: 1)
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                }
-
-                // Tích hợp RPSystemBroadcastPickerView ngay trong app.
-                ZStack {
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(Color.blue.opacity(0.24))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(Color.blue.opacity(0.6), lineWidth: 1)
-                        )
-
-                    HStack(spacing: 8) {
-                        Image(systemName: "record.circle.fill")
-                            .font(.subheadline.weight(.bold))
-                        Text("Phát màn hình")
-                            .font(.subheadline.weight(.semibold))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.85)
-                    }
-                    .foregroundStyle(Color.cyan)
-                    .allowsHitTesting(false)
-
-                    BroadcastPickerView(preferredExtension: "com.gunny.pipcalc.BroadcastExtension")
-                        .opacity(0.02)
-                }
-                .frame(maxWidth: .infinity)
-                .frame(height: 48)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-            }
-
-            if let message = pipManager.statusMessage {
-                Text(message)
-                    .font(.caption)
-                    .foregroundStyle(.yellow)
-            }
-        }
-        .cardStyle()
-    }
-
-    // MARK: - 2. Bảng hiển thị trực tiếp thông số
-
-    private var liveTelemetrySection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                sectionHeader(title: "Thông số thời gian thực", icon: "waveform.path.ecg", tint: .cyan)
-                Spacer()
-                Text(viewModel.lastUpdatedText)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-
-            LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
-                telemetryTile(
-                    title: "LỰC BẮN",
-                    value: String(format: "%.1f", viewModel.telemetry.calculatedPower),
-                    unit: "/ 100",
-                    accent: Color(red: 0.22, green: 0.88, blue: 0.56)
-                )
-
-                telemetryTile(
-                    title: "THỜI GIAN GIỮ",
-                    value: String(format: "%.2f", viewModel.telemetry.holdSeconds),
-                    unit: "giây",
-                    accent: Color(red: 1.0, green: 0.78, blue: 0.24)
-                )
-
-                telemetryTile(
-                    title: "GIÓ",
-                    value: String(format: "%@%.1f", viewModel.telemetry.wind > 0 ? "+" : "", viewModel.telemetry.wind),
-                    unit: viewModel.telemetry.wind == 0 ? "lặng" : (viewModel.telemetry.wind > 0 ? "thuận/phải" : "ngược/trái"),
-                    accent: .cyan
-                )
-
-                telemetryTile(
-                    title: "GÓC BẮN",
-                    value: String(format: "%.0f°", viewModel.telemetry.angle),
-                    unit: viewModel.ballisticsConfig.useOCRAngle ? "Tự đọc OCR" : "Cố định",
-                    accent: .orange
-                )
-            }
-
-            HStack {
-                Text(String(format: "dx: %.3f", viewModel.telemetry.dx))
-                Spacer()
-                Text(String(format: "dy: %.3f", viewModel.telemetry.dy))
-                Spacer()
-                Text("App Group: \(AppGroupConfig.suiteName)")
-            }
-            .font(.system(.caption2, design: .monospaced))
-            .foregroundStyle(.secondary)
-        }
-        .cardStyle()
-    }
-
-    private func telemetryTile(title: String, value: String, unit: String, accent: Color) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(value)
-                    .font(.system(size: 28, weight: .bold, design: .rounded).monospacedDigit())
-                    .foregroundStyle(accent)
-                Text(unit)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(Color.white.opacity(0.05))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-    }
-
-    // MARK: - 3. Bộ điều chỉnh nhanh
-
-    private var quickTuningSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            sectionHeader(title: "Bộ điều chỉnh nhanh", icon: "slider.horizontal.3", tint: .orange)
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Chọn nhanh góc bắn")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
-
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(presetAngles, id: \.self) { angle in
-                            let isSelected = !viewModel.ballisticsConfig.useOCRAngle
-                                && abs(viewModel.ballisticsConfig.selectedAngle - angle) < 0.1
-                            Button {
-                                viewModel.selectFixedAngle(angle)
-                            } label: {
-                                Text("\(Int(angle))°")
-                                    .font(.subheadline.weight(.bold))
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 8)
-                                    .background(isSelected ? Color.orange : Color.white.opacity(0.08))
-                                    .foregroundStyle(isSelected ? .black : .white)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                            }
-                        }
-
-                        Button {
-                            viewModel.enableOCRAngleMode()
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "text.viewfinder")
-                                Text("Tự đọc OCR")
-                            }
-                            .font(.subheadline.weight(.bold))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .background(viewModel.ballisticsConfig.useOCRAngle ? Color.cyan : Color.white.opacity(0.08))
-                            .foregroundStyle(viewModel.ballisticsConfig.useOCRAngle ? .black : .white)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                        }
-                    }
-                }
-            }
-
-            Divider().overlay(Color.white.opacity(0.1))
-
-            tuningSlider(
-                title: "Hệ số lực",
-                value: Binding(
-                    get: { viewModel.ballisticsConfig.powerFactor },
-                    set: {
-                        viewModel.ballisticsConfig.powerFactor = $0
-                        viewModel.persistAndRecalculate()
-                    }
-                ),
-                range: 0.50...2.00,
-                step: 0.05,
-                format: "%.2fx",
-                tint: .green
-            )
-
-            tuningSlider(
-                title: "Hệ số gió",
-                value: Binding(
-                    get: { viewModel.ballisticsConfig.windFactor },
-                    set: {
-                        viewModel.ballisticsConfig.windFactor = $0
-                        viewModel.persistAndRecalculate()
-                    }
-                ),
-                range: 0.00...2.50,
-                step: 0.05,
-                format: "%.2fx",
-                tint: .cyan
-            )
-
-            tuningSlider(
-                title: "Thời gian giữ Full 100 (giây)",
-                value: Binding(
-                    get: { viewModel.ballisticsConfig.maxHoldSeconds },
-                    set: {
-                        viewModel.ballisticsConfig.maxHoldSeconds = $0
-                        viewModel.persistAndRecalculate()
-                    }
-                ),
-                range: 1.00...4.00,
-                step: 0.05,
-                format: "%.2fs",
-                tint: .yellow
-            )
-        }
-        .cardStyle()
-    }
-
-    private func tuningSlider(
+    private func sliderRow(
         title: String,
         value: Binding<Double>,
         range: ClosedRange<Double>,
-        step: Double,
         format: String,
         tint: Color
     ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(title)
                     .font(.subheadline)
@@ -420,79 +566,10 @@ struct ContentView: View {
                     .font(.subheadline.bold().monospacedDigit())
                     .foregroundStyle(tint)
             }
-            Slider(value: value, in: range, step: step)
+            Slider(value: value, in: range, step: 0.05)
                 .tint(tint)
         }
-    }
-
-    // MARK: - 4. Cấu hình ROI & Hướng dẫn Switch Control
-
-    private var calibratorAndGuideSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Button {
-                isShowingCalibrator = true
-            } label: {
-                HStack {
-                    Image(systemName: "crop")
-                        .font(.title3)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Căn chỉnh vùng nhận diện (ROI)")
-                            .font(.subheadline.weight(.bold))
-                        Text("Chọn ảnh chụp trận đấu để đặt khung Minimap, Gió, Góc")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(.secondary)
-                }
-                .padding(14)
-                .background(Color.white.opacity(0.07))
-                .foregroundStyle(.white)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-            }
-
-            DisclosureGroup(isExpanded: $isSwitchGuideExpanded) {
-                VStack(alignment: .leading, spacing: 6) {
-                    guideStep(number: "1", text: "Vào Cài đặt iPhone > Trợ năng > Điều khiển công tắc (Switch Control) > Công thức (Recipes).")
-                    guideStep(number: "2", text: "Tạo công thức mới, gắn cử chỉ tùy chỉnh (Custom Gesture) nhấn giữ đúng vị trí nút Bắn trên màn hình game.")
-                    guideStep(number: "3", text: "Đo thời gian nạp đầy thanh lực 100 trong game rồi chỉnh thanh \"Thời gian giữ Full 100\" tương ứng ở trên.")
-                    guideStep(number: "4", text: "Bật PiP + Phát màn hình, vào trận và giữ nút Bắn theo đúng số giây hiển thị trên cửa sổ nổi.")
-                }
-                .padding(.top, 8)
-            } label: {
-                Label("Hướng dẫn nhanh Switch Control iOS", systemImage: "hand.tap.fill")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.white)
-            }
-            .tint(.secondary)
-        }
-        .cardStyle()
-    }
-
-    private func guideStep(number: String, text: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Text(number)
-                .font(.caption2.bold())
-                .frame(width: 18, height: 18)
-                .background(Color.accentColor.opacity(0.25))
-                .foregroundStyle(Color.accentColor)
-                .clipShape(Circle())
-            Text(text)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private func sectionHeader(title: String, icon: String, tint: Color) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: icon)
-                .foregroundStyle(tint)
-            Text(title)
-                .font(.headline)
-        }
+        .padding(.vertical, 2)
     }
 }
 
@@ -534,20 +611,5 @@ final class BroadcastPickerContainerView: UIView {
         for subview in picker.subviews {
             subview.frame = picker.bounds
         }
-    }
-}
-
-// MARK: - Card Styling
-
-private extension View {
-    func cardStyle() -> some View {
-        self
-            .padding(14)
-            .background(Color(red: 0.10, green: 0.11, blue: 0.15))
-            .clipShape(RoundedRectangle(cornerRadius: 16))
-            .overlay(
-                RoundedRectangle(cornerRadius: 16)
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
-            )
     }
 }

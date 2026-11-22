@@ -51,6 +51,10 @@ targets:
         UIBackgroundModes:
           - audio
           - picture-in-picture
+        LSApplicationQueriesSchemes:
+          - gunnymobi
+          - garena
+          - vnggunny
         NSPhotoLibraryUsageDescription: "GunnyCalc cần quyền truy cập Thư viện ảnh để chọn ảnh chụp màn hình game phục vụ căn chỉnh vùng nhận diện (ROI)."
     settings:
       base:

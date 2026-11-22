@@ -84,6 +84,17 @@ public struct ROIConfig: Codable, Equatable, Sendable {
     )
 }
 
+/// Điểm tọa độ chuẩn hóa `0.0 - 1.0` trên khung vẽ quỹ đạo đường đạn.
+public struct TrajectoryPoint: Codable, Equatable, Sendable {
+    public let x: Double
+    public let y: Double
+
+    public init(x: Double, y: Double) {
+        self.x = x
+        self.y = y
+    }
+}
+
 /// Tham số hiệu chỉnh đạn đạo và thời gian giữ thanh lực.
 public struct BallisticsConfig: Codable, Equatable, Sendable {
     public var selectedAngle: Double
@@ -91,19 +102,22 @@ public struct BallisticsConfig: Codable, Equatable, Sendable {
     public var windFactor: Double
     public var maxHoldSeconds: Double
     public var useOCRAngle: Bool
+    public var gameURLScheme: String
 
     public init(
         selectedAngle: Double = 65.0,
         powerFactor: Double = 1.0,
         windFactor: Double = 1.0,
         maxHoldSeconds: Double = 2.2,
-        useOCRAngle: Bool = false
+        useOCRAngle: Bool = false,
+        gameURLScheme: String = "gunnymobi://"
     ) {
         self.selectedAngle = selectedAngle
         self.powerFactor = powerFactor
         self.windFactor = windFactor
         self.maxHoldSeconds = maxHoldSeconds
         self.useOCRAngle = useOCRAngle
+        self.gameURLScheme = gameURLScheme
     }
 
     public init(from decoder: Decoder) throws {
@@ -113,6 +127,7 @@ public struct BallisticsConfig: Codable, Equatable, Sendable {
         self.windFactor = try container.decodeIfPresent(Double.self, forKey: .windFactor) ?? 1.0
         self.maxHoldSeconds = try container.decodeIfPresent(Double.self, forKey: .maxHoldSeconds) ?? 2.2
         self.useOCRAngle = try container.decodeIfPresent(Bool.self, forKey: .useOCRAngle) ?? false
+        self.gameURLScheme = try container.decodeIfPresent(String.self, forKey: .gameURLScheme) ?? "gunnymobi://"
     }
 
     public static let `default` = BallisticsConfig()
@@ -127,6 +142,7 @@ public struct TelemetryData: Codable, Equatable, Sendable {
     public var calculatedPower: Double
     public var holdSeconds: Double
     public var timestamp: TimeInterval
+    public var trajectoryPoints: [TrajectoryPoint]
 
     public init(
         dx: Double,
@@ -135,7 +151,8 @@ public struct TelemetryData: Codable, Equatable, Sendable {
         angle: Double,
         calculatedPower: Double,
         holdSeconds: Double,
-        timestamp: TimeInterval = Date().timeIntervalSince1970
+        timestamp: TimeInterval = Date().timeIntervalSince1970,
+        trajectoryPoints: [TrajectoryPoint] = []
     ) {
         self.dx = dx
         self.dy = dy
@@ -144,6 +161,21 @@ public struct TelemetryData: Codable, Equatable, Sendable {
         self.calculatedPower = min(max(calculatedPower, 0.0), 100.0)
         self.holdSeconds = max(holdSeconds, 0.0)
         self.timestamp = timestamp
+        self.trajectoryPoints = trajectoryPoints
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.dx = try container.decodeIfPresent(Double.self, forKey: .dx) ?? 0.0
+        self.dy = try container.decodeIfPresent(Double.self, forKey: .dy) ?? 0.0
+        self.wind = try container.decodeIfPresent(Double.self, forKey: .wind) ?? 0.0
+        self.angle = try container.decodeIfPresent(Double.self, forKey: .angle) ?? 65.0
+        let rawPower = try container.decodeIfPresent(Double.self, forKey: .calculatedPower) ?? 0.0
+        self.calculatedPower = min(max(rawPower, 0.0), 100.0)
+        let rawHold = try container.decodeIfPresent(Double.self, forKey: .holdSeconds) ?? 0.0
+        self.holdSeconds = max(rawHold, 0.0)
+        self.timestamp = try container.decodeIfPresent(TimeInterval.self, forKey: .timestamp) ?? 0.0
+        self.trajectoryPoints = try container.decodeIfPresent([TrajectoryPoint].self, forKey: .trajectoryPoints) ?? []
     }
 
     public static let placeholder = TelemetryData(
@@ -153,6 +185,7 @@ public struct TelemetryData: Codable, Equatable, Sendable {
         angle: 65.0,
         calculatedPower: 0.0,
         holdSeconds: 0.0,
-        timestamp: 0
+        timestamp: 0,
+        trajectoryPoints: []
     )
 }
