@@ -1,0 +1,48 @@
+name: Build GunnyInGameLine Dylib
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-dylib:
+    name: Build GunnyInGameLine.dylib (arm64)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile GunnyInGameLine.dylib with clang
+        run: |
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -dynamiclib \
+            -miphoneos-version-min=16.0 \
+            -fobjc-arc \
+            -O2 \
+            -Wall -Wextra \
+            -framework Foundation \
+            -framework UIKit \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -install_name @rpath/GunnyInGameLine.dylib \
+            GunnyInGameLine/GunnyInGameLine.m \
+            -o GunnyInGameLine.dylib
+
+      - name: Verify dynamic library binary
+        run: |
+          file GunnyInGameLine.dylib
+          lipo -info GunnyInGameLine.dylib
+          otool -L GunnyInGameLine.dylib
+
+      - name: Upload GunnyInGameLine.dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GunnyInGameLine-Dylib
+          path: GunnyInGameLine.dylib
+          if-no-files-found: error
