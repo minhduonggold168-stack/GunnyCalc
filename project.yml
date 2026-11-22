@@ -1,0 +1,106 @@
+name: GunnyCalc
+
+options:
+  bundleIdPrefix: com.gunny.pipcalc
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1"
+    CODE_SIGN_IDENTITY: ""
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGN_STYLE: Manual
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  GunnyCalcApp:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: GunnyCalcApp
+        excludes:
+          - "*.entitlements"
+          - "Info.plist"
+      - path: Shared
+    entitlements:
+      path: GunnyCalcApp/GunnyCalcApp.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.gunny.pipcalc
+    info:
+      path: GunnyCalcApp/Info.plist
+      properties:
+        CFBundleDisplayName: GunnyCalc
+        CFBundleName: $(PRODUCT_NAME)
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        LSRequiresIPhoneOS: true
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIBackgroundModes:
+          - audio
+          - picture-in-picture
+        NSPhotoLibraryUsageDescription: "GunnyCalc cần quyền truy cập Thư viện ảnh để chọn ảnh chụp màn hình game phục vụ căn chỉnh vùng nhận diện (ROI)."
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.gunny.pipcalc
+        PRODUCT_NAME: GunnyCalcApp
+        CODE_SIGN_ENTITLEMENTS: GunnyCalcApp/GunnyCalcApp.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+    dependencies:
+      - target: BroadcastExtension
+        embed: true
+        codeSign: false
+
+  BroadcastExtension:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: BroadcastExtension
+        excludes:
+          - "*.entitlements"
+          - "Info.plist"
+      - path: Shared
+    entitlements:
+      path: BroadcastExtension/BroadcastExtension.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.gunny.pipcalc
+    info:
+      path: BroadcastExtension/Info.plist
+      properties:
+        CFBundleDisplayName: GunnyCalc Broadcast
+        CFBundleName: $(PRODUCT_NAME)
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.broadcast-services-upload
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).SampleHandler
+          RPBroadcastProcessMode: RPBroadcastProcessModeSampleBuffer
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.gunny.pipcalc.BroadcastExtension
+        PRODUCT_NAME: BroadcastExtension
+        CODE_SIGN_ENTITLEMENTS: BroadcastExtension/BroadcastExtension.entitlements
+        SKIP_INSTALL: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+        GENERATE_INFOPLIST_FILE: NO
+
+schemes:
+  GunnyCalcApp:
+    build:
+      targets:
+        BroadcastExtension: all
+        GunnyCalcApp: all

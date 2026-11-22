@@ -1,0 +1,57 @@
+name: Build GunnyCalc IPA
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    name: Build Unsigned IPA
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen and generate Xcode project
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen generate
+
+      - name: Build GunnyCalcApp (Release / iphoneos)
+        run: |
+          xcodebuild build \
+            -project GunnyCalc.xcodeproj \
+            -scheme GunnyCalcApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package Payload into GunnyCalc.ipa
+        run: |
+          rm -rf Payload GunnyCalc.ipa
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/GunnyCalcApp.app Payload/GunnyCalcApp.app
+          mkdir -p Payload/GunnyCalcApp.app/PlugIns
+          if [ ! -d "Payload/GunnyCalcApp.app/PlugIns/BroadcastExtension.appex" ]; then
+            cp -R build/Build/Products/Release-iphoneos/BroadcastExtension.appex Payload/GunnyCalcApp.app/PlugIns/BroadcastExtension.appex
+          fi
+          test -d Payload/GunnyCalcApp.app/PlugIns/BroadcastExtension.appex
+          ls -la Payload/GunnyCalcApp.app/PlugIns/
+          zip -r9 GunnyCalc.ipa Payload
+
+      - name: Upload GunnyCalc.ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GunnyCalc-IPA
+          path: GunnyCalc.ipa
+          if-no-files-found: error

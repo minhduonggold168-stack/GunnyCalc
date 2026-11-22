@@ -1,0 +1,12 @@
+# Xcode & XcodeGen generated artifacts
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+build/
+Payload/
+*.ipa
+
+# macOS / IDE
+.DS_Store
+*.swp
+*~
