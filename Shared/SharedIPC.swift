@@ -43,19 +43,30 @@ public final class SharedIPC: @unchecked Sendable {
 
     public func saveROIConfig(_ config: ROIConfig, notify: Bool = true) {
         saveCodable(config, forKey: StorageKey.roiConfig)
+
+        var ballistics = loadBallisticsConfig()
+        ballistics.minimapROI = config.minimapRect.cgRect
+        ballistics.windROI = config.windRect.cgRect
+        ballistics.angleROI = config.angleRect.cgRect
+        saveCodable(ballistics, forKey: StorageKey.ballisticsConfig)
+
         if notify {
             postDarwinNotification(name: Self.configDarwinNotification)
         }
     }
 
     public func loadROIConfig() -> ROIConfig {
-        loadCodable(ROIConfig.self, forKey: StorageKey.roiConfig) ?? .default
+        if let saved = loadCodable(ROIConfig.self, forKey: StorageKey.roiConfig) {
+            return saved
+        }
+        return loadBallisticsConfig().roiConfig
     }
 
     // MARK: - BallisticsConfig
 
     public func saveBallisticsConfig(_ config: BallisticsConfig, notify: Bool = true) {
         saveCodable(config, forKey: StorageKey.ballisticsConfig)
+        saveCodable(config.roiConfig, forKey: StorageKey.roiConfig)
         if notify {
             postDarwinNotification(name: Self.configDarwinNotification)
         }
@@ -221,4 +232,15 @@ private let darwinConfigCallback: CFNotificationCallback = { _, observer, _, _, 
     guard let observer else { return }
     let ipc = Unmanaged<SharedIPC>.fromOpaque(observer).takeUnretainedValue()
     ipc.handleConfigNotification()
+}
+
+public extension BallisticsConfig {
+    /// Luôn trả về cấu hình kèm bộ tọa độ mặc định Gunny Mobi ngay từ lần chạy đầu tiên.
+    static func load() -> BallisticsConfig {
+        SharedIPC.shared.loadBallisticsConfig()
+    }
+
+    func save(notify: Bool = true) {
+        SharedIPC.shared.saveBallisticsConfig(self, notify: notify)
+    }
 }

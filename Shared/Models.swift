@@ -18,6 +18,15 @@ public struct NormalizedRect: Codable, Equatable, Sendable {
         self.height = min(Self.clamp01(height), 1.0 - clampedY)
     }
 
+    public init(_ rect: CGRect) {
+        self.init(
+            x: Double(rect.origin.x),
+            y: Double(rect.origin.y),
+            width: Double(rect.size.width),
+            height: Double(rect.size.height)
+        )
+    }
+
     /// Trả về `CGRect` chuẩn hóa (`0.0 ... 1.0`).
     public var cgRect: CGRect {
         CGRect(x: x, y: y, width: width, height: height)
@@ -77,10 +86,14 @@ public struct ROIConfig: Codable, Equatable, Sendable {
         self.angleRect = angleRect
     }
 
+    public static let defaultMinimapROI = CGRect(x: 0.67, y: 0.03, width: 0.30, height: 0.28)
+    public static let defaultWindROI = CGRect(x: 0.44, y: 0.01, width: 0.12, height: 0.09)
+    public static let defaultAngleROI = CGRect(x: 0.22, y: 0.18, width: 0.56, height: 0.48)
+
     public static let `default` = ROIConfig(
-        minimapRect: NormalizedRect(x: 0.72, y: 0.03, width: 0.25, height: 0.20),
-        windRect: NormalizedRect(x: 0.44, y: 0.03, width: 0.12, height: 0.07),
-        angleRect: NormalizedRect(x: 0.11, y: 0.78, width: 0.10, height: 0.08)
+        minimapRect: NormalizedRect(defaultMinimapROI),
+        windRect: NormalizedRect(defaultWindROI),
+        angleRect: NormalizedRect(defaultAngleROI)
     )
 }
 
@@ -95,22 +108,32 @@ public struct TrajectoryPoint: Codable, Equatable, Sendable {
     }
 }
 
-/// Tham số hiệu chỉnh đạn đạo và thời gian giữ thanh lực.
+/// Tham số hiệu chỉnh đạn đạo, thời gian giữ thanh lực và bộ tọa độ ROI mặc định chuẩn Gunny Mobi 19.5:9.
 public struct BallisticsConfig: Codable, Equatable, Sendable {
+    public static let defaultMinimapROI = CGRect(x: 0.67, y: 0.03, width: 0.30, height: 0.28)
+    public static let defaultWindROI = CGRect(x: 0.44, y: 0.01, width: 0.12, height: 0.09)
+    public static let defaultAngleROI = CGRect(x: 0.22, y: 0.18, width: 0.56, height: 0.48)
+
     public var selectedAngle: Double
     public var powerFactor: Double
     public var windFactor: Double
     public var maxHoldSeconds: Double
     public var useOCRAngle: Bool
     public var gameURLScheme: String
+    public var minimapROI: CGRect
+    public var windROI: CGRect
+    public var angleROI: CGRect
 
     public init(
         selectedAngle: Double = 65.0,
         powerFactor: Double = 1.0,
         windFactor: Double = 1.0,
         maxHoldSeconds: Double = 2.2,
-        useOCRAngle: Bool = false,
-        gameURLScheme: String = "gunnymobi://"
+        useOCRAngle: Bool = true,
+        gameURLScheme: String = "gunnymobi://",
+        minimapROI: CGRect = BallisticsConfig.defaultMinimapROI,
+        windROI: CGRect = BallisticsConfig.defaultWindROI,
+        angleROI: CGRect = BallisticsConfig.defaultAngleROI
     ) {
         self.selectedAngle = selectedAngle
         self.powerFactor = powerFactor
@@ -118,6 +141,9 @@ public struct BallisticsConfig: Codable, Equatable, Sendable {
         self.maxHoldSeconds = maxHoldSeconds
         self.useOCRAngle = useOCRAngle
         self.gameURLScheme = gameURLScheme
+        self.minimapROI = minimapROI
+        self.windROI = windROI
+        self.angleROI = angleROI
     }
 
     public init(from decoder: Decoder) throws {
@@ -126,8 +152,19 @@ public struct BallisticsConfig: Codable, Equatable, Sendable {
         self.powerFactor = try container.decodeIfPresent(Double.self, forKey: .powerFactor) ?? 1.0
         self.windFactor = try container.decodeIfPresent(Double.self, forKey: .windFactor) ?? 1.0
         self.maxHoldSeconds = try container.decodeIfPresent(Double.self, forKey: .maxHoldSeconds) ?? 2.2
-        self.useOCRAngle = try container.decodeIfPresent(Bool.self, forKey: .useOCRAngle) ?? false
+        self.useOCRAngle = try container.decodeIfPresent(Bool.self, forKey: .useOCRAngle) ?? true
         self.gameURLScheme = try container.decodeIfPresent(String.self, forKey: .gameURLScheme) ?? "gunnymobi://"
+        self.minimapROI = try container.decodeIfPresent(CGRect.self, forKey: .minimapROI) ?? Self.defaultMinimapROI
+        self.windROI = try container.decodeIfPresent(CGRect.self, forKey: .windROI) ?? Self.defaultWindROI
+        self.angleROI = try container.decodeIfPresent(CGRect.self, forKey: .angleROI) ?? Self.defaultAngleROI
+    }
+
+    public var roiConfig: ROIConfig {
+        ROIConfig(
+            minimapRect: NormalizedRect(minimapROI),
+            windRect: NormalizedRect(windROI),
+            angleRect: NormalizedRect(angleROI)
+        )
     }
 
     public static let `default` = BallisticsConfig()

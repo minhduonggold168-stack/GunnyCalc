@@ -41,6 +41,7 @@ public struct MinimapCentroids: Equatable, Sendable {
 public final class VisionProcessor {
     private static let maxMinimapSampleDimension = 240
     private static let maxOCRSampleDimension = 280
+    private static let maxBattlefieldOCRSampleDimension = 560
     private static let allowedNumericChars = CharacterSet(charactersIn: "0123456789-+.")
 
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
@@ -49,7 +50,11 @@ public final class VisionProcessor {
     public init() {}
 
     /// Xử lý trực tiếp `CVPixelBuffer` nhận từ `ReplayKit` trong `autoreleasepool`.
-    public func process(pixelBuffer: CVPixelBuffer, roiConfig: ROIConfig) -> VisionObservationResult {
+    public func process(
+        pixelBuffer: CVPixelBuffer,
+        roiConfig: ROIConfig,
+        includeAngle: Bool = true
+    ) -> VisionObservationResult {
         autoreleasepool {
             let width = CVPixelBufferGetWidth(pixelBuffer)
             let height = CVPixelBufferGetHeight(pixelBuffer)
@@ -62,7 +67,9 @@ public final class VisionProcessor {
 
             let minimap = analyzeMinimap(from: pixelBuffer, normalizedRect: roiConfig.minimapRect)
             let wind = recognizeNumericValue(from: pixelBuffer, normalizedRect: roiConfig.windRect, allowNegative: true)
-            let angle = recognizeNumericValue(from: pixelBuffer, normalizedRect: roiConfig.angleRect, allowNegative: false)
+            let angle = includeAngle
+                ? recognizeBattlefieldAngle(from: pixelBuffer, normalizedRect: roiConfig.angleRect)
+                : nil
 
             return VisionObservationResult(
                 dx: minimap?.dx ?? 0.0,
@@ -79,7 +86,7 @@ public final class VisionProcessor {
         autoreleasepool {
             let minimap = analyzeMinimap(from: cgImage, normalizedRect: roiConfig.minimapRect)
             let wind = recognizeNumericValue(from: cgImage, normalizedRect: roiConfig.windRect, allowNegative: true)
-            let angle = recognizeNumericValue(from: cgImage, normalizedRect: roiConfig.angleRect, allowNegative: false)
+            let angle = recognizeBattlefieldAngle(from: cgImage, normalizedRect: roiConfig.angleRect)
 
             return VisionObservationResult(
                 dx: minimap?.dx ?? 0.0,
@@ -214,13 +221,116 @@ public final class VisionProcessor {
         )
     }
 
+    /// Đọc các chuỗi OCR thô từ một vùng `NormalizedRect` trong `CVPixelBuffer` (dùng trong `SampleHandler`).
+    public func recognizeTextCandidates(
+        from pixelBuffer: CVPixelBuffer,
+        normalizedRect: NormalizedRect,
+        maxDimension: Int = 560,
+        minimumTextHeight: Float = 0.03
+    ) -> [String] {
+        guard let image = makeContrastGrayscaleImage(
+            from: pixelBuffer,
+            normalizedRect: normalizedRect,
+            maxDimension: maxDimension
+        ) else {
+            return []
+        }
+        return performFastTextRecognition(on: image, minimumTextHeight: minimumTextHeight)
+    }
+
+    /// Trích xuất giá trị góc ưu tiên chuỗi có ký hiệu `°`/`º` hoặc đứng sau chữ `Góc` (ví dụ: `"Góc 31°"` -> `31.0`).
+    public static func extractPriorityAngle(from candidates: [String], allowPlainFallback: Bool = false) -> Double? {
+        for raw in candidates {
+            if let matched = parseAngleNearGocKeyword(raw) {
+                return matched
+            }
+        }
+        for raw in candidates {
+            if let matched = parseAngleBeforeDegreeSymbol(raw) {
+                return matched
+            }
+        }
+        if allowPlainFallback {
+            let joined = candidates.joined(separator: " ")
+            if let plain = parseFilteredNumber(from: joined, allowNegative: false),
+               plain >= 0.0 && plain <= 90.0 {
+                return plain
+            }
+        }
+        return nil
+    }
+
     // MARK: - Wind & Angle High-Contrast Grayscale + Fast Vision OCR
+
+    private func recognizeBattlefieldAngle(from pixelBuffer: CVPixelBuffer, normalizedRect: NormalizedRect) -> Double? {
+        let isWideBattlefield = normalizedRect.width > 0.22 || normalizedRect.height > 0.16
+        guard let image = makeContrastGrayscaleImage(
+            from: pixelBuffer,
+            normalizedRect: normalizedRect,
+            maxDimension: isWideBattlefield ? Self.maxBattlefieldOCRSampleDimension : Self.maxOCRSampleDimension
+        ) else {
+            return nil
+        }
+
+        let candidates = performFastTextRecognition(
+            on: image,
+            minimumTextHeight: isWideBattlefield ? 0.03 : 0.15
+        )
+        return Self.extractPriorityAngle(from: candidates, allowPlainFallback: !isWideBattlefield)
+    }
+
+    private func recognizeBattlefieldAngle(from cgImage: CGImage, normalizedRect: NormalizedRect) -> Double? {
+        let isWideBattlefield = normalizedRect.width > 0.22 || normalizedRect.height > 0.16
+        guard let image = makeContrastGrayscaleImage(
+            from: cgImage,
+            normalizedRect: normalizedRect,
+            maxDimension: isWideBattlefield ? Self.maxBattlefieldOCRSampleDimension : Self.maxOCRSampleDimension
+        ) else {
+            return nil
+        }
+
+        let candidates = performFastTextRecognition(
+            on: image,
+            minimumTextHeight: isWideBattlefield ? 0.03 : 0.15
+        )
+        return Self.extractPriorityAngle(from: candidates, allowPlainFallback: !isWideBattlefield)
+    }
 
     private func recognizeNumericValue(
         from pixelBuffer: CVPixelBuffer,
         normalizedRect: NormalizedRect,
         allowNegative: Bool
     ) -> Double? {
+        guard let enhancedImage = makeContrastGrayscaleImage(
+            from: pixelBuffer,
+            normalizedRect: normalizedRect,
+            maxDimension: Self.maxOCRSampleDimension
+        ) else {
+            return nil
+        }
+        return performFastDigitOCR(on: enhancedImage, allowNegative: allowNegative)
+    }
+
+    private func recognizeNumericValue(
+        from cgImage: CGImage,
+        normalizedRect: NormalizedRect,
+        allowNegative: Bool
+    ) -> Double? {
+        guard let enhancedImage = makeContrastGrayscaleImage(
+            from: cgImage,
+            normalizedRect: normalizedRect,
+            maxDimension: Self.maxOCRSampleDimension
+        ) else {
+            return nil
+        }
+        return performFastDigitOCR(on: enhancedImage, allowNegative: allowNegative)
+    }
+
+    private func makeContrastGrayscaleImage(
+        from pixelBuffer: CVPixelBuffer,
+        normalizedRect: NormalizedRect,
+        maxDimension: Int
+    ) -> CGImage? {
         let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
         let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
         let roiPixel = normalizedRect.pixelRect(width: srcWidth, height: srcHeight)
@@ -232,7 +342,7 @@ public final class VisionProcessor {
         let (outW, outH) = clampedSize(
             width: cropW * scale,
             height: cropH * scale,
-            maxDimension: Self.maxOCRSampleDimension
+            maxDimension: maxDimension
         )
 
         guard let grayContext = makeGrayscaleContext(width: outW, height: outH),
@@ -258,15 +368,14 @@ public final class VisionProcessor {
             bytesPerRow: grayContext.bytesPerRow
         )
 
-        guard let enhancedImage = grayContext.makeImage() else { return nil }
-        return performFastDigitOCR(on: enhancedImage, allowNegative: allowNegative)
+        return grayContext.makeImage()
     }
 
-    private func recognizeNumericValue(
+    private func makeContrastGrayscaleImage(
         from cgImage: CGImage,
         normalizedRect: NormalizedRect,
-        allowNegative: Bool
-    ) -> Double? {
+        maxDimension: Int
+    ) -> CGImage? {
         let roiPixel = normalizedRect.pixelRect(width: cgImage.width, height: cgImage.height)
         let cropW = Int(roiPixel.width)
         let cropH = Int(roiPixel.height)
@@ -279,7 +388,7 @@ public final class VisionProcessor {
         let (outW, outH) = clampedSize(
             width: cropW * scale,
             height: cropH * scale,
-            maxDimension: Self.maxOCRSampleDimension
+            maxDimension: maxDimension
         )
 
         guard let grayContext = makeGrayscaleContext(width: outW, height: outH),
@@ -297,36 +406,92 @@ public final class VisionProcessor {
             bytesPerRow: grayContext.bytesPerRow
         )
 
-        guard let enhancedImage = grayContext.makeImage() else { return nil }
-        return performFastDigitOCR(on: enhancedImage, allowNegative: allowNegative)
+        return grayContext.makeImage()
     }
 
-    private func performFastDigitOCR(on image: CGImage, allowNegative: Bool) -> Double? {
+    private func performFastTextRecognition(on image: CGImage, minimumTextHeight: Float) -> [String] {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .fast
         request.usesLanguageCorrection = false
-        request.minimumTextHeight = 0.15
+        request.minimumTextHeight = minimumTextHeight
 
         let handler = VNImageRequestHandler(cgImage: image, options: [:])
         do {
             try handler.perform([request])
         } catch {
-            return nil
+            return []
         }
 
-        guard let observations = request.results else { return nil }
-        let recognizedString = observations
-            .compactMap { $0.topCandidates(1).first?.string }
-            .joined(separator: " ")
-
-        return parseFilteredNumber(from: recognizedString, allowNegative: allowNegative)
+        guard let observations = request.results else { return [] }
+        return observations.compactMap { $0.topCandidates(1).first?.string }
     }
 
-    private func parseFilteredNumber(from rawText: String, allowNegative: Bool) -> Double? {
+    private func performFastDigitOCR(on image: CGImage, allowNegative: Bool) -> Double? {
+        let recognizedString = performFastTextRecognition(on: image, minimumTextHeight: 0.15)
+            .joined(separator: " ")
+        return Self.parseFilteredNumber(from: recognizedString, allowNegative: allowNegative)
+    }
+
+    private static func parseAngleNearGocKeyword(_ text: String) -> Double? {
+        let folded = text.folding(options: .diacriticInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+            .lowercased()
+        guard let range = folded.range(of: "goc") else { return nil }
+
+        let tail = String(folded[range.upperBound...])
+        var token = ""
+        var started = false
+        for ch in tail {
+            if !started {
+                if ch == "-" || (ch.isASCII && ch.isNumber) {
+                    started = true
+                    token.append(ch)
+                } else if ch == "°" || ch == "º" {
+                    break
+                }
+            } else {
+                if (ch.isASCII && ch.isNumber) || ch == "." {
+                    token.append(ch)
+                } else {
+                    break
+                }
+            }
+        }
+        guard let value = Double(token), value >= -90.0 && value <= 90.0 else { return nil }
+        return value
+    }
+
+    private static func parseAngleBeforeDegreeSymbol(_ text: String) -> Double? {
+        let chars = Array(text)
+        for (idx, ch) in chars.enumerated() where ch == "°" || ch == "º" {
+            var digits = ""
+            var i = idx - 1
+            while i >= 0 && chars[i] == " " {
+                i -= 1
+            }
+            while i >= 0 {
+                let c = chars[i]
+                if (c.isASCII && c.isNumber) || c == "." {
+                    digits.insert(c, at: digits.startIndex)
+                } else if c == "-" {
+                    digits.insert(c, at: digits.startIndex)
+                    break
+                } else {
+                    break
+                }
+                i -= 1
+            }
+            if let value = Double(digits), value >= -90.0 && value <= 90.0 {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private static func parseFilteredNumber(from rawText: String, allowNegative: Bool) -> Double? {
         var filtered = ""
         filtered.reserveCapacity(rawText.count)
 
-        for scalar in rawText.unicodeScalars where Self.allowedNumericChars.contains(scalar) {
+        for scalar in rawText.unicodeScalars where allowedNumericChars.contains(scalar) {
             filtered.unicodeScalars.append(scalar)
         }
 
