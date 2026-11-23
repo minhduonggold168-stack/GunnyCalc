@@ -190,13 +190,13 @@ public final class VisionProcessor {
                 let hsv = rgbToHSV(r: r, g: g, b: b)
 
                 // Cụm màu xanh dương: vị trí người chơi trên minimap.
-                if hsv.h >= 185.0 && hsv.h <= 255.0 && hsv.s >= 0.45 && hsv.v >= 0.35 {
+                if hsv.h >= 180.0 && hsv.h <= 255.0 && hsv.s >= 0.35 && hsv.v >= 0.30 {
                     blueSumX += Double(x)
                     blueSumY += Double(y)
                     blueCount += 1
                 }
                 // Cụm màu đỏ: vị trí mục tiêu / boss trên minimap.
-                else if (hsv.h <= 22.0 || hsv.h >= 338.0) && hsv.s >= 0.48 && hsv.v >= 0.35 {
+                else if (hsv.h <= 25.0 || hsv.h >= 335.0) && hsv.s >= 0.38 && hsv.v >= 0.30 {
                     redSumX += Double(x)
                     redSumY += Double(y)
                     redCount += 1
@@ -225,6 +225,47 @@ public final class VisionProcessor {
             bluePixelCount: blueCount,
             redPixelCount: redCount
         )
+    }
+
+    /// So sánh mật độ điểm ảnh sáng màu ở nửa trái và nửa phải khung `windROI`
+    /// để xác định hướng mũi tên gió (`-1` nếu chỉ trái `<`, `+1` nếu chỉ phải `>`).
+    public func detectWindDirection(from cgImage: CGImage, normalizedRect: NormalizedRect) -> Int {
+        let roiPixel = normalizedRect.pixelRect(width: cgImage.width, height: cgImage.height)
+        let cropW = Int(roiPixel.width)
+        let cropH = Int(roiPixel.height)
+        guard cropW >= 8, cropH >= 4,
+              let cropped = cgImage.cropping(to: roiPixel) else {
+            return 1
+        }
+
+        let (outW, outH) = clampedSize(width: cropW, height: cropH, maxDimension: 160)
+        guard let grayContext = makeGrayscaleContext(width: outW, height: outH),
+              let grayPtr = grayContext.data?.assumingMemoryBound(to: UInt8.self) else {
+            return 1
+        }
+
+        grayContext.interpolationQuality = .low
+        grayContext.draw(cropped, in: CGRect(x: 0, y: 0, width: outW, height: outH))
+
+        let midX = outW / 2
+        let bytesPerRow = grayContext.bytesPerRow
+        var leftBright = 0
+        var rightBright = 0
+
+        for y in 0..<outH {
+            let row = grayPtr.advanced(by: y * bytesPerRow)
+            for x in 0..<outW {
+                if row[x] >= 175 {
+                    if x < midX {
+                        leftBright += 1
+                    } else {
+                        rightBright += 1
+                    }
+                }
+            }
+        }
+
+        return leftBright > rightBright ? -1 : 1
     }
 
     /// Đọc các chuỗi OCR thô từ một vùng `NormalizedRect` trong `CGImage` đã xoay ngang & thu nhỏ.

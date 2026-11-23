@@ -4,39 +4,46 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import ImageIO
+import Network
 import ReplayKit
 import Vision
 
 /// Handler nhận khung hình thụ động từ ReplayKit.
-/// Giới hạn 4 FPS, bọc toàn bộ xử lý trong `autoreleasepool`, xoay đúng hướng ngang bằng `RPVideoSampleOrientationKey`
-/// và thu nhỏ khung hình <= 960px trước khi chạy Vision OCR (.fast) để giữ RAM luôn dưới 25 MB.
+/// - Dùng duy nhất 1 `sharedCIContext` trong suốt vòng đời Extension để giữ RAM < 25 MB.
+/// - Giới hạn tốc độ 3 FPS (0.33s/frame) và bọc toàn bộ trong `autoreleasepool`.
+/// - Tự chuẩn hóa khung hình sang chiều ngang, đọc Minimap + Gió + Hướng mũi tên gió + Góc `Góc ...°`,
+///   sau đó gửi gói JSON qua UDP IPv4 tới `127.0.0.1:45678` bằng `NWConnection`.
 final class SampleHandler: RPBroadcastSampleHandler {
+    private let sharedCIContext = CIContext(options: [.useSoftwareRenderer: false])
     private let visionProcessor = VisionProcessor()
     private let ballisticsEngine = BallisticsEngine()
     private let ipc = SharedIPC.shared
-
-    /// CIContext tắt cache trung gian nhằm tránh phình bộ nhớ vượt ngưỡng Jetsam 50 MB của Broadcast Extension.
-    private let ciContext = CIContext(options: [
-        .cacheIntermediates: false,
-        .priorityRequestLow: true
-    ])
+    private let jsonEncoder = JSONEncoder()
 
     private var ballisticsConfig: BallisticsConfig = .default
     private var roiConfig: ROIConfig = .default
     private var lastProcessedTimestamp: TimeInterval = 0
     private var isProcessingFrame = false
+    private var frameCount: Int = 0
+    private var lastValidDx: Double = 0.48
+    private var lastValidDy: Double = 0.0
+    private var lastValidAngle: Double?
 
-    private let minimumFrameInterval: TimeInterval = 0.25 // Tối đa 4 FPS
+    private let minimumFrameInterval: TimeInterval = 0.33 // 3 FPS
     private let maxScaledWidth: CGFloat = 960.0
     private let stateLock = NSLock()
+    private let udpQueue = DispatchQueue(label: "com.gunny.pipcalc.ext.udp", qos: .userInteractive)
+    private var udpConnection: NWConnection?
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         reloadConfigurations()
         stateLock.lock()
         lastProcessedTimestamp = 0
         isProcessingFrame = false
+        frameCount = 0
         stateLock.unlock()
 
+        startUDPConnectionIfNeeded()
         ipc.startObservingConfig { [weak self] in
             self?.reloadConfigurations()
         }
@@ -48,11 +55,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     override func broadcastResumed() {
         reloadConfigurations()
+        startUDPConnectionIfNeeded()
     }
 
     override func broadcastFinished() {
         ipc.stopObservingConfig()
-        ciContext.clearCaches()
+        stopUDPConnection()
+        sharedCIContext.clearCaches()
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
@@ -79,9 +88,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-            // Đọc hướng xoay thực tế từ ReplayKit để chuẩn hóa khung hình ngang khớp màn hình game Gunny Mobi.
             let orientation = extractVideoOrientation(from: sampleBuffer)
-            guard let scaledImage = makeOrientedDownscaledCGImage(
+            guard let scaledImage = makeLandscapeDownscaledCGImage(
                 from: pixelBuffer,
                 orientation: orientation
             ) else {
@@ -93,42 +101,70 @@ final class SampleHandler: RPBroadcastSampleHandler {
                 roiConfig: currentROI,
                 includeAngle: false
             )
-            guard observation.hasValidMinimap else { return }
 
-            // Ưu tiên bộ lọc OCR tìm chuỗi chứa ký hiệu `°` hoặc đứng sau chữ `Góc` (ví dụ `Góc 31°` -> 31.0).
-            let priorityAngle: Double?
+            // Xác định hướng mũi tên gió (< = -1, > = +1) bằng mật độ điểm sáng nửa trái/phải trong windROI.
+            let windDirection = visionProcessor.detectWindDirection(
+                from: scaledImage,
+                normalizedRect: currentROI.windRect
+            )
+
+            // Đọc góc bắn trong angleROI: ưu tiên chuỗi có ký hiệu `°` hoặc đứng sau `Góc` (ví dụ `Góc 21°`).
+            let detectedAngle: Double?
             if currentBallistics.useOCRAngle {
                 let angleCandidates = visionProcessor.recognizeTextCandidates(
                     from: scaledImage,
-                    normalizedRect: NormalizedRect(currentBallistics.angleROI),
+                    normalizedRect: currentROI.angleRect,
                     maxDimension: 560,
                     minimumTextHeight: 0.03
                 )
-                priorityAngle = filterBattlefieldAngle(from: angleCandidates)
+                if let matched = filterBattlefieldAngle(from: angleCandidates) {
+                    detectedAngle = matched
+                    stateLock.lock()
+                    lastValidAngle = matched
+                    stateLock.unlock()
+                } else {
+                    stateLock.lock()
+                    detectedAngle = lastValidAngle
+                    stateLock.unlock()
+                }
             } else {
-                priorityAngle = nil
+                detectedAngle = nil
             }
 
             let previous = ipc.loadTelemetry()
-            let resolvedWind = observation.wind ?? previous?.wind ?? 0.0
+            let windMagnitude = abs(observation.wind ?? previous?.wind ?? 0.0)
+            let signedWind = windMagnitude * Double(windDirection)
+
+            let resolvedDx: Double
+            let resolvedDy: Double
+            stateLock.lock()
+            if observation.hasValidMinimap {
+                lastValidDx = observation.dx
+                lastValidDy = observation.dy
+            }
+            resolvedDx = lastValidDx
+            resolvedDy = lastValidDy
+            frameCount += 1
+            let currentFrameNumber = frameCount
+            stateLock.unlock()
 
             let telemetry = ballisticsEngine.computeTelemetry(
-                dx: observation.dx,
-                dy: observation.dy,
-                wind: resolvedWind,
-                detectedAngle: priorityAngle,
+                dx: resolvedDx,
+                dy: resolvedDy,
+                wind: signedWind,
+                windDirection: windDirection,
+                detectedAngle: detectedAngle,
                 config: currentBallistics,
-                timestamp: now
+                timestamp: now,
+                frameCount: currentFrameNumber
             )
 
-            // Gửi dữ liệu tức thì qua UDP nội bộ 127.0.0.1:45678 và đồng bộ qua App Group IPC.
-            ipc.sendTelemetryUDP(telemetry)
+            sendUDPPacket(telemetry)
             ipc.saveTelemetry(telemetry, notify: true)
-            ciContext.clearCaches()
         }
     }
 
-    // MARK: - Orientation & Low-Memory Downscale Helpers
+    // MARK: - Orientation & 960px Downscale
 
     private func extractVideoOrientation(from sampleBuffer: CMSampleBuffer) -> CGImagePropertyOrientation {
         if let attachment = CMGetAttachment(
@@ -141,11 +177,16 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return .up
     }
 
-    private func makeOrientedDownscaledCGImage(
+    private func makeLandscapeDownscaledCGImage(
         from pixelBuffer: CVPixelBuffer,
         orientation: CGImagePropertyOrientation
     ) -> CGImage? {
         var ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
+
+        // Nếu sau khi áp dụng RPVideoSampleOrientationKey vẫn là khung đứng (height > width), tự xoay 90° sang ngang.
+        if ciImage.extent.height > ciImage.extent.width {
+            ciImage = ciImage.oriented(.left)
+        }
 
         let origin = ciImage.extent.origin
         if origin != .zero {
@@ -168,12 +209,72 @@ final class SampleHandler: RPBroadcastSampleHandler {
         )
         guard renderBounds.width >= 16, renderBounds.height >= 16 else { return nil }
 
-        return ciContext.createCGImage(ciImage, from: renderBounds)
+        return sharedCIContext.createCGImage(ciImage, from: renderBounds)
     }
 
-    /// Tối ưu bộ lọc OCR cho `angleROI`: ưu tiên chuỗi chứa chữ `Góc` (ví dụ `Góc 31°`) hoặc ký hiệu `°`.
     private func filterBattlefieldAngle(from candidates: [String]) -> Double? {
         VisionProcessor.extractPriorityAngle(from: candidates, allowPlainFallback: false)
+    }
+
+    // MARK: - UDP IPv4 Sender (NWParameters.udp -> 127.0.0.1:45678)
+
+    private func startUDPConnectionIfNeeded() {
+        udpQueue.async { [weak self] in
+            guard let self, self.udpConnection == nil else { return }
+
+            let parameters = NWParameters.udp
+            if let ipOptions = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+                ipOptions.version = .v4
+            }
+
+            let connection = NWConnection(
+                host: NWEndpoint.Host(SharedIPC.udpHost),
+                port: NWEndpoint.Port(rawValue: SharedIPC.udpPort)!,
+                using: parameters
+            )
+            connection.stateUpdateHandler = { [weak self] state in
+                if case .failed = state {
+                    self?.udpConnection = nil
+                }
+            }
+            connection.start(queue: self.udpQueue)
+            self.udpConnection = connection
+        }
+    }
+
+    private func stopUDPConnection() {
+        udpQueue.async { [weak self] in
+            self?.udpConnection?.cancel()
+            self?.udpConnection = nil
+        }
+    }
+
+    private func sendUDPPacket(_ telemetry: TelemetryData) {
+        guard let payload = try? jsonEncoder.encode(telemetry), !payload.isEmpty else { return }
+
+        udpQueue.async { [weak self] in
+            guard let self else { return }
+            if self.udpConnection == nil {
+                let parameters = NWParameters.udp
+                if let ipOptions = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+                    ipOptions.version = .v4
+                }
+                let conn = NWConnection(
+                    host: NWEndpoint.Host(SharedIPC.udpHost),
+                    port: NWEndpoint.Port(rawValue: SharedIPC.udpPort)!,
+                    using: parameters
+                )
+                conn.stateUpdateHandler = { [weak self] state in
+                    if case .failed = state {
+                        self?.udpConnection = nil
+                    }
+                }
+                conn.start(queue: self.udpQueue)
+                self.udpConnection = conn
+            }
+
+            self.udpConnection?.send(content: payload, completion: .contentProcessed { _ in })
+        }
     }
 
     private func reloadConfigurations() {

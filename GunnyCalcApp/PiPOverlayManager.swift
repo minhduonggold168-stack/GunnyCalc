@@ -3,6 +3,7 @@ import AVKit
 import CoreGraphics
 import CoreMedia
 import CoreVideo
+import Network
 import SwiftUI
 import UIKit
 
@@ -34,7 +35,101 @@ struct PiPHostView: UIViewRepresentable {
     }
 }
 
-/// Quản lý cửa sổ nổi Picture-in-Picture (`AVKit` + `AVSampleBufferDisplayLayer`) hiển thị thông số lực bắn theo thời gian thực.
+/// Bộ lắng nghe UDP IPv4 (`0.0.0.0:45678`) độc lập khỏi `@MainActor` để chạy trên hàng đợi riêng không xung đột actor isolation.
+private final class UDPTelemetryReceiver: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.gunny.pipcalc.app.udp.listener", qos: .userInteractive)
+    private let lock = NSLock()
+    private var listener: NWListener?
+    private var activeConnections: [NWConnection] = []
+    private var onTelemetry: (@Sendable (TelemetryData) -> Void)?
+    private var onError: (@Sendable (String) -> Void)?
+
+    func start(
+        port: UInt16,
+        onTelemetry: @escaping @Sendable (TelemetryData) -> Void,
+        onError: @escaping @Sendable (String) -> Void
+    ) {
+        lock.lock()
+        self.onTelemetry = onTelemetry
+        self.onError = onError
+        lock.unlock()
+
+        queue.async { [weak self] in
+            guard let self, self.listener == nil else { return }
+
+            let parameters = NWParameters.udp
+            parameters.allowLocalEndpointReuse = true
+            if let ipOptions = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+                ipOptions.version = .v4
+            }
+            if let nwPort = NWEndpoint.Port(rawValue: port) {
+                parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
+                    host: NWEndpoint.Host("0.0.0.0"),
+                    port: nwPort
+                )
+            }
+
+            do {
+                let newListener = try NWListener(using: parameters)
+                newListener.stateUpdateHandler = { [weak self] state in
+                    if case .failed = state {
+                        self?.listener = nil
+                    }
+                }
+                newListener.newConnectionHandler = { [weak self] connection in
+                    self?.acceptConnection(connection)
+                }
+                newListener.start(queue: self.queue)
+                self.listener = newListener
+            } catch {
+                self.lock.lock()
+                let errorCallback = self.onError
+                self.lock.unlock()
+                errorCallback?("Lỗi mở cổng UDP \(port): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func acceptConnection(_ connection: NWConnection) {
+        activeConnections.append(connection)
+        if activeConnections.count > 12 {
+            let stale = activeConnections.removeFirst()
+            stale.cancel()
+        }
+
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection else { return }
+            switch state {
+            case .ready:
+                self.receiveNextMessage(on: connection)
+            case .failed, .cancelled:
+                self.activeConnections.removeAll { $0 === connection }
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+    }
+
+    private func receiveNextMessage(on connection: NWConnection) {
+        connection.receiveMessage { [weak self, weak connection] data, _, _, error in
+            guard let self else { return }
+            if let data, !data.isEmpty,
+               let telemetry = try? JSONDecoder().decode(TelemetryData.self, from: data) {
+                self.lock.lock()
+                let callback = self.onTelemetry
+                self.lock.unlock()
+                callback?(telemetry)
+            }
+            if error == nil, let connection {
+                self.receiveNextMessage(on: connection)
+            }
+        }
+    }
+}
+
+/// Quản lý cửa sổ nổi Picture-in-Picture (`640 x 210`) mô phỏng đường ngắm 2 tia kiểu tool Gunny PC,
+/// lắng nghe UDP IPv4 `0.0.0.0:45678` qua `NWListener` và duy trì chạy nền bằng âm thanh câm lặp vô hạn.
 @MainActor
 final class PiPOverlayManager: NSObject, ObservableObject {
     static let shared = PiPOverlayManager()
@@ -43,32 +138,29 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     @Published private(set) var isPiPSupported = AVPictureInPictureController.isPictureInPictureSupported()
     @Published private(set) var statusMessage: String?
 
-    let sampleBufferView = PiPSampleBufferView(frame: CGRect(x: 0, y: 0, width: 640, height: 280))
+    let sampleBufferView = PiPSampleBufferView(frame: CGRect(x: 0, y: 0, width: 640, height: 210))
 
     private var pipController: AVPictureInPictureController?
     private var currentTelemetry: TelemetryData = .placeholder
+    private var lastPacketReceivedAt: TimeInterval = 0
     private var keepAliveTimer: Timer?
-    private var isUDPListening = false
+    private var silentAudioPlayer: AVAudioPlayer?
+    private let udpReceiver = UDPTelemetryReceiver()
 
-    private let renderSize = CGSize(width: 640, height: 280)
+    private let renderSize = CGSize(width: 640, height: 210)
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
     private let ballisticsEngine = BallisticsEngine()
     private let defaultFallbackPower: Double = 45.0
+    private let liveTimeoutSeconds: TimeInterval = 1.5
 
     private override init() {
         super.init()
-        configureAudioSession()
+        configureAudioSessionAndSilentLoop()
     }
 
     func configureIfNeeded() {
-        if !isUDPListening {
-            isUDPListening = true
-            SharedIPC.shared.startUDPTelemetryListener { [weak self] incoming in
-                Task { @MainActor [weak self] in
-                    self?.updateOverlay(with: incoming)
-                }
-            }
-        }
+        startSilentAudioLoopIfNeeded()
+        startUDPListenerIfNeeded()
 
         guard pipController == nil else { return }
 
@@ -95,7 +187,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
 
     func togglePiP() {
         configureIfNeeded()
-        configureAudioSession()
+        configureAudioSessionAndSilentLoop()
 
         guard let pipController else {
             statusMessage = "Không thể khởi tạo bộ điều khiển PiP."
@@ -112,7 +204,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
 
     func startPiP() {
         configureIfNeeded()
-        configureAudioSession()
+        configureAudioSessionAndSilentLoop()
         guard let pipController, !pipController.isPictureInPictureActive else { return }
         enqueueHUDFrame(for: currentTelemetry)
         pipController.startPictureInPicture()
@@ -124,6 +216,9 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     }
 
     func updateOverlay(with telemetry: TelemetryData) {
+        if telemetry.frameCount > 0 || telemetry.timestamp > 0 {
+            lastPacketReceivedAt = Date().timeIntervalSince1970
+        }
         currentTelemetry = telemetry
         configureIfNeeded()
         enqueueHUDFrame(for: telemetry)
@@ -133,9 +228,9 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         updateOverlay(with: telemetry)
     }
 
-    // MARK: - Private Audio & Keep-Alive
+    // MARK: - Background Silent Audio Keep-Alive
 
-    private func configureAudioSession() {
+    private func configureAudioSessionAndSilentLoop() {
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
@@ -143,11 +238,81 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         } catch {
             statusMessage = "Không thể cấu hình Audio Session nền: \(error.localizedDescription)"
         }
+        startSilentAudioLoopIfNeeded()
     }
+
+    private func startSilentAudioLoopIfNeeded() {
+        if let player = silentAudioPlayer {
+            if !player.isPlaying {
+                player.play()
+            }
+            return
+        }
+
+        let silentData = makeSilentWAVData(durationSeconds: 1.0, sampleRate: 8000)
+        do {
+            let player = try AVAudioPlayer(data: silentData, fileTypeHint: AVFileType.wav.rawValue)
+            player.numberOfLoops = -1
+            player.volume = 0.0
+            player.prepareToPlay()
+            player.play()
+            silentAudioPlayer = player
+        } catch {
+            statusMessage = "Không thể khởi tạo âm thanh nền giữ sống: \(error.localizedDescription)"
+        }
+    }
+
+    private func makeSilentWAVData(durationSeconds: Double, sampleRate: Int) -> Data {
+        let numChannels: UInt16 = 1
+        let bitsPerSample: UInt16 = 16
+        let sampleCount = max(1, Int(Double(sampleRate) * durationSeconds))
+        let dataByteSize = UInt32(sampleCount * Int(numChannels) * Int(bitsPerSample / 8))
+        let byteRate = UInt32(sampleRate) * UInt32(numChannels) * UInt32(bitsPerSample / 8)
+        let blockAlign: UInt16 = numChannels * (bitsPerSample / 8)
+        let riffSize: UInt32 = 36 + dataByteSize
+
+        var data = Data()
+        data.reserveCapacity(Int(44 + dataByteSize))
+        data.append("RIFF".data(using: .ascii)!)
+        withUnsafeBytes(of: riffSize.littleEndian) { data.append(contentsOf: $0) }
+        data.append("WAVE".data(using: .ascii)!)
+        data.append("fmt ".data(using: .ascii)!)
+        withUnsafeBytes(of: UInt32(16).littleEndian) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt16(1).littleEndian) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: numChannels.littleEndian) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt32(sampleRate).littleEndian) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: byteRate.littleEndian) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: blockAlign.littleEndian) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: bitsPerSample.littleEndian) { data.append(contentsOf: $0) }
+        data.append("data".data(using: .ascii)!)
+        withUnsafeBytes(of: dataByteSize.littleEndian) { data.append(contentsOf: $0) }
+        data.append(Data(count: Int(dataByteSize)))
+        return data
+    }
+
+    // MARK: - UDP IPv4 NWListener (0.0.0.0:45678)
+
+    private func startUDPListenerIfNeeded() {
+        udpReceiver.start(
+            port: SharedIPC.udpPort,
+            onTelemetry: { [weak self] telemetry in
+                Task { @MainActor [weak self] in
+                    self?.updateOverlay(with: telemetry)
+                }
+            },
+            onError: { [weak self] message in
+                Task { @MainActor [weak self] in
+                    self?.statusMessage = message
+                }
+            }
+        )
+    }
+
+    // MARK: - Keep-Alive Refresh Timer
 
     private func startKeepAliveTimer() {
         keepAliveTimer?.invalidate()
-        keepAliveTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        keepAliveTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.isPiPActive else { return }
                 self.enqueueHUDFrame(for: self.currentTelemetry)
@@ -160,7 +325,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         keepAliveTimer = nil
     }
 
-    // MARK: - CoreGraphics HUD Frame Rendering
+    // MARK: - CoreGraphics HUD Frame Rendering (640 x 210)
 
     private func enqueueHUDFrame(for telemetry: TelemetryData) {
         let displayLayer = sampleBufferView.displayLayer
@@ -217,7 +382,6 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             return nil
         }
 
-        // Chuyển gốc tọa độ sang trên-trái để vẽ UIKit text & layout chuẩn xác.
         cgContext.translateBy(x: 0, y: CGFloat(height))
         cgContext.scaleBy(x: 1, y: -1)
 
@@ -264,9 +428,8 @@ final class PiPOverlayManager: NSObject, ObservableObject {
 
     private func resolveDisplayTelemetry(_ telemetry: TelemetryData) -> (data: TelemetryData, isLive: Bool) {
         let now = Date().timeIntervalSince1970
-        let hasLiveSignal = telemetry.timestamp > 0
-            && (now - telemetry.timestamp) <= 4.0
-            && telemetry.calculatedPower > 0.0
+        let hasLiveSignal = lastPacketReceivedAt > 0
+            && (now - lastPacketReceivedAt) <= liveTimeoutSeconds
 
         let effectivePower = telemetry.calculatedPower > 0.0 ? telemetry.calculatedPower : defaultFallbackPower
         let effectiveAngle = telemetry.angle > 0.0 ? telemetry.angle : 65.0
@@ -295,10 +458,12 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             dx: effectiveDx,
             dy: telemetry.dy,
             wind: telemetry.wind,
+            windDirection: telemetry.windDirection,
             angle: effectiveAngle,
             calculatedPower: effectivePower,
             holdSeconds: effectiveHold,
             timestamp: telemetry.timestamp,
+            frameCount: telemetry.frameCount,
             trajectoryPoints: points
         )
         return (resolved, hasLiveSignal)
@@ -308,65 +473,121 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         let cgContext = UIGraphicsGetCurrentContext()
         let (displayTelemetry, isLive) = resolveDisplayTelemetry(telemetry)
 
-        // Nền tối bán trong suốt & viền sáng sắc nét kích thước 640 x 280.
-        UIColor(red: 0.03, green: 0.04, blue: 0.06, alpha: 0.88).setFill()
+        // Nền tối bán trong suốt & viền sáng sắc nét kích thước 640 x 210.
+        UIColor(red: 0.03, green: 0.04, blue: 0.06, alpha: 0.90).setFill()
         UIRectFill(rect)
 
         let outerRect = rect.insetBy(dx: 2, dy: 2)
-        let outerPath = UIBezierPath(roundedRect: outerRect, cornerRadius: 16)
-        UIColor(red: 0.06, green: 0.08, blue: 0.12, alpha: 0.94).setFill()
+        let outerPath = UIBezierPath(roundedRect: outerRect, cornerRadius: 14)
+        UIColor(red: 0.06, green: 0.08, blue: 0.12, alpha: 0.95).setFill()
         outerPath.fill()
 
-        UIColor(white: 1.0, alpha: 0.45).setStroke()
-        outerPath.lineWidth = 2.0
+        UIColor(white: 1.0, alpha: 0.42).setStroke()
+        outerPath.lineWidth = 1.8
         outerPath.stroke()
 
-        let innerBorderPath = UIBezierPath(roundedRect: rect.insetBy(dx: 4, dy: 4), cornerRadius: 14)
-        UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 0.22).setStroke()
-        innerBorderPath.lineWidth = 1.0
-        innerBorderPath.stroke()
-
-        // Chia rõ 2 vùng: phần trên 185px (quỹ đạo) và phần dưới 95px (thanh lực).
-        let splitY: CGFloat = 185.0
+        // Chia 2 vùng gọn gàng: phần trên 152px (chiến trường 2 tia) & sát cạnh dưới 58px (thước đo lực 0-100).
+        let splitY: CGFloat = 152.0
         let dividerPath = UIBezierPath()
-        dividerPath.move(to: CGPoint(x: 14, y: splitY))
-        dividerPath.addLine(to: CGPoint(x: rect.width - 14, y: splitY))
-        UIColor(white: 1.0, alpha: 0.20).setStroke()
+        dividerPath.move(to: CGPoint(x: 12, y: splitY))
+        dividerPath.addLine(to: CGPoint(x: rect.width - 12, y: splitY))
+        UIColor(white: 1.0, alpha: 0.18).setStroke()
         dividerPath.lineWidth = 1.0
         dividerPath.stroke()
 
-        drawTrajectorySection(
+        drawBattlefieldSection(
             in: CGRect(x: 0, y: 0, width: rect.width, height: splitY),
             telemetry: displayTelemetry,
             isLive: isLive,
             cgContext: cgContext
         )
 
-        drawPowerGaugeSection(
+        drawBottomPowerRuler(
             in: CGRect(x: 0, y: splitY, width: rect.width, height: rect.height - splitY),
             telemetry: displayTelemetry,
             cgContext: cgContext
         )
     }
 
-    // MARK: - Phần trên (185px): Khung đường kẻ quỹ đạo đến địch
+    // MARK: - Battlefield 2-Ray PC Aiming Section (152px)
 
-    private func drawTrajectorySection(
+    private func drawBattlefieldSection(
         in sectionRect: CGRect,
         telemetry: TelemetryData,
         isLive: Bool,
         cgContext: CGContext?
     ) {
-        let plotRect = CGRect(
-            x: 16,
-            y: 36,
-            width: sectionRect.width - 32,
-            height: sectionRect.height - 44
+        // 1. Góc trên trái: Góc | Gió (< hoặc >) | Giữ.
+        let arrowChar = telemetry.windDirection < 0 ? "<" : ">"
+        let headerText = String(
+            format: "Góc: %.0f° | Gió: %@ %.1f | Giữ: %.2fs",
+            telemetry.angle,
+            arrowChar,
+            abs(telemetry.wind),
+            telemetry.holdSeconds
         )
+        let headerAttrs: [NSAttributedString.Key: Any] = [
+            .font: UIFont.monospacedDigitSystemFont(ofSize: 12.5, weight: .bold),
+            .foregroundColor: UIColor.white
+        ]
+        let attrHeader = NSAttributedString(string: headerText, attributes: headerAttrs)
+        let headerSize = attrHeader.size()
+        let leftPill = CGRect(
+            x: 12,
+            y: 7,
+            width: min(sectionRect.width - 170, headerSize.width + 18),
+            height: 22
+        )
+        let leftPillPath = UIBezierPath(roundedRect: leftPill, cornerRadius: 6)
+        UIColor(red: 0.11, green: 0.14, blue: 0.21, alpha: 0.95).setFill()
+        leftPillPath.fill()
+        UIColor(white: 1.0, alpha: 0.18).setStroke()
+        leftPillPath.lineWidth = 1.0
+        leftPillPath.stroke()
+        attrHeader.draw(at: CGPoint(x: leftPill.minX + 9, y: leftPill.minY + (leftPill.height - headerSize.height) / 2.0))
 
-        // Nền vùng plot quỹ đạo & lưới tọa độ mờ.
-        let plotBg = UIBezierPath(roundedRect: plotRect, cornerRadius: 10)
-        UIColor(red: 0.04, green: 0.05, blue: 0.08, alpha: 0.85).setFill()
+        // 2. Góc trên phải: LIVE #[frameCount] (xanh lá) hoặc CHỜ TÍN HIỆU (vàng).
+        let statusColor = isLive
+            ? UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 1.0)
+            : UIColor(red: 1.0, green: 0.84, blue: 0.04, alpha: 1.0)
+        let statusText = isLive ? "LIVE #\(telemetry.frameCount)" : "CHỜ TÍN HIỆU"
+        let statusAttrs: [NSAttributedString.Key: Any] = [
+            .font: UIFont.monospacedDigitSystemFont(ofSize: 11.0, weight: .heavy),
+            .foregroundColor: statusColor
+        ]
+        let attrStatus = NSAttributedString(string: statusText, attributes: statusAttrs)
+        let statusSize = attrStatus.size()
+        let statusPillW = statusSize.width + 24.0
+        let statusPill = CGRect(
+            x: sectionRect.width - statusPillW - 12.0,
+            y: 7,
+            width: statusPillW,
+            height: 22
+        )
+        let statusPillPath = UIBezierPath(roundedRect: statusPill, cornerRadius: 6)
+        UIColor(red: 0.09, green: 0.12, blue: 0.18, alpha: 0.95).setFill()
+        statusPillPath.fill()
+        statusColor.withAlphaComponent(0.55).setStroke()
+        statusPillPath.lineWidth = 1.0
+        statusPillPath.stroke()
+
+        let dotCenter = CGPoint(x: statusPill.minX + 10.0, y: statusPill.midY)
+        statusColor.withAlphaComponent(0.35).setFill()
+        UIBezierPath(arcCenter: dotCenter, radius: 6.0, startAngle: 0, endAngle: .pi * 2, clockwise: true).fill()
+        statusColor.setFill()
+        UIBezierPath(arcCenter: dotCenter, radius: 3.5, startAngle: 0, endAngle: .pi * 2, clockwise: true).fill()
+
+        attrStatus.draw(at: CGPoint(x: statusPill.minX + 18.0, y: statusPill.minY + (statusPill.height - statusSize.height) / 2.0))
+
+        // 3. Khung vẽ chiến trường 2 tia.
+        let plotRect = CGRect(
+            x: 12,
+            y: 33,
+            width: sectionRect.width - 24,
+            height: sectionRect.height - 39
+        )
+        let plotBg = UIBezierPath(roundedRect: plotRect, cornerRadius: 9)
+        UIColor(red: 0.04, green: 0.05, blue: 0.08, alpha: 0.88).setFill()
         plotBg.fill()
         UIColor(white: 1.0, alpha: 0.10).setStroke()
         plotBg.lineWidth = 1.0
@@ -375,16 +596,15 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         cgContext?.saveGState()
         plotBg.addClip()
 
+        // Lưới tọa độ mờ.
         let gridPath = UIBezierPath()
-        let verticalDivisions = 8
-        for idx in 1..<verticalDivisions {
-            let gx = plotRect.minX + (plotRect.width * CGFloat(idx) / CGFloat(verticalDivisions))
+        for idx in 1..<8 {
+            let gx = plotRect.minX + (plotRect.width * CGFloat(idx) / 8.0)
             gridPath.move(to: CGPoint(x: gx, y: plotRect.minY))
             gridPath.addLine(to: CGPoint(x: gx, y: plotRect.maxY))
         }
-        let horizontalDivisions = 4
-        for idx in 1..<horizontalDivisions {
-            let gy = plotRect.minY + (plotRect.height * CGFloat(idx) / CGFloat(horizontalDivisions))
+        for idx in 1..<3 {
+            let gy = plotRect.minY + (plotRect.height * CGFloat(idx) / 3.0)
             gridPath.move(to: CGPoint(x: plotRect.minX, y: gy))
             gridPath.addLine(to: CGPoint(x: plotRect.maxX, y: gy))
         }
@@ -392,7 +612,6 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         gridPath.lineWidth = 0.8
         gridPath.stroke()
 
-        // Xác định danh sách điểm quỹ đạo hoặc điểm người chơi / mục tiêu mặc định.
         let mappedPoints: [CGPoint] = telemetry.trajectoryPoints.map { pt in
             CGPoint(
                 x: plotRect.minX + CGFloat(pt.x) * plotRect.width,
@@ -409,174 +628,116 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             let shootsRight = telemetry.dx >= 0.0
             let leftX = plotRect.minX + plotRect.width * 0.12
             let rightX = plotRect.minX + plotRect.width * 0.88
-            let baselineY = plotRect.minY + plotRect.height * 0.78
+            let baselineY = plotRect.minY + plotRect.height * 0.80
             playerPoint = CGPoint(x: shootsRight ? leftX : rightX, y: baselineY)
-            let clampedDy = min(max(telemetry.dy, -0.5), 0.5)
-            let targetY = min(max(baselineY - CGFloat(clampedDy) * plotRect.height * 0.7, plotRect.minY + 18), plotRect.maxY - 14)
-            targetPoint = CGPoint(x: shootsRight ? rightX : leftX, y: targetY)
+            targetPoint = CGPoint(x: shootsRight ? rightX : leftX, y: baselineY)
         }
 
         // Đường mặt đất ngang tại cao độ người chơi.
-        let groundY = min(max(playerPoint.y, plotRect.minY + 14), plotRect.maxY - 10)
+        let groundY = min(max(playerPoint.y, plotRect.minY + 12), plotRect.maxY - 8)
         let groundPath = UIBezierPath()
         groundPath.move(to: CGPoint(x: plotRect.minX, y: groundY))
         groundPath.addLine(to: CGPoint(x: plotRect.maxX, y: groundY))
-        UIColor(red: 0.35, green: 0.75, blue: 0.55, alpha: 0.32).setStroke()
-        groundPath.lineWidth = 1.4
+        UIColor(red: 0.35, green: 0.75, blue: 0.55, alpha: 0.28).setStroke()
+        groundPath.lineWidth = 1.1
         groundPath.stroke()
 
-        // Đường cong parabol nét đứt màu xanh lá neon (#00FF88).
+        // TIA 1 (Tia ngắm góc): Đường thẳng nét mảnh màu vàng chiếu từ chấm xanh theo đúng góc bắn.
+        let safeAngleRad = CGFloat(min(max(telemetry.angle, 1.0), 89.0) * .pi / 180.0)
+        let directionSign: CGFloat = telemetry.dx >= 0.0 ? 1.0 : -1.0
+        let rayLength: CGFloat = 240.0
+        let rayEnd = CGPoint(
+            x: playerPoint.x + directionSign * cos(safeAngleRad) * rayLength,
+            y: playerPoint.y - sin(safeAngleRad) * rayLength
+        )
+        let angleRay = UIBezierPath()
+        angleRay.move(to: playerPoint)
+        angleRay.addLine(to: rayEnd)
+        UIColor(red: 1.0, green: 0.84, blue: 0.10, alpha: 0.92).setStroke()
+        angleRay.lineWidth = 1.4
+        angleRay.stroke()
+
+        // TIA 2 (Quỹ đạo đạn): Đường cong parabol nét đứt màu đỏ/xanh neon bay vồng tới trúng chấm đỏ.
         if mappedPoints.count >= 2 {
             let curvePath = UIBezierPath()
             curvePath.move(to: mappedPoints[0])
             for pt in mappedPoints.dropFirst() {
-                curvePath.addLine(to: pt)
+                curvePath.addLineToPoint(pt)
             }
 
-            let dashPattern: [CGFloat] = [8.0, 5.0]
+            let dashPattern: [CGFloat] = [7.0, 5.0]
             curvePath.lineCapStyle = .round
             curvePath.setLineDash(dashPattern, count: dashPattern.count, phase: 0)
 
-            // Lớp phát sáng nhẹ bên ngoài.
-            UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 0.28).setStroke()
-            curvePath.lineWidth = 5.5
+            // Lớp viền phát sáng đỏ rực bên ngoài.
+            UIColor(red: 1.0, green: 0.22, blue: 0.18, alpha: 0.42).setStroke()
+            curvePath.lineWidth = 4.8
             curvePath.stroke()
 
-            // Đường nét đứt neon chính sắc nét.
+            // Lõi đường cong nét đứt xanh lá neon sắc nét.
             UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 1.0).setStroke()
-            curvePath.lineWidth = 2.4
+            curvePath.lineWidth = 2.2
             curvePath.stroke()
         }
 
-        // Điểm người chơi: hình tròn xanh dương phát sáng.
-        let playerGlow = UIBezierPath(arcCenter: playerPoint, radius: 11, startAngle: 0, endAngle: .pi * 2, clockwise: true)
-        UIColor(red: 0.18, green: 0.62, blue: 1.0, alpha: 0.32).setFill()
-        playerGlow.fill()
-
-        let playerCircle = UIBezierPath(arcCenter: playerPoint, radius: 6, startAngle: 0, endAngle: .pi * 2, clockwise: true)
+        // Chấm xanh (người chơi).
+        UIColor(red: 0.16, green: 0.62, blue: 1.0, alpha: 0.32).setFill()
+        UIBezierPath(arcCenter: playerPoint, radius: 10, startAngle: 0, endAngle: .pi * 2, clockwise: true).fill()
+        let playerCircle = UIBezierPath(arcCenter: playerPoint, radius: 5.5, startAngle: 0, endAngle: .pi * 2, clockwise: true)
         UIColor(red: 0.16, green: 0.65, blue: 1.0, alpha: 1.0).setFill()
         playerCircle.fill()
         UIColor.white.setStroke()
-        playerCircle.lineWidth = 1.6
+        playerCircle.lineWidth = 1.4
         playerCircle.stroke()
 
-        // Điểm mục tiêu địch: hình tròn đỏ có tâm ngắm.
-        let enemyGlow = UIBezierPath(arcCenter: targetPoint, radius: 11, startAngle: 0, endAngle: .pi * 2, clockwise: true)
-        UIColor(red: 1.0, green: 0.22, blue: 0.22, alpha: 0.28).setFill()
-        enemyGlow.fill()
-
-        let enemyRing = UIBezierPath(arcCenter: targetPoint, radius: 6.5, startAngle: 0, endAngle: .pi * 2, clockwise: true)
-        UIColor(red: 1.0, green: 0.24, blue: 0.24, alpha: 0.95).setFill()
-        enemyRing.fill()
+        // Chấm đỏ (địch) có tâm ngắm.
+        UIColor(red: 1.0, green: 0.20, blue: 0.20, alpha: 0.30).setFill()
+        UIBezierPath(arcCenter: targetPoint, radius: 10, startAngle: 0, endAngle: .pi * 2, clockwise: true).fill()
+        let enemyCircle = UIBezierPath(arcCenter: targetPoint, radius: 6.0, startAngle: 0, endAngle: .pi * 2, clockwise: true)
+        UIColor(red: 1.0, green: 0.22, blue: 0.22, alpha: 0.96).setFill()
+        enemyCircle.fill()
         UIColor.white.setStroke()
-        enemyRing.lineWidth = 1.4
-        enemyRing.stroke()
+        enemyCircle.lineWidth = 1.3
+        enemyCircle.stroke()
 
-        let reticlePath = UIBezierPath()
-        let arm: CGFloat = 10.5
-        reticlePath.move(to: CGPoint(x: targetPoint.x - arm, y: targetPoint.y))
-        reticlePath.addLine(to: CGPoint(x: targetPoint.x + arm, y: targetPoint.y))
-        reticlePath.move(to: CGPoint(x: targetPoint.x, y: targetPoint.y - arm))
-        reticlePath.addLine(to: CGPoint(x: targetPoint.x, y: targetPoint.y + arm))
+        let reticle = UIBezierPath()
+        let arm: CGFloat = 9.5
+        reticle.move(to: CGPoint(x: targetPoint.x - arm, y: targetPoint.y))
+        reticle.addLine(to: CGPoint(x: targetPoint.x + arm, y: targetPoint.y))
+        reticle.move(to: CGPoint(x: targetPoint.x, y: targetPoint.y - arm))
+        reticle.addLine(to: CGPoint(x: targetPoint.x, y: targetPoint.y + arm))
         UIColor(red: 1.0, green: 0.85, blue: 0.85, alpha: 0.95).setStroke()
-        reticlePath.lineWidth = 1.2
-        reticlePath.stroke()
+        reticle.lineWidth = 1.1
+        reticle.stroke()
 
         cgContext?.restoreGState()
-
-        // Thanh thông số gọn ở góc trên: Góc | Gió | Giữ.
-        let windSign = telemetry.wind > 0 ? "+" : ""
-        let headerText = String(
-            format: "Góc: %.0f°  |  Gió: %@%.1f  |  Giữ: %.2fs",
-            telemetry.angle,
-            windSign,
-            telemetry.wind,
-            telemetry.holdSeconds
-        )
-        let headerAttrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.monospacedDigitSystemFont(ofSize: 13.5, weight: .bold),
-            .foregroundColor: UIColor.white
-        ]
-        let attrHeader = NSAttributedString(string: headerText, attributes: headerAttrs)
-        let headerSize = attrHeader.size()
-        let pillRect = CGRect(
-            x: 16,
-            y: 8,
-            width: min(sectionRect.width - 110, headerSize.width + 20),
-            height: 22
-        )
-        let pillPath = UIBezierPath(roundedRect: pillRect, cornerRadius: 7)
-        UIColor(red: 0.12, green: 0.15, blue: 0.22, alpha: 0.95).setFill()
-        pillPath.fill()
-        UIColor(white: 1.0, alpha: 0.18).setStroke()
-        pillPath.lineWidth = 1.0
-        pillPath.stroke()
-
-        attrHeader.draw(at: CGPoint(x: pillRect.minX + 10, y: pillRect.minY + (pillRect.height - headerSize.height) / 2.0))
-
-        // Chấm trạng thái ở góc trên bên phải PiP: xanh lá khi nhận dữ liệu sống, vàng khi chờ tín hiệu.
-        let statusColor = isLive
-            ? UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 1.0)
-            : UIColor(red: 1.0, green: 0.84, blue: 0.04, alpha: 1.0)
-        let statusText = isLive ? "LIVE" : "CHỜ"
-        let statusAttrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.systemFont(ofSize: 10.5, weight: .bold),
-            .foregroundColor: statusColor
-        ]
-        let attrStatus = NSAttributedString(string: statusText, attributes: statusAttrs)
-        let statusTextSize = attrStatus.size()
-        let statusPillWidth = statusTextSize.width + 26.0
-        let statusPillRect = CGRect(
-            x: sectionRect.width - statusPillWidth - 16.0,
-            y: 8,
-            width: statusPillWidth,
-            height: 22
-        )
-        let statusPill = UIBezierPath(roundedRect: statusPillRect, cornerRadius: 7)
-        UIColor(red: 0.10, green: 0.13, blue: 0.19, alpha: 0.95).setFill()
-        statusPill.fill()
-        statusColor.withAlphaComponent(0.45).setStroke()
-        statusPill.lineWidth = 1.0
-        statusPill.stroke()
-
-        let dotCenter = CGPoint(x: statusPillRect.minX + 11.0, y: statusPillRect.midY)
-        statusColor.withAlphaComponent(0.35).setFill()
-        UIBezierPath(arcCenter: dotCenter, radius: 6.5, startAngle: 0, endAngle: .pi * 2, clockwise: true).fill()
-        statusColor.setFill()
-        UIBezierPath(arcCenter: dotCenter, radius: 3.8, startAngle: 0, endAngle: .pi * 2, clockwise: true).fill()
-
-        attrStatus.draw(at: CGPoint(
-            x: statusPillRect.minX + 20.0,
-            y: statusPillRect.minY + (statusPillRect.height - statusTextSize.height) / 2.0
-        ))
     }
 
-    // MARK: - Phần dưới (95px): Thanh vạch lực bắn trực quan (0 - 100)
+    // MARK: - Bottom Power Ruler (58px: 0 — 25 — 50 — 75 — 100)
 
-    private func drawPowerGaugeSection(in sectionRect: CGRect, telemetry: TelemetryData, cgContext: CGContext?) {
-        let barMarginX: CGFloat = 22.0
+    private func drawBottomPowerRuler(in sectionRect: CGRect, telemetry: TelemetryData, cgContext: CGContext?) {
+        let barMarginX: CGFloat = 20.0
         let barRect = CGRect(
             x: barMarginX,
-            y: sectionRect.minY + 42.0,
+            y: sectionRect.minY + 18.0,
             width: sectionRect.width - barMarginX * 2.0,
-            height: 22.0
+            height: 16.0
         )
 
         let clampedPower = CGFloat(min(max(telemetry.calculatedPower, 0.0), 100.0))
         let fillWidth = barRect.width * (clampedPower / 100.0)
         let markerX = barRect.minX + fillWidth
 
-        // Nền thanh lực tối.
-        let trackPath = UIBezierPath(roundedRect: barRect, cornerRadius: 6)
+        // Nền thước lực.
+        let trackPath = UIBezierPath(roundedRect: barRect, cornerRadius: 5)
         UIColor(red: 0.12, green: 0.14, blue: 0.19, alpha: 1.0).setFill()
         trackPath.fill()
 
-        // Tô màu từ 0 đến calculatedPower bằng gradient Vàng -> Cam -> Đỏ.
+        // Tô dải màu Vàng -> Cam -> Đỏ từ 0 đến lực cần bắn.
         if fillWidth > 0.5, let cgContext {
             cgContext.saveGState()
-            let fillClipRect = CGRect(x: barRect.minX, y: barRect.minY, width: fillWidth, height: barRect.height)
             trackPath.addClip()
-            cgContext.clip(to: fillClipRect)
+            cgContext.clip(to: CGRect(x: barRect.minX, y: barRect.minY, width: fillWidth, height: barRect.height))
 
             let colors = [
                 UIColor(red: 1.0, green: 0.90, blue: 0.12, alpha: 1.0).cgColor,
@@ -595,31 +756,27 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             cgContext.restoreGState()
         }
 
-        // Viền ngoài thanh lực.
         UIColor(white: 1.0, alpha: 0.35).setStroke()
-        trackPath.lineWidth = 1.2
+        trackPath.lineWidth = 1.0
         trackPath.stroke()
 
-        // Chia vạch nhỏ mỗi 5 đơn vị và vạch lớn + nhãn tại 0, 25, 50, 75, 100.
-        let tickLabelAttrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+        // Vạch chia 0 — 25 — 50 — 75 — 100.
+        let tickAttrs: [NSAttributedString.Key: Any] = [
+            .font: UIFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .bold),
             .foregroundColor: UIColor(white: 0.78, alpha: 1.0)
         ]
-
         for step in stride(from: 0, through: 100, by: 5) {
-            let ratio = CGFloat(step) / 100.0
-            let tx = barRect.minX + barRect.width * ratio
+            let tx = barRect.minX + barRect.width * (CGFloat(step) / 100.0)
             let isMajor = step % 25 == 0
-
-            let tickPath = UIBezierPath()
+            let tick = UIBezierPath()
             if isMajor {
-                tickPath.move(to: CGPoint(x: tx, y: barRect.minY))
-                tickPath.addLine(to: CGPoint(x: tx, y: barRect.maxY + 4))
-                UIColor(white: 1.0, alpha: 0.72).setStroke()
-                tickPath.lineWidth = 1.4
-                tickPath.stroke()
+                tick.move(to: CGPoint(x: tx, y: barRect.minY))
+                tick.addLine(to: CGPoint(x: tx, y: barRect.maxY + 3))
+                UIColor(white: 1.0, alpha: 0.75).setStroke()
+                tick.lineWidth = 1.2
+                tick.stroke()
 
-                let label = NSAttributedString(string: "\(step)", attributes: tickLabelAttrs)
+                let label = NSAttributedString(string: "\(step)", attributes: tickAttrs)
                 let labelSize = label.size()
                 let labelX: CGFloat
                 if step == 0 {
@@ -629,62 +786,53 @@ final class PiPOverlayManager: NSObject, ObservableObject {
                 } else {
                     labelX = tx - labelSize.width / 2.0
                 }
-                label.draw(at: CGPoint(x: labelX, y: barRect.maxY + 6))
+                label.draw(at: CGPoint(x: labelX, y: barRect.maxY + 4))
             } else {
-                tickPath.move(to: CGPoint(x: tx, y: barRect.maxY - 6))
-                tickPath.addLine(to: CGPoint(x: tx, y: barRect.maxY))
-                UIColor(white: 1.0, alpha: 0.25).setStroke()
-                tickPath.lineWidth = 0.8
-                tickPath.stroke()
+                tick.move(to: CGPoint(x: tx, y: barRect.maxY - 4))
+                tick.addLine(to: CGPoint(x: tx, y: barRect.maxY))
+                UIColor(white: 1.0, alpha: 0.24).setStroke()
+                tick.lineWidth = 0.8
+                tick.stroke()
             }
         }
 
-        // Vạch chỉ thị dọc màu trắng/đỏ nổi bật tại vị trí lực cần bắn.
-        let markerTop = barRect.minY - 5
-        let markerBottom = barRect.maxY + 5
+        // Vạch chỉ thị đỏ nổi bật tại vị trí lực cần bắn.
+        let redLine = UIBezierPath()
+        redLine.move(to: CGPoint(x: markerX, y: barRect.minY - 4))
+        redLine.addLine(to: CGPoint(x: markerX, y: barRect.maxY + 4))
+        redLine.lineCapStyle = .round
+        UIColor(red: 1.0, green: 0.16, blue: 0.14, alpha: 1.0).setStroke()
+        redLine.lineWidth = 4.2
+        redLine.stroke()
 
-        let redMarkerPath = UIBezierPath()
-        redMarkerPath.move(to: CGPoint(x: markerX, y: markerTop))
-        redMarkerPath.addLine(to: CGPoint(x: markerX, y: markerBottom))
-        redMarkerPath.lineCapStyle = .round
-        UIColor(red: 1.0, green: 0.18, blue: 0.18, alpha: 0.95).setStroke()
-        redMarkerPath.lineWidth = 5.0
-        redMarkerPath.stroke()
-
-        let whiteMarkerPath = UIBezierPath()
-        whiteMarkerPath.move(to: CGPoint(x: markerX, y: markerTop + 1))
-        whiteMarkerPath.addLine(to: CGPoint(x: markerX, y: markerBottom - 1))
-        whiteMarkerPath.lineCapStyle = .round
+        let whiteCore = UIBezierPath()
+        whiteCore.move(to: CGPoint(x: markerX, y: barRect.minY - 3))
+        whiteCore.addLine(to: CGPoint(x: markerX, y: barRect.maxY + 3))
+        whiteCore.lineCapStyle = .round
         UIColor.white.setStroke()
-        whiteMarkerPath.lineWidth = 2.2
-        whiteMarkerPath.stroke()
+        whiteCore.lineWidth = 1.6
+        whiteCore.stroke()
 
-        // Con số lực lớn ngay phía trên vạch chỉ thị.
+        // Con số lực cần bắn ngay phía trên vạch chỉ thị.
         let powerText = String(format: "%.1f", clampedPower)
         let powerAttrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.monospacedDigitSystemFont(ofSize: 24, weight: .heavy),
+            .font: UIFont.monospacedDigitSystemFont(ofSize: 13.0, weight: .heavy),
             .foregroundColor: UIColor.white
         ]
         let attrPower = NSAttributedString(string: powerText, attributes: powerAttrs)
         let powerSize = attrPower.size()
-        let desiredPowerX = markerX - powerSize.width / 2.0
-        let clampedPowerX = min(max(desiredPowerX, barRect.minX), barRect.maxX - powerSize.width)
-        let powerY = sectionRect.minY + 7.0
+        let desiredX = markerX - powerSize.width / 2.0
+        let clampedX = min(max(desiredX, barRect.minX), barRect.maxX - powerSize.width)
+        let badgeY = sectionRect.minY + 1.0
 
-        let badgeRect = CGRect(
-            x: clampedPowerX - 7,
-            y: powerY - 1,
-            width: powerSize.width + 14,
-            height: powerSize.height + 2
-        )
-        let badgePath = UIBezierPath(roundedRect: badgeRect, cornerRadius: 6)
-        UIColor(red: 0.88, green: 0.18, blue: 0.14, alpha: 0.92).setFill()
+        let badgeRect = CGRect(x: clampedX - 6, y: badgeY, width: powerSize.width + 12, height: 16)
+        let badgePath = UIBezierPath(roundedRect: badgeRect, cornerRadius: 4)
+        UIColor(red: 0.90, green: 0.16, blue: 0.12, alpha: 0.96).setFill()
         badgePath.fill()
-        UIColor(white: 1.0, alpha: 0.85).setStroke()
-        badgePath.lineWidth = 1.0
+        UIColor(white: 1.0, alpha: 0.80).setStroke()
+        badgePath.lineWidth = 0.8
         badgePath.stroke()
-
-        attrPower.draw(at: CGPoint(x: clampedPowerX, y: powerY))
+        attrPower.draw(at: CGPoint(x: clampedX, y: badgeY + (16.0 - powerSize.height) / 2.0))
     }
 }
 

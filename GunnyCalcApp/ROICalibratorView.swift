@@ -452,9 +452,9 @@ struct ROICalibratorView: View {
             grassStrip.lineWidth = h * 0.025
             grassStrip.stroke()
 
-            // 2. Ô Gió ở chính giữa trên cùng (khớp windROI: x: 0.44, y: 0.01, w: 0.12, h: 0.09).
-            let windBox = CGRect(x: w * 0.44, y: h * 0.01, width: w * 0.12, height: h * 0.09)
-            let windBg = UIBezierPath(roundedRect: windBox.insetBy(dx: 3, dy: 2), cornerRadius: 10)
+            // 2. Ô Gió ở chính giữa trên cùng (khớp windROI: x: 0.445, y: 0.00, w: 0.110, h: 0.075).
+            let windBox = CGRect(x: w * 0.445, y: h * 0.00, width: w * 0.110, height: h * 0.075)
+            let windBg = UIBezierPath(roundedRect: windBox.insetBy(dx: 3, dy: 2), cornerRadius: 8)
             UIColor(red: 0.06, green: 0.10, blue: 0.18, alpha: 0.90).setFill()
             windBg.fill()
             UIColor(red: 0.35, green: 0.82, blue: 1.0, alpha: 0.85).setStroke()
@@ -464,22 +464,22 @@ struct ROICalibratorView: View {
             let windPara = NSMutableParagraphStyle()
             windPara.alignment = .center
             let windText = NSAttributedString(
-                string: "+1.5",
+                string: "1.5 >",
                 attributes: [
-                    .font: UIFont.monospacedDigitSystemFont(ofSize: h * 0.044, weight: .bold),
+                    .font: UIFont.monospacedDigitSystemFont(ofSize: h * 0.036, weight: .bold),
                     .foregroundColor: UIColor.white,
                     .paragraphStyle: windPara
                 ]
             )
             windText.draw(in: CGRect(
                 x: windBox.minX,
-                y: windBox.midY - h * 0.027,
+                y: windBox.midY - h * 0.022,
                 width: windBox.width,
-                height: h * 0.055
+                height: h * 0.048
             ))
 
-            // 3. Ô Minimap ở góc trên bên phải (khớp minimapROI: x: 0.67, y: 0.03, w: 0.30, h: 0.28).
-            let miniBox = CGRect(x: w * 0.67, y: h * 0.03, width: w * 0.30, height: h * 0.28)
+            // 3. Ô Minimap ở góc trên bên phải (khớp minimapROI: x: 0.845, y: 0.00, w: 0.155, h: 0.165).
+            let miniBox = CGRect(x: w * 0.845, y: h * 0.00, width: w * 0.155, height: h * 0.165)
             let miniBg = UIBezierPath(roundedRect: miniBox, cornerRadius: 10)
             UIColor(red: 0.08, green: 0.11, blue: 0.15, alpha: 0.88).setFill()
             miniBg.fill()
@@ -522,9 +522,9 @@ struct ROICalibratorView: View {
                 clockwise: true
             ).fill()
 
-            // 4. Nhân vật, địch và chữ "Góc 31°" trong vùng trung tâm chiến trường (angleROI: 0.22, 0.18, 0.56, 0.48).
-            let playerPos = CGPoint(x: w * 0.30, y: h * 0.54)
-            let enemyPos = CGPoint(x: w * 0.69, y: h * 0.54)
+            // 4. Nhân vật, địch và chữ "Góc 21°" trong vùng trung tâm chiến trường (angleROI: 0.120, 0.14, 0.760, 0.550).
+            let playerPos = CGPoint(x: w * 0.25, y: h * 0.54)
+            let enemyPos = CGPoint(x: w * 0.73, y: h * 0.54)
 
             // Nhân vật người chơi.
             let playerBody = UIBezierPath(ovalIn: CGRect(x: playerPos.x - 18, y: playerPos.y - 44, width: 36, height: 44))
@@ -542,8 +542,8 @@ struct ROICalibratorView: View {
             enemyBody.lineWidth = 2
             enemyBody.stroke()
 
-            // Nhãn góc bắn nổi cạnh nhân vật: "Góc 31°".
-            let angleBadgeRect = CGRect(x: w * 0.35, y: h * 0.36, width: w * 0.13, height: h * 0.085)
+            // Nhãn góc bắn nổi cạnh nhân vật: "Góc 21°".
+            let angleBadgeRect = CGRect(x: w * 0.30, y: h * 0.36, width: w * 0.13, height: h * 0.085)
             let angleBadgePath = UIBezierPath(roundedRect: angleBadgeRect, cornerRadius: 8)
             UIColor(red: 0.04, green: 0.06, blue: 0.10, alpha: 0.88).setFill()
             angleBadgePath.fill()
@@ -554,7 +554,7 @@ struct ROICalibratorView: View {
             let anglePara = NSMutableParagraphStyle()
             anglePara.alignment = .center
             let angleText = NSAttributedString(
-                string: "Góc 31°",
+                string: "Góc 21°",
                 attributes: [
                     .font: UIFont.systemFont(ofSize: h * 0.044, weight: .heavy),
                     .foregroundColor: UIColor(red: 1.0, green: 0.85, blue: 0.25, alpha: 1.0),

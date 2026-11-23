@@ -171,9 +171,11 @@ public struct BallisticsEngine: Sendable {
         dx: Double,
         dy: Double,
         wind: Double,
+        windDirection: Int? = nil,
         detectedAngle: Double?,
         config: BallisticsConfig,
-        timestamp: TimeInterval = Date().timeIntervalSince1970
+        timestamp: TimeInterval = Date().timeIntervalSince1970,
+        frameCount: Int = 0
     ) -> TelemetryData {
         let effectiveAngle = config.useOCRAngle ? (detectedAngle ?? config.selectedAngle) : config.selectedAngle
         let power = calculatePower(
@@ -199,10 +201,12 @@ public struct BallisticsEngine: Sendable {
             dx: dx,
             dy: dy,
             wind: wind,
+            windDirection: windDirection,
             angle: effectiveAngle,
             calculatedPower: power,
             holdSeconds: holdSeconds,
             timestamp: timestamp,
+            frameCount: frameCount,
             trajectoryPoints: trajectory
         )
     }

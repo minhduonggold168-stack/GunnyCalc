@@ -86,9 +86,9 @@ public struct ROIConfig: Codable, Equatable, Sendable {
         self.angleRect = angleRect
     }
 
-    public static let defaultMinimapROI = CGRect(x: 0.67, y: 0.03, width: 0.30, height: 0.28)
-    public static let defaultWindROI = CGRect(x: 0.44, y: 0.01, width: 0.12, height: 0.09)
-    public static let defaultAngleROI = CGRect(x: 0.22, y: 0.18, width: 0.56, height: 0.48)
+    public static let defaultMinimapROI = CGRect(x: 0.845, y: 0.00, width: 0.155, height: 0.165)
+    public static let defaultWindROI = CGRect(x: 0.445, y: 0.00, width: 0.110, height: 0.075)
+    public static let defaultAngleROI = CGRect(x: 0.120, y: 0.14, width: 0.760, height: 0.550)
 
     public static let `default` = ROIConfig(
         minimapRect: NormalizedRect(defaultMinimapROI),
@@ -110,9 +110,9 @@ public struct TrajectoryPoint: Codable, Equatable, Sendable {
 
 /// Tham số hiệu chỉnh đạn đạo, thời gian giữ thanh lực và bộ tọa độ ROI mặc định chuẩn Gunny Mobi 19.5:9.
 public struct BallisticsConfig: Codable, Equatable, Sendable {
-    public static let defaultMinimapROI = CGRect(x: 0.67, y: 0.03, width: 0.30, height: 0.28)
-    public static let defaultWindROI = CGRect(x: 0.44, y: 0.01, width: 0.12, height: 0.09)
-    public static let defaultAngleROI = CGRect(x: 0.22, y: 0.18, width: 0.56, height: 0.48)
+    public static let defaultMinimapROI = CGRect(x: 0.845, y: 0.00, width: 0.155, height: 0.165)
+    public static let defaultWindROI = CGRect(x: 0.445, y: 0.00, width: 0.110, height: 0.075)
+    public static let defaultAngleROI = CGRect(x: 0.120, y: 0.14, width: 0.760, height: 0.550)
 
     public var selectedAngle: Double
     public var powerFactor: Double
@@ -175,29 +175,35 @@ public struct TelemetryData: Codable, Equatable, Sendable {
     public var dx: Double
     public var dy: Double
     public var wind: Double
+    public var windDirection: Int
     public var angle: Double
     public var calculatedPower: Double
     public var holdSeconds: Double
     public var timestamp: TimeInterval
+    public var frameCount: Int
     public var trajectoryPoints: [TrajectoryPoint]
 
     public init(
         dx: Double,
         dy: Double,
         wind: Double,
+        windDirection: Int? = nil,
         angle: Double,
         calculatedPower: Double,
         holdSeconds: Double,
         timestamp: TimeInterval = Date().timeIntervalSince1970,
+        frameCount: Int = 0,
         trajectoryPoints: [TrajectoryPoint] = []
     ) {
         self.dx = dx
         self.dy = dy
         self.wind = wind
+        self.windDirection = windDirection ?? (wind < 0 ? -1 : 1)
         self.angle = angle
         self.calculatedPower = min(max(calculatedPower, 0.0), 100.0)
         self.holdSeconds = max(holdSeconds, 0.0)
         self.timestamp = timestamp
+        self.frameCount = max(frameCount, 0)
         self.trajectoryPoints = trajectoryPoints
     }
 
@@ -205,13 +211,16 @@ public struct TelemetryData: Codable, Equatable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.dx = try container.decodeIfPresent(Double.self, forKey: .dx) ?? 0.0
         self.dy = try container.decodeIfPresent(Double.self, forKey: .dy) ?? 0.0
-        self.wind = try container.decodeIfPresent(Double.self, forKey: .wind) ?? 0.0
+        let decodedWind = try container.decodeIfPresent(Double.self, forKey: .wind) ?? 0.0
+        self.wind = decodedWind
+        self.windDirection = try container.decodeIfPresent(Int.self, forKey: .windDirection) ?? (decodedWind < 0 ? -1 : 1)
         self.angle = try container.decodeIfPresent(Double.self, forKey: .angle) ?? 65.0
         let rawPower = try container.decodeIfPresent(Double.self, forKey: .calculatedPower) ?? 0.0
         self.calculatedPower = min(max(rawPower, 0.0), 100.0)
         let rawHold = try container.decodeIfPresent(Double.self, forKey: .holdSeconds) ?? 0.0
         self.holdSeconds = max(rawHold, 0.0)
         self.timestamp = try container.decodeIfPresent(TimeInterval.self, forKey: .timestamp) ?? 0.0
+        self.frameCount = try container.decodeIfPresent(Int.self, forKey: .frameCount) ?? 0
         self.trajectoryPoints = try container.decodeIfPresent([TrajectoryPoint].self, forKey: .trajectoryPoints) ?? []
     }
 
@@ -219,10 +228,12 @@ public struct TelemetryData: Codable, Equatable, Sendable {
         dx: 0.0,
         dy: 0.0,
         wind: 0.0,
+        windDirection: 1,
         angle: 65.0,
         calculatedPower: 0.0,
         holdSeconds: 0.0,
         timestamp: 0,
+        frameCount: 0,
         trajectoryPoints: []
     )
 }
