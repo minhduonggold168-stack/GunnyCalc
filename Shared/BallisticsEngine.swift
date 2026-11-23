@@ -171,7 +171,7 @@ public struct BallisticsEngine: Sendable {
         dx: Double,
         dy: Double,
         wind: Double,
-        windDirection: Int? = nil,
+        windDirection: Int = 1,
         detectedAngle: Double?,
         config: BallisticsConfig,
         timestamp: TimeInterval = Date().timeIntervalSince1970,

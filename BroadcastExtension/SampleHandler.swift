@@ -220,7 +220,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     private func startUDPConnectionIfNeeded() {
         udpQueue.async { [weak self] in
-            guard let self, self.udpConnection == nil else { return }
+            guard let self, self.udpConnection == nil,
+                  let port = NWEndpoint.Port(rawValue: SharedIPC.udpPort) else { return }
 
             let parameters = NWParameters.udp
             if let ipOptions = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
@@ -229,7 +230,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
             let connection = NWConnection(
                 host: NWEndpoint.Host(SharedIPC.udpHost),
-                port: NWEndpoint.Port(rawValue: SharedIPC.udpPort)!,
+                port: port,
                 using: parameters
             )
             connection.stateUpdateHandler = { [weak self] state in
@@ -255,13 +256,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
         udpQueue.async { [weak self] in
             guard let self else { return }
             if self.udpConnection == nil {
+                guard let port = NWEndpoint.Port(rawValue: SharedIPC.udpPort) else { return }
                 let parameters = NWParameters.udp
                 if let ipOptions = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
                     ipOptions.version = .v4
                 }
                 let conn = NWConnection(
                     host: NWEndpoint.Host(SharedIPC.udpHost),
-                    port: NWEndpoint.Port(rawValue: SharedIPC.udpPort)!,
+                    port: port,
                     using: parameters
                 )
                 conn.stateUpdateHandler = { [weak self] state in

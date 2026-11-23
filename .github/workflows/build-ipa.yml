@@ -26,6 +26,7 @@ jobs:
 
       - name: Build GunnyCalcApp (Release / iphoneos)
         run: |
+          set -o pipefail
           xcodebuild build \
             -project GunnyCalc.xcodeproj \
             -scheme GunnyCalcApp \
@@ -34,7 +35,11 @@ jobs:
             -derivedDataPath build \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee xcodebuild.log || {
+              echo "=== XCODEBUILD ERRORS ==="
+              grep -nE "(error:|fatal error:|Undefined symbols|ld:)" xcodebuild.log || true
+              exit 1
+            }
 
       - name: Package Payload into GunnyCalc.ipa
         run: |

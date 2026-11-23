@@ -3,6 +3,7 @@ import AVKit
 import CoreGraphics
 import CoreMedia
 import CoreVideo
+import Foundation
 import Network
 import SwiftUI
 import UIKit
@@ -62,15 +63,10 @@ private final class UDPTelemetryReceiver: @unchecked Sendable {
             if let ipOptions = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
                 ipOptions.version = .v4
             }
-            if let nwPort = NWEndpoint.Port(rawValue: port) {
-                parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
-                    host: NWEndpoint.Host("0.0.0.0"),
-                    port: nwPort
-                )
-            }
+            guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
 
             do {
-                let newListener = try NWListener(using: parameters)
+                let newListener = try NWListener(using: parameters, on: nwPort)
                 newListener.stateUpdateHandler = { [weak self] state in
                     if case .failed = state {
                         self?.listener = nil
@@ -662,7 +658,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             let curvePath = UIBezierPath()
             curvePath.move(to: mappedPoints[0])
             for pt in mappedPoints.dropFirst() {
-                curvePath.addLineToPoint(pt)
+                curvePath.addLine(to: pt)
             }
 
             let dashPattern: [CGFloat] = [7.0, 5.0]

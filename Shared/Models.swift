@@ -175,19 +175,19 @@ public struct TelemetryData: Codable, Equatable, Sendable {
     public var dx: Double
     public var dy: Double
     public var wind: Double
-    public var windDirection: Int
+    public var windDirection: Int = 1
     public var angle: Double
     public var calculatedPower: Double
     public var holdSeconds: Double
     public var timestamp: TimeInterval
-    public var frameCount: Int
+    public var frameCount: Int = 0
     public var trajectoryPoints: [TrajectoryPoint]
 
     public init(
         dx: Double,
         dy: Double,
         wind: Double,
-        windDirection: Int? = nil,
+        windDirection: Int = 1,
         angle: Double,
         calculatedPower: Double,
         holdSeconds: Double,
@@ -198,7 +198,7 @@ public struct TelemetryData: Codable, Equatable, Sendable {
         self.dx = dx
         self.dy = dy
         self.wind = wind
-        self.windDirection = windDirection ?? (wind < 0 ? -1 : 1)
+        self.windDirection = windDirection
         self.angle = angle
         self.calculatedPower = min(max(calculatedPower, 0.0), 100.0)
         self.holdSeconds = max(holdSeconds, 0.0)
