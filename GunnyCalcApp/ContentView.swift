@@ -27,34 +27,8 @@ struct ContentView: View {
                 Spacer()
 
                 VStack(spacing: 14) {
-                    // Nút 1: RPSystemBroadcastPickerView phủ toàn bộ nút với nhãn "1. Bật Đọc Màn Hình".
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 16)
-                            .fill(
-                                LinearGradient(
-                                    colors: [Color(red: 0.09, green: 0.44, blue: 0.94), Color(red: 0.05, green: 0.30, blue: 0.76)],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 16)
-                                    .stroke(Color.cyan.opacity(0.55), lineWidth: 1.2)
-                            )
-
-                        HStack(spacing: 10) {
-                            Image(systemName: "record.circle.fill")
-                                .font(.system(size: 20, weight: .bold))
-                            Text("1. Bật Đọc Màn Hình")
-                                .font(.system(size: 17, weight: .bold))
-                        }
-                        .foregroundStyle(.white)
-                        .allowsHitTesting(false)
-
-                        BroadcastPickerView(preferredExtension: "com.gunny.pipcalc.BroadcastExtension")
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .opacity(0.02)
-                    }
+                    // Nút 1: Nút SwiftUI "1. Bật Đọc Màn Hình" kích hoạt trực tiếp UIButton bên trong RPSystemBroadcastPickerView.
+                    BroadcastStartButton()
                     .frame(maxWidth: .infinity)
                     .frame(height: 60)
                     .clipShape(RoundedRectangle(cornerRadius: 16))
@@ -160,24 +134,121 @@ struct ContentView: View {
     }
 }
 
-// MARK: - RPSystemBroadcastPickerView Wrapper
+// MARK: - RPSystemBroadcastPickerView Wrapper (iOS 18 + Sideloadly Safe)
 
-struct BroadcastPickerView: UIViewRepresentable {
-    let preferredExtension: String
+private final class BroadcastPickerBridge: ObservableObject {
+    weak var pickerView: RPSystemBroadcastPickerView?
+
+    func triggerPicker() {
+        guard let pickerView,
+              let button = Self.findButton(in: pickerView)
+        else {
+            return
+        }
+        button.sendActions(for: .touchUpInside)
+    }
+
+    private static func findButton(in view: UIView) -> UIButton? {
+        if let button = view as? UIButton {
+            return button
+        }
+        for subview in view.subviews {
+            if let found = findButton(in: subview) {
+                return found
+            }
+        }
+        return nil
+    }
+}
+
+private struct BroadcastStartButton: View {
+    @StateObject private var bridge = BroadcastPickerBridge()
+
+    var body: some View {
+        ZStack {
+            BroadcastPickerButton(bridge: bridge)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .opacity(0.02)
+                .allowsHitTesting(false)
+
+            Button {
+                bridge.triggerPicker()
+            } label: {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 16)
+                        .fill(
+                            LinearGradient(
+                                colors: [Color(red: 0.09, green: 0.44, blue: 0.94), Color(red: 0.05, green: 0.30, blue: 0.76)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16)
+                                .stroke(Color.cyan.opacity(0.55), lineWidth: 1.2)
+                        )
+
+                    HStack(spacing: 10) {
+                        Image(systemName: "record.circle.fill")
+                            .font(.system(size: 20, weight: .bold))
+                        Text("1. Bật Đọc Màn Hình")
+                            .font(.system(size: 17, weight: .bold))
+                    }
+                    .foregroundStyle(.white)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
+
+struct BroadcastPickerButton: UIViewRepresentable {
+    fileprivate let bridge: BroadcastPickerBridge
 
     func makeUIView(context: Context) -> BroadcastPickerContainerView {
-        BroadcastPickerContainerView(preferredExtension: preferredExtension)
+        let preferredExtension = Self.resolvePreferredExtension()
+        let container = BroadcastPickerContainerView(preferredExtension: preferredExtension)
+        bridge.pickerView = container.picker
+        return container
     }
 
     func updateUIView(_ uiView: BroadcastPickerContainerView, context: Context) {
-        uiView.picker.preferredExtension = preferredExtension
+        uiView.picker.preferredExtension = Self.resolvePreferredExtension()
+        uiView.picker.showsMicrophoneButton = false
+        bridge.pickerView = uiView.picker
+    }
+
+    /// Tự động đối chiếu `<Bundle.main.bundleIdentifier>.BroadcastExtension` với `.appex` được nhúng;
+    /// trả về `nil` nếu Sideloadly đã đổi ID khác để iOS 18 luôn hiển thị danh sách chọn truyền phát.
+    static func resolvePreferredExtension() -> String? {
+        guard let mainBundleID = Bundle.main.bundleIdentifier, !mainBundleID.isEmpty else {
+            return nil
+        }
+        let candidateID = "\(mainBundleID).BroadcastExtension"
+
+        guard let plugInsURL = Bundle.main.builtInPlugInsURL,
+              let pluginURLs = try? FileManager.default.contentsOfDirectory(
+                  at: plugInsURL,
+                  includingPropertiesForKeys: nil,
+                  options: .skipsHiddenFiles
+              )
+        else {
+            return nil
+        }
+
+        let installedAppexIDs = pluginURLs
+            .filter { $0.pathExtension == "appex" }
+            .compactMap { Bundle(url: $0)?.bundleIdentifier }
+
+        return installedAppexIDs.contains(candidateID) ? candidateID : nil
     }
 }
 
 final class BroadcastPickerContainerView: UIView {
     let picker: RPSystemBroadcastPickerView
 
-    init(preferredExtension: String) {
+    init(preferredExtension: String?) {
         self.picker = RPSystemBroadcastPickerView(frame: .zero)
         super.init(frame: .zero)
 

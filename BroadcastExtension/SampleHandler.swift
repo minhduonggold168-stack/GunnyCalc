@@ -2,6 +2,7 @@ import CoreGraphics
 import CoreImage
 import CoreMedia
 import CoreVideo
+import Darwin
 import Foundation
 import ImageIO
 import ReplayKit
@@ -9,19 +10,37 @@ import ReplayKit
 /// Handler nhận khung hình thụ động từ ReplayKit.
 /// - Dùng duy nhất 1 `sharedCIContext`, bọc `processSampleBuffer` trong `autoreleasepool` ở tốc độ 10 FPS (100ms).
 /// - Tự xoay khung hình về chiều ngang (`width > height`) bằng `RPVideoSampleOrientationKey`.
-/// - Quét 3 vùng chuẩn Gunny Mobi và bắn gói `TelemetryData` qua BSD UDP loopback `127.0.0.1:45678`.
+/// - Gửi ngay gói khởi động (`frameId = 1`) khi bắt đầu truyền phát và duy trì heartbeat 0.5s bằng `DispatchSourceTimer`.
+/// - Gửi gói `TelemetryData` qua `Darwin.socket` (BSD UDP `127.0.0.1:45678`) an toàn tuyệt đối (không `!`, không `fatalError`).
 final class SampleHandler: RPBroadcastSampleHandler {
+    private struct SnapshotState {
+        let playerX: Double
+        let playerY: Double
+        let enemyX: Double
+        let enemyY: Double
+        let angle: Double
+        let wind: Double
+        let windDir: Int
+    }
+
     private let sharedCIContext = CIContext(options: [
         .useSoftwareRenderer: false,
         .cacheIntermediates: false
     ])
     private let visionProcessor = VisionProcessor()
     private let ballisticsEngine = BallisticsEngine()
-    private let udpSender = BSDUDPSender()
     private let ipc = SharedIPC.shared
 
     private let stateLock = NSLock()
+    private let udpLock = NSLock()
+    private let heartbeatQueue = DispatchQueue(label: "com.gunny.pipcalc.broadcast.heartbeat", qos: .utility)
+
+    private var heartbeatTimer: DispatchSourceTimer?
+    private var udpSocketFD: Int32 = -1
+    private var udpDestination: sockaddr_in?
+
     private var lastProcessedTime: TimeInterval = 0
+    private var lastPacketSentTime: TimeInterval = 0
     private var isProcessingFrame = false
     private var frameCounter: Int = 0
 
@@ -37,16 +56,30 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private let minimumFrameInterval: TimeInterval = 0.10 // 10 FPS (100ms)
     private let maxScaledWidth: CGFloat = 960.0
 
+    deinit {
+        stopHeartbeatTimer()
+        closeUDPSocket()
+    }
+
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
+        let now = Date().timeIntervalSince1970
         stateLock.lock()
         lastProcessedTime = 0
         isProcessingFrame = false
-        frameCounter = 0
+        frameCounter = 1
+        lastPacketSentTime = now
+        let initialSnapshot = currentSnapshotLocked()
         stateLock.unlock()
+
+        let startupTelemetry = buildTelemetry(frameId: 1, from: initialSnapshot)
+        sendUDPPacket(startupTelemetry)
+        ipc.saveTelemetry(startupTelemetry)
+
+        startHeartbeatTimer()
     }
 
     override func broadcastPaused() {
-        // Tạm dừng xử lý khi hệ thống tạm ngưng broadcast.
+        // Giữ heartbeat 0.5s để PiP biết phiên truyền phát vẫn tồn tại khi hệ thống tạm ngưng video.
     }
 
     override func broadcastResumed() {
@@ -56,6 +89,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastFinished() {
+        stopHeartbeatTimer()
+        closeUDPSocket()
         sharedCIContext.clearCaches()
     }
 
@@ -128,29 +163,174 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
             frameCounter += 1
             let currentFrameId = frameCounter
-            let resolvedPX = lastPlayerX
-            let resolvedPY = lastPlayerY
-            let resolvedEX = lastEnemyX
-            let resolvedEY = lastEnemyY
-            let resolvedAngle = lastAngle
-            let resolvedWind = lastWind
-            let resolvedWindDir = lastWindDir
+            lastPacketSentTime = Date().timeIntervalSince1970
+            let snapshot = currentSnapshotLocked()
             stateLock.unlock()
 
-            let telemetry = ballisticsEngine.buildTelemetry(
-                frameId: currentFrameId,
-                playerX: resolvedPX,
-                playerY: resolvedPY,
-                enemyX: resolvedEX,
-                enemyY: resolvedEY,
-                angle: resolvedAngle,
-                windMagnitude: resolvedWind,
-                windDir: resolvedWindDir
-            )
-
-            udpSender.send(telemetry)
+            let telemetry = buildTelemetry(frameId: currentFrameId, from: snapshot)
+            sendUDPPacket(telemetry)
             ipc.saveTelemetry(telemetry)
         }
+    }
+
+    // MARK: - Snapshot & Heartbeat Timer (0.5s)
+
+    private func currentSnapshotLocked() -> SnapshotState {
+        SnapshotState(
+            playerX: lastPlayerX,
+            playerY: lastPlayerY,
+            enemyX: lastEnemyX,
+            enemyY: lastEnemyY,
+            angle: lastAngle,
+            wind: lastWind,
+            windDir: lastWindDir
+        )
+    }
+
+    private func buildTelemetry(frameId: Int, from snapshot: SnapshotState) -> TelemetryData {
+        ballisticsEngine.buildTelemetry(
+            frameId: frameId,
+            playerX: snapshot.playerX,
+            playerY: snapshot.playerY,
+            enemyX: snapshot.enemyX,
+            enemyY: snapshot.enemyY,
+            angle: snapshot.angle,
+            windMagnitude: snapshot.wind,
+            windDir: snapshot.windDir
+        )
+    }
+
+    private func startHeartbeatTimer() {
+        stopHeartbeatTimer()
+
+        let timer = DispatchSource.makeTimerSource(queue: heartbeatQueue)
+        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        timer.setEventHandler { [weak self] in
+            self?.handleHeartbeatTick()
+        }
+
+        stateLock.lock()
+        heartbeatTimer = timer
+        stateLock.unlock()
+
+        timer.resume()
+    }
+
+    private func stopHeartbeatTimer() {
+        stateLock.lock()
+        let existingTimer = heartbeatTimer
+        heartbeatTimer = nil
+        stateLock.unlock()
+
+        existingTimer?.setEventHandler {}
+        existingTimer?.cancel()
+    }
+
+    private func handleHeartbeatTick() {
+        let now = Date().timeIntervalSince1970
+        stateLock.lock()
+        guard (now - lastPacketSentTime) >= 0.45 else {
+            stateLock.unlock()
+            return
+        }
+
+        frameCounter += 1
+        let currentFrameId = frameCounter
+        lastPacketSentTime = now
+        let snapshot = currentSnapshotLocked()
+        stateLock.unlock()
+
+        let telemetry = buildTelemetry(frameId: currentFrameId, from: snapshot)
+        sendUDPPacket(telemetry)
+        ipc.saveTelemetry(telemetry)
+    }
+
+    // MARK: - Safe Darwin BSD UDP Sender
+
+    private func ensureUDPSocketLocked() -> (Int32, sockaddr_in)? {
+        if udpSocketFD >= 0, let existingDest = udpDestination {
+            return (udpSocketFD, existingDest)
+        }
+
+        let fd = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { return nil }
+
+        var noSigPipe: Int32 = 1
+        _ = Darwin.setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            &noSigPipe,
+            socklen_t(MemoryLayout<Int32>.size)
+        )
+        _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = BSDUDPConfig.port.bigEndian
+
+        let ptonStatus = BSDUDPConfig.host.withCString { cHost in
+            Darwin.inet_pton(AF_INET, cHost, &addr.sin_addr)
+        }
+        guard ptonStatus == 1 else {
+            Darwin.close(fd)
+            return nil
+        }
+
+        udpSocketFD = fd
+        udpDestination = addr
+        return (fd, addr)
+    }
+
+    private func sendUDPPacket(_ telemetry: TelemetryData) {
+        let payload: Data
+        do {
+            payload = try JSONEncoder().encode(telemetry)
+        } catch {
+            return
+        }
+        guard !payload.isEmpty else { return }
+
+        udpLock.lock()
+        defer { udpLock.unlock() }
+
+        guard let (fd, dest) = ensureUDPSocketLocked() else { return }
+        var mutableDest = dest
+        let sentCount: ssize_t = payload.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return -1 }
+            return withUnsafePointer(to: &mutableDest) { destPtr in
+                destPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockAddrPtr in
+                    Darwin.sendto(
+                        fd,
+                        baseAddress,
+                        rawBuffer.count,
+                        0,
+                        sockAddrPtr,
+                        socklen_t(MemoryLayout<sockaddr_in>.size)
+                    )
+                }
+            }
+        }
+
+        if sentCount < 0 {
+            let err = errno
+            if err != EAGAIN && err != EWOULDBLOCK {
+                Darwin.close(fd)
+                udpSocketFD = -1
+                udpDestination = nil
+            }
+        }
+    }
+
+    private func closeUDPSocket() {
+        udpLock.lock()
+        if udpSocketFD >= 0 {
+            Darwin.close(udpSocketFD)
+            udpSocketFD = -1
+        }
+        udpDestination = nil
+        udpLock.unlock()
     }
 
     // MARK: - Orientation & 960px Landscape Downscale
