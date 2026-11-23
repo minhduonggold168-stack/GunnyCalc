@@ -1,8 +1,7 @@
 import Foundation
 
-/// Bộ tính toán lực bắn 2D dựa trên phương trình chuyển động ném xiên có gió và chênh lệch độ cao.
+/// Bộ tính toán lực bắn 2D (0...100) và sinh 30 điểm quỹ đạo parabol từ tọa độ người chơi tới mục tiêu.
 public struct BallisticsEngine: Sendable {
-    /// Hằng số chuẩn hóa quy đổi tỉ lệ minimap sang hệ quy chiếu lực bắn (0 - 100).
     private static let horizontalRangeScale = 400.0
     private static let verticalElevationScale = 220.0
     private static let gravity = 15.0
@@ -10,13 +9,12 @@ public struct BallisticsEngine: Sendable {
 
     public init() {}
 
-    /// Tính lực bắn `P` (0.0 - 100.0) từ tọa độ chuẩn hóa `dx`, `dy`, góc bắn, gió và cấu hình hiệu chỉnh.
+    /// Tính lực bắn `power` (0.0 ... 100.0) theo `(dx = enemyX - playerX, dy = playerY - enemyY)`, góc bắn và gió có hướng (`wind * windDir`).
     public func calculatePower(
         dx: Double,
         dy: Double,
         angle: Double,
-        wind: Double,
-        config: BallisticsConfig
+        signedWind: Double
     ) -> Double {
         let distance = abs(dx) * Self.horizontalRangeScale
         let elevation = dy * Self.verticalElevationScale
@@ -25,30 +23,23 @@ public struct BallisticsEngine: Sendable {
             return 0.0
         }
 
-        // Góc bắn hợp lệ trong khoảng (1° ... 89°) để tránh chia cho 0 khi cos(θ) → 0.
         let safeAngle = min(max(angle, 1.0), 89.0)
         let theta = safeAngle * .pi / 180.0
         let sinTheta = sin(theta)
         let cosTheta = cos(theta)
 
-        // Quy đổi chiều gió theo hướng bắn (gió thuận > 0, gió ngược < 0).
+        // Quy đổi chiều gió theo hướng bắn (+ thuận gió, - ngược gió).
         let shotSign = dx >= 0.0 ? 1.0 : -1.0
-        let directedWind = wind * shotSign
-        let windAcceleration = directedWind * config.windFactor * Self.windAccelerationScale
+        let directedWind = signedWind * shotSign
+        let windAcceleration = directedWind * Self.windAccelerationScale
 
-        // Giải hệ phương trình chuyển động ném xiên 2D:
-        // x(t) = v0 * cos(θ) * t + 0.5 * a_w * t^2 = D
-        // y(t) = v0 * sin(θ) * t - 0.5 * g * t^2   = H
-        // => t^2 = 2 * (D * sin(θ) - H * cos(θ)) / (g * cos(θ) + a_w * sin(θ))
         let numerator = 2.0 * (distance * sinTheta - elevation * cosTheta)
         let denominator = Self.gravity * cosTheta + windAcceleration * sinTheta
 
         guard denominator > 0.0001 else {
             return 100.0
         }
-
         guard numerator > 0.0 else {
-            // Mục tiêu cao hơn đường tiệm cận của góc bắn hiện tại.
             return 0.0
         }
 
@@ -63,151 +54,99 @@ public struct BallisticsEngine: Sendable {
             return 0.0
         }
 
-        let rawPower = max(0.0, initialVelocity) * max(0.0, config.powerFactor)
-        return min(max(rawPower, 0.0), 100.0)
+        return min(max(initialVelocity, 0.0), 100.0)
     }
 
-    /// Tính thời gian cần giữ nút bắn (giây) tương ứng với lực `P` (0 - 100).
-    public func calculateHoldSeconds(power: Double, maxHoldSeconds: Double) -> Double {
-        let clampedPower = min(max(power, 0.0), 100.0)
-        return (clampedPower / 100.0) * max(0.0, maxHoldSeconds)
-    }
-
-    /// Tạo danh sách 30 điểm quỹ đạo parabol ném xiên 2D chuẩn hóa trong khung `0.0 - 1.0` (chừa lề 10% xung quanh).
+    /// Sinh 30 điểm quỹ đạo parabol chuẩn hóa `0.0 - 1.0` nối chính xác từ `(playerX, playerY)` tới `(enemyX, enemyY)`.
     public func generateTrajectoryPoints(
-        dx: Double,
-        dy: Double,
+        playerX: Double,
+        playerY: Double,
+        enemyX: Double,
+        enemyY: Double,
         angleDeg: Double,
-        wind: Double,
+        signedWind: Double,
         power: Double
     ) -> [TrajectoryPoint] {
         let stepCount = 30
-        let targetX = dx * Self.horizontalRangeScale
-        let targetY = dy * Self.verticalElevationScale
-        let distance = abs(targetX)
+        let px = min(max(playerX, 0.06), 0.94)
+        let ex = min(max(enemyX, 0.06), 0.94)
 
-        guard distance > 0.0001 || abs(targetY) > 0.0001 else {
-            return []
-        }
+        // Ánh xạ tọa độ đứng vào nửa dưới khung ngắm để dành khoảng trống phía trên cho đỉnh parabol.
+        let py = 0.42 + min(max(playerY, 0.0), 1.0) * 0.48
+        let ey = 0.42 + min(max(enemyY, 0.0), 1.0) * 0.48
 
-        let safeAngle = min(max(angleDeg, 1.0), 89.0)
+        let dx = ex - px
+        let dyUp = py - ey
+        let safeAngle = min(max(angleDeg, 10.0), 85.0)
         let theta = safeAngle * .pi / 180.0
-        let sinTheta = sin(theta)
-        let cosTheta = cos(theta)
-        let shotSign = dx >= 0.0 ? 1.0 : -1.0
 
-        let speed = max(power, 1.0)
-        let vx0 = shotSign * speed * cosTheta
-        let vy0 = speed * sinTheta
-        let ax = wind * Self.windAccelerationScale
+        // Độ cao vồng parabol tỉ lệ với góc bắn và lực bắn, giữ đỉnh luôn >= 0.06 trong khung vẽ.
+        let desiredRise = max(abs(dx) * tan(theta) * 0.24, 0.14) + (power / 100.0) * 0.08
+        let highestEndpoint = min(py, ey)
+        let maxSafeRise = max(highestEndpoint - 0.07, 0.05)
+        let archRise = min(desiredRise, maxSafeRise)
 
-        // Giải thời gian bay T để đạn đi hết quãng đường ngang targetX dưới gia tốc gió ax:
-        // 0.5 * ax * T^2 + vx0 * T - targetX = 0
-        let flightTime: Double
-        if abs(ax) > 1e-6 {
-            let discriminant = vx0 * vx0 + 2.0 * ax * targetX
-            if discriminant >= 0.0 {
-                let sqrtDisc = sqrt(discriminant)
-                let t1 = (-vx0 + sqrtDisc) / ax
-                let t2 = (-vx0 - sqrtDisc) / ax
-                let candidates = [t1, t2].filter { $0 > 0.0001 }
-                flightTime = candidates.min() ?? max(distance / max(abs(vx0), 1.0), 0.1)
-            } else {
-                flightTime = max(distance / max(abs(vx0), 1.0), 0.1)
-            }
-        } else {
-            flightTime = max(distance / max(abs(vx0), 1.0), 0.1)
-        }
+        // Độ uốn ngang theo gió có hướng.
+        let windBend = -0.025 * signedWind * max(abs(dx), 0.15)
 
-        // Hiệu chỉnh trọng lực tương đương sao cho ở thời điểm T đường cong chạm chính xác (targetX, targetY).
-        let rawGravity = 2.0 * (vy0 * flightTime - targetY) / (flightTime * flightTime)
-        let effectiveGravity = rawGravity > 0.05 ? rawGravity : Self.gravity
-
-        var rawPoints: [(x: Double, y: Double)] = []
-        rawPoints.reserveCapacity(stepCount)
+        var points: [TrajectoryPoint] = []
+        points.reserveCapacity(stepCount)
 
         for i in 0..<stepCount {
             let u = Double(i) / Double(stepCount - 1)
-            let t = u * flightTime
-            let px = vx0 * t + 0.5 * ax * t * t
-            let py = vy0 * t - 0.5 * effectiveGravity * t * t
-            rawPoints.append((px, py))
+            let arcFactor = 4.0 * u * (1.0 - u)
+            let x = min(max(px + dx * u + windBend * arcFactor, 0.03), 0.97)
+            let y = min(max(py - dyUp * u - archRise * arcFactor, 0.05), 0.95)
+            points.append(TrajectoryPoint(x: x, y: y))
         }
 
-        guard let minX = rawPoints.map(\.x).min(),
-              let maxX = rawPoints.map(\.x).max(),
-              let minY = rawPoints.map(\.y).min(),
-              let maxY = rawPoints.map(\.y).max() else {
-            return []
-        }
-
-        let spanX = maxX - minX
-        let spanY = maxY - minY
-        let margin = 0.10
-        let usableSpan = 1.0 - 2.0 * margin
-
-        return rawPoints.map { pt in
-            let normX: Double
-            if spanX > 1e-6 {
-                normX = margin + ((pt.x - minX) / spanX) * usableSpan
-            } else {
-                normX = 0.5
-            }
-
-            // Đảo trục Y về hệ tọa độ màn hình (y = 0 ở trên, y = 1 ở dưới) để đỉnh parabol nằm gần mép trên 0.10.
-            let normY: Double
-            if spanY > 1e-6 {
-                normY = margin + ((maxY - pt.y) / spanY) * usableSpan
-            } else {
-                normY = 0.5
-            }
-
-            return TrajectoryPoint(x: normX, y: normY)
-        }
+        return points
     }
 
-    /// Tạo gói `TelemetryData` hoàn chỉnh từ kết quả quan sát hình ảnh và cấu hình hiện hành.
-    public func computeTelemetry(
-        dx: Double,
-        dy: Double,
-        wind: Double,
-        windDirection: Int = 1,
-        detectedAngle: Double?,
-        config: BallisticsConfig,
-        timestamp: TimeInterval = Date().timeIntervalSince1970,
-        frameCount: Int = 0
+    /// Tính hoàn chỉnh `power` và 30 điểm parabol thành `TelemetryData`.
+    public func buildTelemetry(
+        frameId: Int,
+        playerX: Double,
+        playerY: Double,
+        enemyX: Double,
+        enemyY: Double,
+        angle: Double,
+        windMagnitude: Double,
+        windDir: Int
     ) -> TelemetryData {
-        let effectiveAngle = config.useOCRAngle ? (detectedAngle ?? config.selectedAngle) : config.selectedAngle
+        let safeDir = windDir < 0 ? -1 : 1
+        let signedWind = abs(windMagnitude) * Double(safeDir)
+        let dx = enemyX - playerX
+        let dy = playerY - enemyY
+
         let power = calculatePower(
             dx: dx,
             dy: dy,
-            angle: effectiveAngle,
-            wind: wind,
-            config: config
+            angle: angle,
+            signedWind: signedWind
         )
-        let holdSeconds = calculateHoldSeconds(
-            power: power,
-            maxHoldSeconds: config.maxHoldSeconds
-        )
-        let trajectory = generateTrajectoryPoints(
-            dx: dx,
-            dy: dy,
-            angleDeg: effectiveAngle,
-            wind: wind * config.windFactor,
+
+        let points = generateTrajectoryPoints(
+            playerX: playerX,
+            playerY: playerY,
+            enemyX: enemyX,
+            enemyY: enemyY,
+            angleDeg: angle,
+            signedWind: signedWind,
             power: power
         )
 
         return TelemetryData(
-            dx: dx,
-            dy: dy,
-            wind: wind,
-            windDirection: windDirection,
-            angle: effectiveAngle,
-            calculatedPower: power,
-            holdSeconds: holdSeconds,
-            timestamp: timestamp,
-            frameCount: frameCount,
-            trajectoryPoints: trajectory
+            frameId: frameId,
+            playerX: playerX,
+            playerY: playerY,
+            enemyX: enemyX,
+            enemyY: enemyY,
+            angle: angle,
+            wind: abs(windMagnitude),
+            windDir: safeDir,
+            power: power,
+            trajectoryPoints: points
         )
     }
 }
