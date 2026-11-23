@@ -48,9 +48,12 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     private var pipController: AVPictureInPictureController?
     private var currentTelemetry: TelemetryData = .placeholder
     private var keepAliveTimer: Timer?
+    private var isUDPListening = false
 
     private let renderSize = CGSize(width: 640, height: 280)
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
+    private let ballisticsEngine = BallisticsEngine()
+    private let defaultFallbackPower: Double = 45.0
 
     private override init() {
         super.init()
@@ -58,6 +61,15 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     }
 
     func configureIfNeeded() {
+        if !isUDPListening {
+            isUDPListening = true
+            SharedIPC.shared.startUDPTelemetryListener { [weak self] incoming in
+                Task { @MainActor [weak self] in
+                    self?.updateOverlay(with: incoming)
+                }
+            }
+        }
+
         guard pipController == nil else { return }
 
         sampleBufferView.displayLayer.videoGravity = .resizeAspect
@@ -250,8 +262,51 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         return sampleBuffer
     }
 
+    private func resolveDisplayTelemetry(_ telemetry: TelemetryData) -> (data: TelemetryData, isLive: Bool) {
+        let now = Date().timeIntervalSince1970
+        let hasLiveSignal = telemetry.timestamp > 0
+            && (now - telemetry.timestamp) <= 4.0
+            && telemetry.calculatedPower > 0.0
+
+        let effectivePower = telemetry.calculatedPower > 0.0 ? telemetry.calculatedPower : defaultFallbackPower
+        let effectiveAngle = telemetry.angle > 0.0 ? telemetry.angle : 65.0
+        let effectiveDx = abs(telemetry.dx) > 0.0001 ? telemetry.dx : 0.48
+        let effectiveHold = telemetry.calculatedPower > 0.0
+            ? telemetry.holdSeconds
+            : ballisticsEngine.calculateHoldSeconds(
+                power: effectivePower,
+                maxHoldSeconds: BallisticsConfig.default.maxHoldSeconds
+            )
+
+        let points: [TrajectoryPoint]
+        if telemetry.trajectoryPoints.count >= 2 && telemetry.calculatedPower > 0.0 {
+            points = telemetry.trajectoryPoints
+        } else {
+            points = ballisticsEngine.generateTrajectoryPoints(
+                dx: effectiveDx,
+                dy: telemetry.dy,
+                angleDeg: effectiveAngle,
+                wind: telemetry.wind,
+                power: effectivePower
+            )
+        }
+
+        let resolved = TelemetryData(
+            dx: effectiveDx,
+            dy: telemetry.dy,
+            wind: telemetry.wind,
+            angle: effectiveAngle,
+            calculatedPower: effectivePower,
+            holdSeconds: effectiveHold,
+            timestamp: telemetry.timestamp,
+            trajectoryPoints: points
+        )
+        return (resolved, hasLiveSignal)
+    }
+
     private func drawHUD(in rect: CGRect, telemetry: TelemetryData) {
         let cgContext = UIGraphicsGetCurrentContext()
+        let (displayTelemetry, isLive) = resolveDisplayTelemetry(telemetry)
 
         // Nền tối bán trong suốt & viền sáng sắc nét kích thước 640 x 280.
         UIColor(red: 0.03, green: 0.04, blue: 0.06, alpha: 0.88).setFill()
@@ -282,20 +337,26 @@ final class PiPOverlayManager: NSObject, ObservableObject {
 
         drawTrajectorySection(
             in: CGRect(x: 0, y: 0, width: rect.width, height: splitY),
-            telemetry: telemetry,
+            telemetry: displayTelemetry,
+            isLive: isLive,
             cgContext: cgContext
         )
 
         drawPowerGaugeSection(
             in: CGRect(x: 0, y: splitY, width: rect.width, height: rect.height - splitY),
-            telemetry: telemetry,
+            telemetry: displayTelemetry,
             cgContext: cgContext
         )
     }
 
     // MARK: - Phần trên (185px): Khung đường kẻ quỹ đạo đến địch
 
-    private func drawTrajectorySection(in sectionRect: CGRect, telemetry: TelemetryData, cgContext: CGContext?) {
+    private func drawTrajectorySection(
+        in sectionRect: CGRect,
+        telemetry: TelemetryData,
+        isLive: Bool,
+        cgContext: CGContext?
+    ) {
         let plotRect = CGRect(
             x: 16,
             y: 36,
@@ -441,7 +502,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         let pillRect = CGRect(
             x: 16,
             y: 8,
-            width: min(sectionRect.width - 32, headerSize.width + 20),
+            width: min(sectionRect.width - 110, headerSize.width + 20),
             height: 22
         )
         let pillPath = UIBezierPath(roundedRect: pillRect, cornerRadius: 7)
@@ -452,6 +513,42 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         pillPath.stroke()
 
         attrHeader.draw(at: CGPoint(x: pillRect.minX + 10, y: pillRect.minY + (pillRect.height - headerSize.height) / 2.0))
+
+        // Chấm trạng thái ở góc trên bên phải PiP: xanh lá khi nhận dữ liệu sống, vàng khi chờ tín hiệu.
+        let statusColor = isLive
+            ? UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 1.0)
+            : UIColor(red: 1.0, green: 0.84, blue: 0.04, alpha: 1.0)
+        let statusText = isLive ? "LIVE" : "CHỜ"
+        let statusAttrs: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 10.5, weight: .bold),
+            .foregroundColor: statusColor
+        ]
+        let attrStatus = NSAttributedString(string: statusText, attributes: statusAttrs)
+        let statusTextSize = attrStatus.size()
+        let statusPillWidth = statusTextSize.width + 26.0
+        let statusPillRect = CGRect(
+            x: sectionRect.width - statusPillWidth - 16.0,
+            y: 8,
+            width: statusPillWidth,
+            height: 22
+        )
+        let statusPill = UIBezierPath(roundedRect: statusPillRect, cornerRadius: 7)
+        UIColor(red: 0.10, green: 0.13, blue: 0.19, alpha: 0.95).setFill()
+        statusPill.fill()
+        statusColor.withAlphaComponent(0.45).setStroke()
+        statusPill.lineWidth = 1.0
+        statusPill.stroke()
+
+        let dotCenter = CGPoint(x: statusPillRect.minX + 11.0, y: statusPillRect.midY)
+        statusColor.withAlphaComponent(0.35).setFill()
+        UIBezierPath(arcCenter: dotCenter, radius: 6.5, startAngle: 0, endAngle: .pi * 2, clockwise: true).fill()
+        statusColor.setFill()
+        UIBezierPath(arcCenter: dotCenter, radius: 3.8, startAngle: 0, endAngle: .pi * 2, clockwise: true).fill()
+
+        attrStatus.draw(at: CGPoint(
+            x: statusPillRect.minX + 20.0,
+            y: statusPillRect.minY + (statusPillRect.height - statusTextSize.height) / 2.0
+        ))
     }
 
     // MARK: - Phần dưới (95px): Thanh vạch lực bắn trực quan (0 - 100)

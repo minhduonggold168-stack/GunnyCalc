@@ -81,12 +81,18 @@ public final class VisionProcessor {
         }
     }
 
-    /// Xử lý từ `CGImage` tĩnh (dùng cho chế độ căn chỉnh ROI bằng ảnh từ Thư viện ảnh).
-    public func process(cgImage: CGImage, roiConfig: ROIConfig) -> VisionObservationResult {
+    /// Xử lý từ `CGImage` tĩnh (dùng cho chế độ căn chỉnh ROI hoặc frame đã chuẩn hóa hướng & thu nhỏ <= 960px).
+    public func process(
+        cgImage: CGImage,
+        roiConfig: ROIConfig,
+        includeAngle: Bool = true
+    ) -> VisionObservationResult {
         autoreleasepool {
             let minimap = analyzeMinimap(from: cgImage, normalizedRect: roiConfig.minimapRect)
             let wind = recognizeNumericValue(from: cgImage, normalizedRect: roiConfig.windRect, allowNegative: true)
-            let angle = recognizeBattlefieldAngle(from: cgImage, normalizedRect: roiConfig.angleRect)
+            let angle = includeAngle
+                ? recognizeBattlefieldAngle(from: cgImage, normalizedRect: roiConfig.angleRect)
+                : nil
 
             return VisionObservationResult(
                 dx: minimap?.dx ?? 0.0,
@@ -219,6 +225,23 @@ public final class VisionProcessor {
             bluePixelCount: blueCount,
             redPixelCount: redCount
         )
+    }
+
+    /// Đọc các chuỗi OCR thô từ một vùng `NormalizedRect` trong `CGImage` đã xoay ngang & thu nhỏ.
+    public func recognizeTextCandidates(
+        from cgImage: CGImage,
+        normalizedRect: NormalizedRect,
+        maxDimension: Int = 560,
+        minimumTextHeight: Float = 0.03
+    ) -> [String] {
+        guard let image = makeContrastGrayscaleImage(
+            from: cgImage,
+            normalizedRect: normalizedRect,
+            maxDimension: maxDimension
+        ) else {
+            return []
+        }
+        return performFastTextRecognition(on: image, minimumTextHeight: minimumTextHeight)
     }
 
     /// Đọc các chuỗi OCR thô từ một vùng `NormalizedRect` trong `CVPixelBuffer` (dùng trong `SampleHandler`).

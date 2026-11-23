@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Cấu hình App Group dùng chung giữa `GunnyCalcApp` và `BroadcastExtension`.
@@ -6,13 +7,15 @@ public enum AppGroupConfig {
 }
 
 /// Lớp giao tiếp liên tiến trình (IPC) giữa `BroadcastExtension` và `GunnyCalcApp`
-/// sử dụng App Group `UserDefaults` và `CFNotificationCenterGetDarwinNotifyCenter`.
+/// kết hợp App Group `UserDefaults`, `CFNotificationCenterGetDarwinNotifyCenter` và UDP cục bộ `127.0.0.1:45678`.
 public final class SharedIPC: @unchecked Sendable {
     public static let shared = SharedIPC()
 
     public static let suiteName = AppGroupConfig.suiteName
     public static let telemetryDarwinNotification = "com.gunny.pipcalc.darwin.telemetryUpdated"
     public static let configDarwinNotification = "com.gunny.pipcalc.darwin.configUpdated"
+    public static let udpHost = "127.0.0.1"
+    public static let udpPort: UInt16 = 45678
 
     private enum StorageKey {
         static let roiConfig = "gunnycalc.roiConfig.json"
@@ -24,11 +27,18 @@ public final class SharedIPC: @unchecked Sendable {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let lock = NSLock()
+    private let udpLock = NSLock()
+    private let udpQueue = DispatchQueue(label: "com.gunny.pipcalc.udp", qos: .userInteractive)
 
     private var telemetryObserverHandler: ((TelemetryData?) -> Void)?
     private var configObserverHandler: (() -> Void)?
     private var isObservingTelemetry = false
     private var isObservingConfig = false
+
+    private var udpSenderFD: Int32 = -1
+    private var udpListenerFD: Int32 = -1
+    private var udpReadSource: DispatchSourceRead?
+    private var udpTelemetryHandler: ((TelemetryData) -> Void)?
 
     public init(suiteName: String = AppGroupConfig.suiteName) {
         self.defaults = UserDefaults(suiteName: suiteName)
@@ -37,6 +47,8 @@ public final class SharedIPC: @unchecked Sendable {
     deinit {
         stopObservingTelemetry()
         stopObservingConfig()
+        stopUDPTelemetryListener()
+        closeUDPSenderSocket()
     }
 
     // MARK: - ROIConfig
@@ -87,6 +99,155 @@ public final class SharedIPC: @unchecked Sendable {
 
     public func loadTelemetry() -> TelemetryData? {
         loadCodable(TelemetryData.self, forKey: StorageKey.telemetryData)
+    }
+
+    // MARK: - Local UDP (127.0.0.1:45678)
+
+    public func sendTelemetryUDP(
+        _ telemetry: TelemetryData,
+        host: String = SharedIPC.udpHost,
+        port: UInt16 = SharedIPC.udpPort
+    ) {
+        guard let payload = try? encoder.encode(telemetry), !payload.isEmpty else { return }
+
+        udpLock.lock()
+        defer { udpLock.unlock() }
+
+        if udpSenderFD < 0 {
+            let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+            guard fd >= 0 else { return }
+            _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+            udpSenderFD = fd
+        }
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        _ = host.withCString { inet_pton(AF_INET, $0, &addr.sin_addr) }
+
+        payload.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            withUnsafePointer(to: &addr) { addrPtr in
+                addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                    _ = sendto(
+                        udpSenderFD,
+                        baseAddress,
+                        payload.count,
+                        0,
+                        sockPtr,
+                        socklen_t(MemoryLayout<sockaddr_in>.size)
+                    )
+                }
+            }
+        }
+    }
+
+    public func startUDPTelemetryListener(
+        port: UInt16 = SharedIPC.udpPort,
+        handler: @escaping (TelemetryData) -> Void
+    ) {
+        udpLock.lock()
+        udpTelemetryHandler = handler
+        if udpReadSource != nil {
+            udpLock.unlock()
+            return
+        }
+
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else {
+            udpLock.unlock()
+            return
+        }
+
+        var yes: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, socklen_t(MemoryLayout<Int32>.size))
+        _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        _ = Self.udpHost.withCString { inet_pton(AF_INET, $0, &addr.sin_addr) }
+
+        let bindResult = withUnsafePointer(to: &addr) { addrPtr in
+            addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                bind(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        guard bindResult == 0 else {
+            close(fd)
+            udpLock.unlock()
+            return
+        }
+
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: udpQueue)
+        source.setEventHandler { [weak self] in
+            self?.drainIncomingUDPPackets(fileDescriptor: fd)
+        }
+        source.setCancelHandler {
+            close(fd)
+        }
+
+        udpListenerFD = fd
+        udpReadSource = source
+        udpLock.unlock()
+
+        source.resume()
+    }
+
+    public func stopUDPTelemetryListener() {
+        udpLock.lock()
+        let source = udpReadSource
+        udpReadSource = nil
+        udpListenerFD = -1
+        udpTelemetryHandler = nil
+        udpLock.unlock()
+
+        source?.cancel()
+    }
+
+    private func closeUDPSenderSocket() {
+        udpLock.lock()
+        let fd = udpSenderFD
+        udpSenderFD = -1
+        udpLock.unlock()
+        if fd >= 0 {
+            close(fd)
+        }
+    }
+
+    private func drainIncomingUDPPackets(fileDescriptor fd: Int32) {
+        var buffer = [UInt8](repeating: 0, count: 8192)
+        var latestData: Data?
+
+        while true {
+            let received = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return -1 }
+                return recvfrom(fd, baseAddress, rawBuffer.count, 0, nil, nil)
+            }
+            if received > 0 {
+                latestData = Data(buffer[0..<received])
+            } else {
+                break
+            }
+        }
+
+        guard let packetData = latestData,
+              let telemetry = try? JSONDecoder().decode(TelemetryData.self, from: packetData) else {
+            return
+        }
+
+        udpLock.lock()
+        let handler = udpTelemetryHandler
+        udpLock.unlock()
+
+        guard let handler else { return }
+        DispatchQueue.main.async {
+            handler(telemetry)
+        }
     }
 
     // MARK: - Darwin Notification Center
