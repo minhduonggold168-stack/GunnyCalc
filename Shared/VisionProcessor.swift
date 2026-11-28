@@ -2,14 +2,11 @@ import CoreGraphics
 import Foundation
 import Vision
 
-/// Kết quả phân tích Minimap bằng HSV + Connected-Component Labeling 8 hướng + trích xuất địa hình 32 cột.
+/// Kết quả phân tích Minimap gồm tọa độ người chơi, mục tiêu đỏ và chiều rộng chuẩn 10.0 đơn vị (`screenWidthNorm`).
 public struct MinimapAnalysisResult: Equatable, Sendable {
     public let playerPos: CGPoint?
-    public let enemyPositions: [CGPoint]
-    public let cameraWidthNorm: Double?
-    public let minimapAspectHOverW: Double
-    public let terrainProfile: [Double]
-    public let lumaGrid64x24: [UInt8]
+    public let enemyPos: CGPoint?
+    public let screenWidthNorm: Double?
 }
 
 /// Bộ tách góc bắn 2 tầng regex cho Gunny Mobi (`-35 ... 85`), hỗ trợ cả lỗi OCR (`G6c`, `G0c`, thiếu chữ `Góc`).
@@ -65,28 +62,25 @@ public enum AngleParser {
     }
 }
 
-/// Bộ xử lý thị giác máy tính siêu nhẹ (< 25MB RAM, < 50ms):
-/// - Phân cụm không gian màu HSV + Connected-Component Labeling 8 hướng + lọc hình thái.
-/// - Tự động đo khung chữ nhật camera trắng (`S < 0.15, V > 0.82`) làm chuẩn `10.0` đơn vị.
-/// - Trích xuất hồ sơ độ cao địa hình 32 cột (`terrainProfile`) và dò vệt nổ trên Minimap.
+/// Bộ xử lý thị giác máy tính siêu nhẹ (< 20MB RAM, < 50ms):
+/// - Tìm tâm người chơi (xanh dương thuần) & mục tiêu (đỏ tươi thuần).
+/// - Đo chiều rộng chuẩn `10.0` đơn vị (`screenWidthNorm`) tự động theo 2 tầng:
+///   1) Quét vùng camera sáng ở nửa trên Minimap (`y: 0.048...0.105`, sáng hơn nền tối >= 15%).
+///   2) Dự phòng đo khoảng cách 2 vạch tối màu liên tiếp (`5.0` đơn vị × 2) trên thước vàng đáy Minimap (`y: 0.148...0.163`).
 public final class VisionProcessor {
-    public static let terrainColumnCount = 32
-    public static let lumaGridWidth = 64
-    public static let lumaGridHeight = 24
-
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
 
     public init() {}
 
-    // MARK: - 1. HSV Color-Space Clustering + 8-Neighbor CCL + White Camera + Terrain Profile
+    // MARK: - 1. Minimap Player, Enemy & Dynamic 10.0-Unit Screen Width Measurement
 
     public func analyzeMinimap(
-        from cropped: CGImage,
-        fallbackPlayerPos: CGPoint = CGPoint(x: 0.20, y: 0.72),
-        fallbackEnemyPos: CGPoint = CGPoint(x: 0.70, y: 0.72)
+        minimapCrop: CGImage,
+        yellowRulerCrop: CGImage? = nil,
+        fallbackPlayerPos: CGPoint? = nil
     ) -> MinimapAnalysisResult? {
-        let outW = cropped.width
-        let outH = cropped.height
+        let outW = minimapCrop.width
+        let outH = minimapCrop.height
         guard outW >= 8, outH >= 6,
               let context = makeRGBAContext(width: outW, height: outH),
               let rgbaPtr = context.data?.assumingMemoryBound(to: UInt8.self) else {
@@ -94,141 +88,91 @@ public final class VisionProcessor {
         }
 
         context.interpolationQuality = .none
-        context.draw(cropped, in: CGRect(x: 0, y: 0, width: outW, height: outH))
+        context.draw(minimapCrop, in: CGRect(x: 0, y: 0, width: outW, height: outH))
 
-        let minimapAspectHOverW = Double(outH) / Double(outW)
         let pixelCount = outW * outH
         var blueMask = [Bool](repeating: false, count: pixelCount)
         var redMask = [Bool](repeating: false, count: pixelCount)
-        var whiteMask = [Bool](repeating: false, count: pixelCount)
 
         let bytesPerRow = context.bytesPerRow
         for y in 0..<outH {
             let rowPtr = rgbaPtr.advanced(by: y * bytesPerRow)
             for x in 0..<outW {
                 let px = x * 4
-                let r = rowPtr[px]
-                let g = rowPtr[px + 1]
-                let b = rowPtr[px + 2]
+                let r = Int(rowPtr[px])
+                let g = Int(rowPtr[px + 1])
+                let b = Int(rowPtr[px + 2])
                 let idx = y * outW + x
 
-                let hsv = Self.rgbToHSV(r: r, g: g, b: b)
-
-                // Khung camera trắng bên trong Minimap: S < 0.15, V > 0.82 (loại 2px sát mép ngoài).
-                if x >= 2 && x < (outW - 2) && y >= 2 && y < (outH - 2) {
-                    if hsv.s < 0.15 && hsv.v > 0.82 {
-                        whiteMask[idx] = true
-                    }
-                }
-
-                // Người chơi (Blue Marker): H ∈ [205°, 245°], S > 0.65, V > 0.65.
-                if hsv.h >= 205.0 && hsv.h <= 245.0 && hsv.s > 0.65 && hsv.v > 0.65 {
+                // Người chơi (Xanh dương thuần): B > 190 && R < 80 && G < 135 && (B - R) > 125.
+                if b > 190 && r < 80 && g < 135 && (b - r) > 125 {
                     blueMask[idx] = true
                 }
-                // Mục tiêu (Red Marker): H ∈ [348°, 360°] ∪ [0°, 10°], S > 0.78, V > 0.70 (loại nền gạch đỏ/đất nâu/dung nham).
-                else if (hsv.h >= 348.0 || hsv.h <= 10.0) && hsv.s > 0.78 && hsv.v > 0.70 {
+                // Mục tiêu (Đỏ tươi thuần): R > 190 && G < 70 && B < 70 && (R - G) > 135 && (R - B) > 135.
+                else if r > 190 && g < 70 && b < 70 && (r - g) > 135 && (r - b) > 135 {
                     redMask[idx] = true
                 }
             }
         }
 
-        let playerPos = detectBluePlayerMarker(mask: blueMask, width: outW, height: outH)
-        let enemyPositions = detectRedEnemyMarkers(
+        let playerPos = detectBluePlayer(mask: blueMask, width: outW, height: outH)
+        let refPlayer = playerPos ?? fallbackPlayerPos
+        let enemyPos = detectNearestRedEnemy(
             mask: redMask,
             width: outW,
             height: outH,
-            playerPos: playerPos ?? fallbackPlayerPos
+            referencePlayer: refPlayer
         )
-        let cameraWidthNorm = detectWhiteCameraWidthNorm(whiteMask: whiteMask, width: outW, height: outH)
 
-        let resolvedPlayer = playerPos ?? fallbackPlayerPos
-        let resolvedEnemy = enemyPositions.first ?? fallbackEnemyPos
-        let terrainProfile = extractTerrainProfile(
+        // Cách 1: Đo vùng camera sáng ở nửa trên Minimap (tương ứng y màn hình 0.048...0.105).
+        var screenWidthNorm = detectBrightCameraWidthNorm(
             rgbaPtr: rgbaPtr,
             bytesPerRow: bytesPerRow,
             width: outW,
             height: outH,
             blueMask: blueMask,
-            redMask: redMask,
-            whiteMask: whiteMask,
-            playerPos: resolvedPlayer,
-            enemyPos: resolvedEnemy
+            redMask: redMask
         )
 
-        let lumaGrid = buildLumaGrid64x24(rgbaPtr: rgbaPtr, bytesPerRow: bytesPerRow, width: outW, height: outH)
+        // Cách 2 (dự phòng): Đối chiếu khoảng cách 2 vạch tối liên tiếp (5.0 đơn vị x 2) trên thước vàng đáy Minimap.
+        if screenWidthNorm == nil, let rulerImage = yellowRulerCrop {
+            screenWidthNorm = detectYellowRulerScreenWidthNorm(from: rulerImage)
+        }
 
         return MinimapAnalysisResult(
             playerPos: playerPos,
-            enemyPositions: enemyPositions,
-            cameraWidthNorm: cameraWidthNorm,
-            minimapAspectHOverW: minimapAspectHOverW,
-            terrainProfile: terrainProfile,
-            lumaGrid64x24: lumaGrid
+            enemyPos: enemyPos,
+            screenWidthNorm: screenWidthNorm
         )
     }
 
-    /// Chuyển đổi RGB (0...255) sang không gian màu HSV (`h: 0...360`, `s: 0...1`, `v: 0...1`).
-    public static func rgbToHSV(r: UInt8, g: UInt8, b: UInt8) -> (h: Double, s: Double, v: Double) {
-        let rf = Double(r) / 255.0
-        let gf = Double(g) / 255.0
-        let bf = Double(b) / 255.0
+    // MARK: - 8-Neighbor CCL for Pure Blue Player & Pure Red Enemy
 
-        let maxC = max(rf, max(gf, bf))
-        let minC = min(rf, min(gf, bf))
-        let delta = maxC - minC
-
-        let v = maxC
-        let s = maxC > 0.00001 ? delta / maxC : 0.0
-
-        var h = 0.0
-        if delta > 0.00001 {
-            if maxC == rf {
-                h = 60.0 * (((gf - bf) / delta).truncatingRemainder(dividingBy: 6.0))
-            } else if maxC == gf {
-                h = 60.0 * (((bf - rf) / delta) + 2.0)
-            } else {
-                h = 60.0 * (((rf - gf) / delta) + 4.0)
-            }
-            if h < 0.0 {
-                h += 360.0
-            }
-        }
-
-        return (h, s, v)
-    }
-
-    // MARK: - 8-Neighbor Connected-Component Labeling & Morphological Filtering
-
-    private struct CCLComponent {
+    private struct PixelCluster {
         var centerX: Double
         var centerY: Double
         var count: Int
         var bboxW: Int
         var bboxH: Int
-        var fillDensity: Double
     }
 
-    private func extract8ConnectedComponents(
+    private func extract8ConnectedClusters(
         from mask: [Bool],
         width: Int,
         height: Int,
         minPixels: Int,
         maxBBoxWidthRatio: Double,
-        maxBBoxHeightRatio: Double,
-        minFillDensity: Double,
-        minAspect: Double,
-        maxAspect: Double
-    ) -> [CCLComponent] {
+        maxBBoxHeightRatio: Double
+    ) -> [PixelCluster] {
         var visited = [Bool](repeating: false, count: width * height)
-        var components: [CCLComponent] = []
-
+        var clusters: [PixelCluster] = []
         let maxBBoxW = max(6, Int(Double(width) * maxBBoxWidthRatio))
         let maxBBoxH = max(6, Int(Double(height) * maxBBoxHeightRatio))
 
         var queueX: [Int] = []
         var queueY: [Int] = []
-        queueX.reserveCapacity(64)
-        queueY.reserveCapacity(64)
+        queueX.reserveCapacity(48)
+        queueY.reserveCapacity(48)
 
         for startY in 0..<height {
             for startX in 0..<width {
@@ -250,7 +194,6 @@ public final class VisionProcessor {
                 var minY = startY
                 var maxY = startY
 
-                // Gom cụm 8 hướng (8-Neighbor Connected-Component Labeling).
                 while head < queueX.count {
                     let cx = queueX[head]
                     let cy = queueY[head]
@@ -284,86 +227,59 @@ public final class VisionProcessor {
 
                 let bboxW = maxX - minX + 1
                 let bboxH = maxY - minY + 1
-                let bboxArea = max(bboxW * bboxH, 1)
-                let fillDensity = Double(count) / Double(bboxArea)
-                let aspect = Double(bboxW) / Double(max(bboxH, 1))
+                guard count >= minPixels, bboxW <= maxBBoxW, bboxH <= maxBBoxH else { continue }
 
-                // Lọc hình thái học: loại bỏ điểm nhiễu đơn lẻ, đường thẳng mảnh hoặc mảng nền lớn.
-                guard count >= minPixels,
-                      bboxW <= maxBBoxW,
-                      bboxH <= maxBBoxH,
-                      fillDensity >= minFillDensity,
-                      aspect >= minAspect,
-                      aspect <= maxAspect else {
-                    continue
-                }
-
-                components.append(
-                    CCLComponent(
+                clusters.append(
+                    PixelCluster(
                         centerX: sumX / Double(count),
                         centerY: sumY / Double(count),
                         count: count,
                         bboxW: bboxW,
-                        bboxH: bboxH,
-                        fillDensity: fillDensity
+                        bboxH: bboxH
                     )
                 )
             }
         }
 
-        return components
+        return clusters
     }
 
-    private func detectBluePlayerMarker(mask: [Bool], width: Int, height: Int) -> CGPoint? {
-        let components = extract8ConnectedComponents(
+    private func detectBluePlayer(mask: [Bool], width: Int, height: Int) -> CGPoint? {
+        let clusters = extract8ConnectedClusters(
             from: mask,
             width: width,
             height: height,
-            minPixels: 3,
+            minPixels: 2,
             maxBBoxWidthRatio: 0.20,
-            maxBBoxHeightRatio: 0.42,
-            minFillDensity: 0.22,
-            minAspect: 0.30,
-            maxAspect: 3.0
+            maxBBoxHeightRatio: 0.45
         )
-        guard !components.isEmpty else { return nil }
+        guard !clusters.isEmpty else { return nil }
 
-        // Ưu tiên cụm xanh dương đặc trưng có hình dạng mũi tên / chấm tròn gọn.
-        var best = components[0]
-        var bestScore = -1.0
-        for comp in components {
-            let shapeBonus = Double(comp.bboxH) >= Double(comp.bboxW) * 0.80 ? 12.0 : 0.0
-            let score = Double(min(comp.count, 220)) * (0.6 + comp.fillDensity) + shapeBonus
-            if score > bestScore {
-                bestScore = score
-                best = comp
-            }
+        var best = clusters[0]
+        for comp in clusters where comp.count > best.count {
+            best = comp
         }
-
         return CGPoint(
             x: min(max(best.centerX / Double(width), 0.0), 1.0),
             y: min(max(best.centerY / Double(height), 0.0), 1.0)
         )
     }
 
-    private func detectRedEnemyMarkers(
+    private func detectNearestRedEnemy(
         mask: [Bool],
         width: Int,
         height: Int,
-        playerPos: CGPoint
-    ) -> [CGPoint] {
-        let raw = extract8ConnectedComponents(
+        referencePlayer: CGPoint?
+    ) -> CGPoint? {
+        let raw = extract8ConnectedClusters(
             from: mask,
             width: width,
             height: height,
             minPixels: 2,
-            maxBBoxWidthRatio: 0.14,
-            maxBBoxHeightRatio: 0.34,
-            minFillDensity: 0.25,
-            minAspect: 0.35,
-            maxAspect: 2.8
+            maxBBoxWidthRatio: 0.16,
+            maxBBoxHeightRatio: 0.40
         )
-        guard !raw.isEmpty else { return [] }
+        guard !raw.isEmpty else { return nil }
 
         let mergeDistPx = max(4.0, Double(width) * 0.025)
         var merged = raw
@@ -396,271 +312,213 @@ public final class VisionProcessor {
                 y: min(max($0.centerY / Double(height), 0.0), 1.0)
             )
         }
-        points.sort {
-            hypot(Double($0.x - playerPos.x), Double($0.y - playerPos.y))
-                < hypot(Double($1.x - playerPos.x), Double($1.y - playerPos.y))
-        }
-        return Array(points.prefix(8))
-    }
 
-    // MARK: - Automatic White Camera Viewport Width Detection (10.0 Units Reference)
-
-    private struct VerticalEdge {
-        let x: Int
-        let yTop: Int
-        let yBottom: Int
-        let coverage: Double
-    }
-
-    private func detectWhiteCameraWidthNorm(whiteMask: [Bool], width: Int, height: Int) -> Double? {
-        let minEdgeH = max(8, Int(Double(height) * 0.28))
-        let maxEdgeH = Int(Double(height) * 0.96)
-        let minRectW = max(14, Int(Double(width) * 0.22))
-        let maxRectW = Int(Double(width) * 0.88)
-        guard width >= 20, height >= 14, minRectW < maxRectW else { return nil }
-
-        let maxGap = width >= 240 ? 2 : 1
-        var edges: [VerticalEdge] = []
-        for x in 2..<(width - 2) {
-            var y = 2
-            while y < (height - 2) {
-                guard whiteMask[y * width + x] else {
-                    y += 1
-                    continue
-                }
-                let startY = y
-                var endY = y
-                var hits = 0
-                var gap = 0
-                while y < (height - 2) {
-                    if whiteMask[y * width + x] {
-                        hits += 1
-                        endY = y
-                        gap = 0
-                    } else {
-                        gap += 1
-                        if gap > maxGap { break }
-                    }
-                    y += 1
-                }
-                let spanH = endY - startY + 1
-                if spanH >= minEdgeH && spanH <= maxEdgeH {
-                    let cov = Double(hits) / Double(spanH)
-                    if cov >= 0.55 {
-                        edges.append(VerticalEdge(x: x, yTop: startY, yBottom: endY, coverage: cov))
-                    }
-                }
+        // Bỏ qua nhiễu đỏ nằm quá sát người chơi (< 0.02).
+        if let player = referencePlayer {
+            points = points.filter { hypot(Double($0.x - player.x), Double($0.y - player.y)) >= 0.02 }
+            points.sort {
+                hypot(Double($0.x - player.x), Double($0.y - player.y))
+                    < hypot(Double($1.x - player.x), Double($1.y - player.y))
             }
         }
 
-        guard edges.count >= 2 else { return nil }
-        edges.sort { ($0.coverage * Double($0.yBottom - $0.yTop)) > ($1.coverage * Double($1.yBottom - $1.yTop)) }
-        let topEdges = Array(edges.prefix(24))
-
-        var bestWidthNorm: Double?
-        var bestScore = 0.0
-
-        for i in 0..<topEdges.count {
-            for j in (i + 1)..<topEdges.count {
-                let a = topEdges[i]
-                let b = topEdges[j]
-                let left = a.x < b.x ? a : b
-                let right = a.x < b.x ? b : a
-                let rectW = right.x - left.x
-                guard rectW >= minRectW && rectW <= maxRectW else { continue }
-
-                let yTop = max(left.yTop, right.yTop)
-                let yBottom = min(left.yBottom, right.yBottom)
-                let rectH = yBottom - yTop + 1
-                guard rectH >= minEdgeH else { continue }
-
-                let aspect = Double(rectW) / Double(rectH)
-                guard aspect >= 1.0 && aspect <= 4.2 else { continue }
-
-                let topCov = horizontalWhiteCoverage(whiteMask: whiteMask, width: width, height: height, xStart: left.x, xEnd: right.x, yTarget: yTop)
-                let bottomCov = horizontalWhiteCoverage(whiteMask: whiteMask, width: width, height: height, xStart: left.x, xEnd: right.x, yTarget: yBottom)
-                guard (topCov + bottomCov) * 0.5 >= 0.35 else { continue }
-
-                let score = (left.coverage + right.coverage + topCov + bottomCov) * 0.25
-                if score >= 0.45 && score > bestScore {
-                    bestScore = score
-                    bestWidthNorm = Double(rectW) / Double(width)
-                }
-            }
-        }
-
-        return bestWidthNorm
+        return points.first
     }
 
-    private func horizontalWhiteCoverage(
-        whiteMask: [Bool],
-        width: Int,
-        height: Int,
-        xStart: Int,
-        xEnd: Int,
-        yTarget: Int
-    ) -> Double {
-        guard xEnd > xStart else { return 0.0 }
-        var hits = 0
-        let total = xEnd - xStart + 1
-        let yMin = max(0, yTarget - 2)
-        let yMax = min(height - 1, yTarget + 2)
+    // MARK: - Method 1: Upper-Half Bright Camera Viewport Detection (10.0 Units)
 
-        for x in xStart...xEnd {
-            var found = false
-            for y in yMin...yMax {
-                if whiteMask[y * width + x] {
-                    found = true
-                    break
-                }
-            }
-            if found { hits += 1 }
-        }
-        return Double(hits) / Double(total)
-    }
-
-    // MARK: - 32-Column Terrain Surface Height Extraction
-
-    /// Trích xuất 32 cột độ cao bề mặt địa hình (`0.0` đáy -> `1.0` đỉnh) dọc đoạn nối từ `playerPos` tới `enemyPos`.
-    private func extractTerrainProfile(
+    /// Quét độ sáng trung bình theo từng cột X ở nửa trên Minimap (tương ứng `y: 0.048...0.105` toàn màn hình).
+    /// Tìm khoảng liên tục sáng hơn nền tối xung quanh ít nhất `15%` nằm trong dải hợp lệ `0.35...0.85`.
+    private func detectBrightCameraWidthNorm(
         rgbaPtr: UnsafeMutablePointer<UInt8>,
         bytesPerRow: Int,
         width: Int,
         height: Int,
         blueMask: [Bool],
-        redMask: [Bool],
-        whiteMask: [Bool],
-        playerPos: CGPoint,
-        enemyPos: CGPoint
-    ) -> [Double] {
-        // Ước lượng màu nền trời từ 3 hàng trên cùng (loại trừ chấm người chơi/địch/khung camera).
-        var skySumR = 0
-        var skySumG = 0
-        var skySumB = 0
-        var skySamples = 0
-        let skyRows = min(3, height)
-        for y in 0..<skyRows {
-            let row = rgbaPtr.advanced(by: y * bytesPerRow)
-            for x in 0..<width {
-                let idx = y * width + x
-                if blueMask[idx] || redMask[idx] || whiteMask[idx] { continue }
-                let px = x * 4
-                skySumR += Int(row[px])
-                skySumG += Int(row[px + 1])
-                skySumB += Int(row[px + 2])
-                skySamples += 1
-            }
-        }
-
-        let skyR = skySamples > 0 ? skySumR / skySamples : 18
-        let skyG = skySamples > 0 ? skySumG / skySamples : 24
-        let skyB = skySamples > 0 ? skySumB / skySamples : 34
-
-        let colCount = Self.terrainColumnCount
-        var profile = [Double](repeating: 0.0, count: colCount)
-        let startX = Double(playerPos.x)
-        let endX = Double(enemyPos.x)
-        let colorDiffThreshold = 55
-
-        for c in 0..<colCount {
-            let u = Double(c) / Double(colCount - 1)
-            let normX = startX + (endX - startX) * u
-            let colX = min(max(Int((normX * Double(width)).rounded()), 0), width - 1)
-
-            var contiguousTerrain = 0
-            var surfaceY: Int?
-            for y in 0..<height {
-                let idx = y * width + colX
-                if blueMask[idx] || redMask[idx] || whiteMask[idx] {
-                    continue
-                }
-                let px = y * bytesPerRow + colX * 4
-                let dr = abs(Int(rgbaPtr[px]) - skyR)
-                let dg = abs(Int(rgbaPtr[px + 1]) - skyG)
-                let db = abs(Int(rgbaPtr[px + 2]) - skyB)
-                if (dr + dg + db) >= colorDiffThreshold {
-                    contiguousTerrain += 1
-                    if contiguousTerrain >= 3 {
-                        surfaceY = max(0, y - 2)
-                        break
-                    }
-                } else {
-                    contiguousTerrain = 0
-                }
-            }
-
-            if let ySurf = surfaceY {
-                profile[c] = min(max(1.0 - (Double(ySurf) / Double(height)), 0.0), 1.0)
-            } else {
-                profile[c] = 0.0
-            }
-        }
-
-        return profile
-    }
-
-    // MARK: - Post-Shot Impact Flash Detection (Adaptive Online Calibration)
-
-    private func buildLumaGrid64x24(
-        rgbaPtr: UnsafeMutablePointer<UInt8>,
-        bytesPerRow: Int,
-        width: Int,
-        height: Int
-    ) -> [UInt8] {
-        let gw = Self.lumaGridWidth
-        let gh = Self.lumaGridHeight
-        var grid = [UInt8](repeating: 0, count: gw * gh)
-        for gy in 0..<gh {
-            let sy = min((gy * height) / gh, height - 1)
-            let row = rgbaPtr.advanced(by: sy * bytesPerRow)
-            for gx in 0..<gw {
-                let sx = min((gx * width) / gw, width - 1)
-                let px = sx * 4
-                let lum = (Int(row[px]) * 77 + Int(row[px + 1]) * 150 + Int(row[px + 2]) * 29) >> 8
-                grid[gy * gw + gx] = UInt8(min(max(lum, 0), 255))
-            }
-        }
-        return grid
-    }
-
-    /// So sánh khung Minimap hiện tại với khung nền trước lúc bắn để định vị tâm X vụ nổ (`0.0...1.0`).
-    public func detectImpactFlashX(
-        baseline: [UInt8],
-        current: [UInt8],
-        playerX: Double
+        redMask: [Bool]
     ) -> Double? {
-        let gw = Self.lumaGridWidth
-        let gh = Self.lumaGridHeight
-        guard baseline.count == gw * gh, current.count == gw * gh else { return nil }
+        guard width >= 20, height >= 8 else { return nil }
 
-        var weightedSumX = 0.0
-        var totalWeight = 0.0
-        var changedCount = 0
+        // Ánh xạ dải màn hình y ∈ [0.048, 0.105] vào bên trong minimapStrip (y = 0.042, h = 0.114).
+        let localYStart = (0.048 - Double(GunnyROIs.minimapStrip.origin.y)) / Double(GunnyROIs.minimapStrip.size.height)
+        let localYEnd = (0.105 - Double(GunnyROIs.minimapStrip.origin.y)) / Double(GunnyROIs.minimapStrip.size.height)
+        let yStart = min(max(Int((localYStart * Double(height)).rounded()), 0), max(height - 2, 0))
+        let yEnd = min(max(Int((localYEnd * Double(height)).rounded()), yStart + 2), height)
 
-        for gy in 0..<gh {
-            for gx in 0..<gw {
-                let normX = Double(gx) / Double(gw)
-                // Bỏ qua vùng đứng của chính nhân vật để tránh hiệu ứng bắn đạn ngay nòng.
-                if abs(normX - playerX) < 0.05 { continue }
+        var colMean = [Double](repeating: 0.0, count: width)
+        for x in 0..<width {
+            var sum = 0.0
+            var samples = 0
+            for y in yStart..<yEnd {
+                let idx = y * width + x
+                if blueMask[idx] || redMask[idx] { continue }
+                let px = y * bytesPerRow + x * 4
+                let lum = 0.299 * Double(rgbaPtr[px]) + 0.587 * Double(rgbaPtr[px + 1]) + 0.114 * Double(rgbaPtr[px + 2])
+                sum += lum
+                samples += 1
+            }
+            colMean[x] = samples > 0 ? (sum / Double(samples)) : 0.0
+        }
 
-                let idx = gy * gw + gx
-                let diff = abs(Int(current[idx]) - Int(baseline[idx]))
-                if diff >= 48 {
-                    let brightBoost = Int(current[idx]) >= 190 ? 2.0 : 1.0
-                    let w = Double(diff) * brightBoost
-                    weightedSumX += normX * w
-                    totalWeight += w
-                    changedCount += 1
+        // Làm mượt nhẹ 3 cột để tránh nhiễu 1 pixel mà vẫn giữ sắc nét biên khung camera.
+        var smooth = [Double](repeating: 0.0, count: width)
+        for x in 0..<width {
+            let l = colMean[max(0, x - 1)]
+            let c = colMean[x]
+            let r = colMean[min(width - 1, x + 1)]
+            smooth[x] = (l + c + r) / 3.0
+        }
+
+        // Lấy mức nền tối từ 12% cột tối nhất (đảm bảo luôn lấy đúng nền tối ngoài khung camera dù khung rộng tới 85%).
+        let sorted = smooth.sorted()
+        let darkCount = max(4, Int(Double(width) * 0.12))
+        var darkSum = 0.0
+        for i in 0..<min(darkCount, sorted.count) {
+            darkSum += sorted[i]
+        }
+        let darkBaseline = darkSum / Double(max(min(darkCount, sorted.count), 1))
+        let threshold = max(darkBaseline * 1.15, darkBaseline + 4.0)
+
+        var bestStart = -1
+        var bestEnd = -1
+        var bestLen = 0
+        var x = 0
+        while x < width {
+            guard smooth[x] >= threshold else {
+                x += 1
+                continue
+            }
+            let runStart = x
+            var runEnd = x
+            var gap = 0
+            while x < width {
+                if smooth[x] >= threshold {
+                    runEnd = x
+                    gap = 0
+                } else {
+                    gap += 1
+                    if gap > 2 { break }
                 }
+                x += 1
+            }
+            let runLen = runEnd - runStart + 1
+            if runLen > bestLen {
+                bestLen = runLen
+                bestStart = runStart
+                bestEnd = runEnd
             }
         }
 
-        // Cần đủ mật độ điểm ảnh nổ/rung nhưng không phải chuyển cảnh toàn màn hình.
-        guard changedCount >= 4 && changedCount <= (gw * gh) / 3, totalWeight > 0.0 else {
+        guard bestLen >= 8, bestStart >= 0, bestEnd >= bestStart else { return nil }
+
+        // Kiểm chứng độ sáng trung bình bên trong khung thực sự cao hơn nền tối xung quanh >= 15%.
+        var insideSum = 0.0
+        var insideCount = 0
+        var outsideSum = 0.0
+        var outsideCount = 0
+        for idx in 0..<width {
+            if idx >= bestStart && idx <= bestEnd {
+                insideSum += colMean[idx]
+                insideCount += 1
+            } else {
+                outsideSum += colMean[idx]
+                outsideCount += 1
+            }
+        }
+
+        let insideMean = insideSum / Double(max(insideCount, 1))
+        let outsideMean = outsideCount >= 4 ? (outsideSum / Double(outsideCount)) : darkBaseline
+        guard insideMean >= max(outsideMean * 1.15, outsideMean + 4.0) else {
             return nil
         }
 
-        return min(max(weightedSumX / totalWeight, 0.0), 1.0)
+        // Tinh chỉnh chính xác 2 mép khung camera bằng ngưỡng trung bình (mid-point) trên colMean gốc để loại sai số làm mượt 1px.
+        let midThreshold = (insideMean + outsideMean) * 0.5
+        var refinedStart = bestStart
+        var refinedEnd = bestEnd
+        while refinedStart < refinedEnd && colMean[refinedStart] < midThreshold {
+            refinedStart += 1
+        }
+        while refinedEnd > refinedStart && colMean[refinedEnd] < midThreshold {
+            refinedEnd -= 1
+        }
+
+        let widthNorm = Double(refinedEnd - refinedStart + 1) / Double(width)
+        guard widthNorm >= 0.35 && widthNorm <= 0.85 else {
+            return nil
+        }
+        return widthNorm
+    }
+
+    // MARK: - Method 2: Fallback Yellow Ruler 5-Unit Tick Spacing (y: 0.148...0.163)
+
+    /// Tìm các vạch chia tối màu dọc thước vàng đáy Minimap để lấy khoảng cách 2 vạch liên tiếp (`5.0` đơn vị) và nhân đôi (`10.0` đơn vị).
+    public func detectYellowRulerScreenWidthNorm(from rulerImage: CGImage) -> Double? {
+        let outW = rulerImage.width
+        let outH = rulerImage.height
+        guard outW >= 20, outH >= 2,
+              let context = makeRGBAContext(width: outW, height: outH),
+              let rgbaPtr = context.data?.assumingMemoryBound(to: UInt8.self) else {
+            return nil
+        }
+
+        context.interpolationQuality = .none
+        context.draw(rulerImage, in: CGRect(x: 0, y: 0, width: outW, height: outH))
+
+        let bytesPerRow = context.bytesPerRow
+        var colLum = [Double](repeating: 0.0, count: outW)
+        for x in 0..<outW {
+            var sum = 0.0
+            for y in 0..<outH {
+                let px = y * bytesPerRow + x * 4
+                sum += 0.299 * Double(rgbaPtr[px]) + 0.587 * Double(rgbaPtr[px + 1]) + 0.114 * Double(rgbaPtr[px + 2])
+            }
+            colLum[x] = sum / Double(outH)
+        }
+
+        let sorted = colLum.sorted()
+        let brightRef = sorted[min(Int(Double(outW) * 0.75), outW - 1)]
+        guard brightRef >= 60.0 else { return nil }
+
+        let darkThreshold = min(brightRef * 0.72, brightRef - 25.0)
+        var tickCenters: [Double] = []
+        let maxTickWidthPx = max(2, Int(Double(outW) * 0.06))
+
+        var x = 1
+        while x < (outW - 1) {
+            guard colLum[x] <= darkThreshold else {
+                x += 1
+                continue
+            }
+            let startX = x
+            while x < (outW - 1) && colLum[x] <= darkThreshold {
+                x += 1
+            }
+            let endX = x - 1
+            let tickW = endX - startX + 1
+            if tickW <= maxTickWidthPx {
+                let centerNorm = (Double(startX + endX) * 0.5) / Double(outW)
+                tickCenters.append(centerNorm)
+            }
+        }
+
+        guard tickCenters.count >= 2 else { return nil }
+
+        var validSpacings: [Double] = []
+        for i in 0..<(tickCenters.count - 1) {
+            let spacing = tickCenters[i + 1] - tickCenters[i]
+            // 1 khoảng vạch = 5.0 đơn vị -> 2 * spacing phải nằm trong [0.35, 0.85].
+            if spacing >= 0.175 && spacing <= 0.425 {
+                validSpacings.append(spacing)
+            }
+        }
+        guard !validSpacings.isEmpty else { return nil }
+
+        validSpacings.sort()
+        let medianSpacing = validSpacings[validSpacings.count / 2]
+        let screenWidth = 2.0 * medianSpacing
+        guard screenWidth >= 0.35 && screenWidth <= 0.85 else { return nil }
+        return screenWidth
     }
 
     // MARK: - 2. Accurate Vietnamese/English Angle OCR (-35 ... 85)

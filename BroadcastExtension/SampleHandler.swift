@@ -7,10 +7,10 @@ import Foundation
 import ImageIO
 import ReplayKit
 
-/// Handler nhận khung hình thụ động từ ReplayKit (< 25MB RAM, độ trễ < 0.1s).
-/// - Thuật toán 1: Phân cụm không gian màu HSV + Connected-Component Labeling 8 hướng + tự đo khung camera trắng (`10.0` đơn vị).
-/// - Thuật toán 2: Trích xuất địa hình 32 cột & Terrain Raycast 25 điểm cảnh báo vướng núi (`isBlocked`, `suggestedAngle`).
-/// - Thuật toán 3: Theo dõi vệt nổ sau phát bắn & tự học `mapScaleMultiplier` (`learningRate = 0.15`, `0.85...1.15`).
+/// Handler nhận khung hình thụ động từ ReplayKit đạt độ trễ < 0.1s (< 20MB RAM).
+/// - Quét Minimap (`0.848, 0.042, 0.148, 0.114`) và thước vàng (`0.848, 0.148, 0.148, 0.015`) ở 30 FPS (33ms) khi xoay ngang.
+/// - Tự động đo chiều rộng khung camera sáng `screenWidthNorm` = `10.0` đơn vị cho mọi bản đồ (dự phòng thước vàng 5 đơn vị × 2).
+/// - Tính cự ly `(abs(enemyX - playerX) / screenWidthNorm) * 10.0`, chênh cao `deltaYUnits` và lực chuẩn NPH (không EMA).
 /// - Gửi gói JSON qua BSD UDP `127.0.0.1:45678` an toàn tuyệt đối (không `!`, không `fatalError`).
 final class SampleHandler: RPBroadcastSampleHandler {
     private let sharedCIContext = CIContext(options: [
@@ -20,7 +20,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private let grayColorSpace = CGColorSpaceCreateDeviceGray()
     private let visionProcessor = VisionProcessor()
     private let ballisticsEngine = BallisticsEngine()
-    private let calibrationEngine = AdaptiveCalibrationEngine()
     private let ipc = SharedIPC.shared
 
     private let stateLock = NSLock()
@@ -41,22 +40,11 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var frameCounter: Int = 0
 
     // Trạng thái tức thời (không làm mượt EMA).
-    private var lastPlayerPos = CGPoint(x: 0.20, y: 0.72)
-    private var lastEnemyPos = CGPoint(x: 0.70, y: 0.72)
-    private var lastCameraWidthNorm: Double = 0.50 // 10.0 đơn vị = 50% Minimap (20.0 đơn vị toàn bản đồ)
-    private var lastMinimapAspect: Double = 0.36
-    private var lastTerrainProfile: [Double] = []
-    private var lastRawDistanceUnits: Double = 10.0
+    private var lastPlayerPos = CGPoint(x: 0.25, y: 0.65)
+    private var lastScreenWidthNorm: Double = 0.50
+    private var lastDistanceUnits: Double = 10.0
+    private var lastDeltaYUnits: Double = 0.0
     private var lastAngle: Int = 50
-
-    // Trạng thái theo dõi phát bắn cho Adaptive Online Calibration.
-    private var consecutiveNilOCR: Int = 0
-    private var isShotInFlight: Bool = false
-    private var shotStartedAt: TimeInterval = 0
-    private var preShotPlayerX: Double = 0.20
-    private var preShotTargetDistance: Double = 10.0
-    private var preShotCameraWidthNorm: Double = 0.50
-    private var preShotBaselineLuma: [UInt8] = []
 
     private let minimumFrameInterval: TimeInterval = 0.033 // 30 FPS (33ms)
     private let minimumOCRInterval: TimeInterval = 0.050   // 20 Hz (50ms)
@@ -77,18 +65,11 @@ final class SampleHandler: RPBroadcastSampleHandler {
         isCurrentlyLandscape = false
         frameCounter = 1
         lastPacketSentTime = now
-        lastPlayerPos = CGPoint(x: 0.20, y: 0.72)
-        lastEnemyPos = CGPoint(x: 0.70, y: 0.72)
-        lastCameraWidthNorm = 0.50
-        lastMinimapAspect = 0.36
-        lastTerrainProfile = []
-        lastRawDistanceUnits = 10.0
+        lastPlayerPos = CGPoint(x: 0.25, y: 0.65)
+        lastScreenWidthNorm = 0.50
+        lastDistanceUnits = 10.0
+        lastDeltaYUnits = 0.0
         lastAngle = 50
-        consecutiveNilOCR = 0
-        isShotInFlight = false
-        preShotBaselineLuma = []
-        calibrationEngine.reset()
-
         let startupTelemetry = buildTelemetryLocked(frameId: 1)
         stateLock.unlock()
 
@@ -156,16 +137,16 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
             stateLock.lock()
             let fallbackPlayer = lastPlayerPos
-            let fallbackEnemy = lastEnemyPos
             stateLock.unlock()
 
-            // 1. Phân tích Minimap (HSV + 8-Neighbor CCL + khung camera trắng + địa hình 32 cột).
+            // 1. Cắt Minimap + dải thước vàng đáy Minimap ở độ phân giải gốc qua ciRectFromTopLeft.
             let analysis: MinimapAnalysisResult?
-            if let nativeStrip = renderNativeMinimapStrip(from: ciImage) {
+            if let minimapCrop = renderNativeROI(GunnyROIs.minimapStrip, from: ciImage) {
+                let yellowRulerCrop = renderNativeROI(GunnyROIs.minimapYellowRuler, from: ciImage)
                 analysis = visionProcessor.analyzeMinimap(
-                    from: nativeStrip,
-                    fallbackPlayerPos: fallbackPlayer,
-                    fallbackEnemyPos: fallbackEnemy
+                    minimapCrop: minimapCrop,
+                    yellowRulerCrop: yellowRulerCrop,
+                    fallbackPlayerPos: fallbackPlayer
                 )
             } else {
                 analysis = nil
@@ -175,47 +156,19 @@ final class SampleHandler: RPBroadcastSampleHandler {
             isCurrentlyLandscape = true
 
             if let analysis {
-                lastMinimapAspect = analysis.minimapAspectHOverW
-                lastTerrainProfile = analysis.terrainProfile
-
-                // Khóa tự động chiều rộng khung camera trắng = 10.0 đơn vị cự ly theo tỷ lệ zoom từng bản đồ.
-                if let camW = analysis.cameraWidthNorm, camW >= 0.22, camW <= 0.88 {
-                    lastCameraWidthNorm = camW
+                if let measuredWidth = analysis.screenWidthNorm,
+                   measuredWidth >= 0.35 && measuredWidth <= 0.85 {
+                    lastScreenWidthNorm = measuredWidth
                 }
 
                 if let playerPos = analysis.playerPos {
                     lastPlayerPos = playerPos
                 }
 
-                if let nearestEnemy = analysis.enemyPositions.first {
-                    lastEnemyPos = nearestEnemy
-                    let safeCamW = min(max(lastCameraWidthNorm, 0.20), 0.90)
-                    lastRawDistanceUnits = (abs(Double(nearestEnemy.x - lastPlayerPos.x)) / safeCamW) * BallisticsEngine.unitsPerScreen
-                }
-
-                // Thuật toán 3: Theo dõi vệt nổ trên Minimap khi đạn đang bay để tự học `mapScaleMultiplier`.
-                if isShotInFlight {
-                    if (now - shotStartedAt) > 5.0 {
-                        isShotInFlight = false
-                    } else if !preShotBaselineLuma.isEmpty,
-                              let impactX = visionProcessor.detectImpactFlashX(
-                                  baseline: preShotBaselineLuma,
-                                  current: analysis.lumaGrid64x24,
-                                  playerX: preShotPlayerX
-                              ) {
-                        let safeCamW = min(max(preShotCameraWidthNorm, 0.20), 0.90)
-                        let actualDistance = (abs(impactX - preShotPlayerX) / safeCamW) * BallisticsEngine.unitsPerScreen
-                        calibrationEngine.recordShotOutcome(
-                            targetDistance: preShotTargetDistance,
-                            actualDistance: actualDistance
-                        )
-                        isShotInFlight = false
-                    }
-                } else {
-                    preShotPlayerX = Double(lastPlayerPos.x)
-                    preShotTargetDistance = lastRawDistanceUnits
-                    preShotCameraWidthNorm = lastCameraWidthNorm
-                    preShotBaselineLuma = analysis.lumaGrid64x24
+                if let enemyPos = analysis.enemyPos {
+                    let safeScreenW = min(max(lastScreenWidthNorm, 0.35), 0.85)
+                    lastDistanceUnits = (abs(Double(enemyPos.x - lastPlayerPos.x)) / safeScreenW) * BallisticsEngine.unitsPerScreen
+                    lastDeltaYUnits = (Double(lastPlayerPos.y - enemyPos.y) / safeScreenW) * BallisticsEngine.unitsPerScreen
                 }
             }
 
@@ -258,55 +211,38 @@ final class SampleHandler: RPBroadcastSampleHandler {
                     self.stateLock.unlock()
                 }
 
-                let detectedAngle = self.visionProcessor.detectAngle(fromContrastImage: contrastAngleImage)
+                guard let detectedAngle = self.visionProcessor.detectAngle(fromContrastImage: contrastAngleImage) else {
+                    return
+                }
 
                 self.stateLock.lock()
-                if let detectedAngle {
-                    let angleChanged = detectedAngle != self.lastAngle
-                    self.lastAngle = detectedAngle
-                    self.consecutiveNilOCR = 0
-                    self.isShotInFlight = false
-
-                    if angleChanged {
-                        self.frameCounter += 1
-                        let immediateId = self.frameCounter
-                        self.lastPacketSentTime = Date().timeIntervalSince1970
-                        let immediateTelemetry = self.buildTelemetryLocked(frameId: immediateId)
-                        self.stateLock.unlock()
-                        self.sendUDPPacket(immediateTelemetry)
-                        return
-                    }
-                } else {
-                    // Khi chữ góc biến mất liên tiếp >= 2 lần (~100ms), kích hoạt theo dõi điểm rơi/vụ nổ trên Minimap.
-                    self.consecutiveNilOCR += 1
-                    if self.consecutiveNilOCR >= 2 && !self.isShotInFlight && !self.preShotBaselineLuma.isEmpty {
-                        self.isShotInFlight = true
-                        self.shotStartedAt = Date().timeIntervalSince1970
-                    }
+                let angleChanged = detectedAngle != self.lastAngle
+                self.lastAngle = detectedAngle
+                if angleChanged {
+                    self.frameCounter += 1
+                    let immediateId = self.frameCounter
+                    self.lastPacketSentTime = Date().timeIntervalSince1970
+                    let immediateTelemetry = self.buildTelemetryLocked(frameId: immediateId)
+                    self.stateLock.unlock()
+                    self.sendUDPPacket(immediateTelemetry)
+                    return
                 }
                 self.stateLock.unlock()
             }
         }
     }
 
-    // MARK: - Telemetry Assembly (Ballistics + Terrain Raycast + Online Calibration)
-
     private func buildTelemetryLocked(frameId: Int) -> TelemetryData {
-        let calibratedDist = calibrationEngine.calibratedDistance(rawDistanceUnits: lastRawDistanceUnits)
-        let power = ballisticsEngine.calculatePower(distanceUnits: calibratedDist, angle: lastAngle)
-        let raycast = ballisticsEngine.checkTerrainObstruction(
-            playerPos: lastPlayerPos,
-            enemyPos: lastEnemyPos,
-            minimapAspectHOverW: lastMinimapAspect,
-            terrainProfile: lastTerrainProfile,
-            angle: lastAngle
+        let power = ballisticsEngine.calculatePower(
+            distanceUnits: lastDistanceUnits,
+            angle: lastAngle,
+            deltaYUnits: lastDeltaYUnits
         )
         return TelemetryData(
             frameId: frameId,
             angle: lastAngle,
-            power: power,
-            isBlocked: raycast.isBlocked,
-            suggestedAngle: raycast.suggestedAngle
+            distanceUnits: lastDistanceUnits,
+            power: power
         )
     }
 
@@ -444,7 +380,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         udpLock.unlock()
     }
 
-    // MARK: - Orientation, Native Minimap Crop & High-Contrast Angle Crop
+    // MARK: - Orientation, Native ROI Crop & High-Contrast Angle Crop
 
     private func extractVideoOrientation(from sampleBuffer: CMSampleBuffer) -> CGImagePropertyOrientation {
         if let attachment = CMGetAttachment(
@@ -457,13 +393,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return .up
     }
 
-    private func renderNativeMinimapStrip(from ciImage: CIImage) -> CGImage? {
+    private func renderNativeROI(_ normRect: CGRect, from ciImage: CIImage) -> CGImage? {
         let cropRect = ciRectFromTopLeft(
-            normRect: GunnyROIs.minimapStrip,
+            normRect: normRect,
             imageWidth: ciImage.extent.width,
             imageHeight: ciImage.extent.height
         ).intersection(ciImage.extent)
-        guard cropRect.width >= 8, cropRect.height >= 6 else { return nil }
+        guard cropRect.width >= 8, cropRect.height >= 2 else { return nil }
 
         let patch = ciImage
             .cropped(to: cropRect)
@@ -475,7 +411,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             width: floor(patch.extent.width),
             height: floor(patch.extent.height)
         )
-        guard bounds.width >= 8, bounds.height >= 6 else { return nil }
+        guard bounds.width >= 8, bounds.height >= 2 else { return nil }
         return sharedCIContext.createCGImage(patch, from: bounds)
     }
 

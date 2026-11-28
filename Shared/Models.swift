@@ -11,10 +11,12 @@ public func ciRectFromTopLeft(normRect: CGRect, imageWidth: CGFloat, imageHeight
     return CGRect(x: x, y: y, width: w, height: h).integral
 }
 
-/// 2 vùng quét cố định (tọa độ chuẩn hóa Top-Left `0.0 - 1.0`) cho Gunny Mobi bản không gió.
+/// Các vùng quét cố định (tọa độ chuẩn hóa Top-Left `0.0 - 1.0`) cho Gunny Mobi bản không gió.
 public enum GunnyROIs {
-    /// Vùng cắt Minimap chuẩn cho phân cụm HSV, đo khung camera trắng và trích xuất địa hình 32 cột.
+    /// Vùng chiến trường Minimap (tìm người chơi xanh, mục tiêu đỏ và vùng camera sáng 10.0 đơn vị).
     public static let minimapStrip = CGRect(x: 0.848, y: 0.042, width: 0.148, height: 0.114)
+    /// Dải thước vàng đáy Minimap (dự phòng đo khoảng cách 5.0 đơn vị giữa 2 vạch chia).
+    public static let minimapYellowRuler = CGRect(x: 0.848, y: 0.148, width: 0.148, height: 0.015)
     /// Vùng chiến trường nửa trên chứa chữ `Góc XX°` cạnh nhân vật.
     public static let angleBattlefield = CGRect(x: 0.050, y: 0.140, width: 0.820, height: 0.540)
 }
@@ -23,31 +25,28 @@ public enum GunnyROIs {
 public struct TelemetryData: Codable, Equatable, Sendable {
     public var frameId: Int
     public var angle: Int
+    public var distanceUnits: Double
     public var power: Double
-    public var isBlocked: Bool
-    public var suggestedAngle: Int
 
     public init(
         frameId: Int = 0,
         angle: Int = 50,
-        power: Double = 48.0,
-        isBlocked: Bool = false,
-        suggestedAngle: Int = 50
+        distanceUnits: Double = 10.0,
+        power: Double = 48.0
     ) {
         self.frameId = max(frameId, 0)
         self.angle = min(max(angle, -35), 85)
+        let clampedDist = distanceUnits.isFinite ? max(distanceUnits, 0.0) : 10.0
+        self.distanceUnits = (clampedDist * 10.0).rounded() / 10.0
         let clampedPower = power.isFinite ? min(max(power, 0.0), 100.0) : 0.0
         self.power = (clampedPower * 10.0).rounded() / 10.0
-        self.isBlocked = isBlocked
-        self.suggestedAngle = min(max(suggestedAngle, -35), 85)
     }
 
     public static let initialLive = TelemetryData(
         frameId: 0,
         angle: 50,
-        power: 48.0,
-        isBlocked: false,
-        suggestedAngle: 50
+        distanceUnits: 10.0,
+        power: 48.0
     )
 }
 
