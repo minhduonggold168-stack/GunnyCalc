@@ -2,48 +2,24 @@ import CoreGraphics
 import Darwin
 import Foundation
 
-/// Vùng chữ nhật chuẩn hóa theo tỉ lệ `0.0 - 1.0` (gốc trên-trái).
-public struct NormalizedRect: Codable, Equatable, Sendable {
-    public var x: Double
-    public var y: Double
-    public var width: Double
-    public var height: Double
-
-    public init(x: Double, y: Double, width: Double, height: Double) {
-        let clampedX = Self.clamp01(x)
-        let clampedY = Self.clamp01(y)
-        self.x = clampedX
-        self.y = clampedY
-        self.width = min(Self.clamp01(width), 1.0 - clampedX)
-        self.height = min(Self.clamp01(height), 1.0 - clampedY)
-    }
-
-    /// Chuyển đổi sang tọa độ CoreImage (gốc dưới-trái) cho ảnh đã dịch về gốc `(0, 0)`.
-    public func ciRect(width imageWidth: CGFloat, height imageHeight: CGFloat) -> CGRect {
-        guard imageWidth > 0, imageHeight > 0 else { return .zero }
-        let rectX = floor(CGFloat(x) * imageWidth)
-        let rectW = max(1.0, floor(CGFloat(width) * imageWidth))
-        let rectH = max(1.0, floor(CGFloat(height) * imageHeight))
-        let rectY = floor((1.0 - CGFloat(y + height)) * imageHeight)
-        let raw = CGRect(x: rectX, y: rectY, width: rectW, height: rectH)
-        return raw.intersection(CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight))
-    }
-
-    private static func clamp01(_ value: Double) -> Double {
-        guard value.isFinite else { return 0.0 }
-        return min(max(value, 0.0), 1.0)
-    }
+/// Quy đổi khung chuẩn hóa gốc trên-trái (`0.0 - 1.0`, Top-Left) sang tọa độ pixel CoreImage gốc dưới-trái (Bottom-Left).
+public func ciRectFromTopLeft(normRect: CGRect, imageWidth: CGFloat, imageHeight: CGFloat) -> CGRect {
+    let x = normRect.origin.x * imageWidth
+    let w = normRect.size.width * imageWidth
+    let h = normRect.size.height * imageHeight
+    let y = (1.0 - normRect.origin.y - normRect.size.height) * imageHeight
+    return CGRect(x: x, y: y, width: w, height: h).integral
 }
 
-/// 2 vùng quét siêu gọn cho Gunny Mobi bản không gió (tỉ lệ 0.0 - 1.0, gốc trên-trái).
+/// 2 vùng quét cố định (tọa độ chuẩn hóa Top-Left `0.0 - 1.0`) cho Gunny Mobi bản không gió.
 public enum GunnyROIs {
-    /// Dải chiến trường ở giữa Minimap (nằm hoàn toàn dưới nút đỏ [X] và trên thước vàng).
-    public static let minimapStrip = NormalizedRect(x: 0.848, y: 0.046, width: 0.148, height: 0.096)
-    /// Vùng chữ góc bắn cạnh nhân vật.
-    public static let angleBattlefield = NormalizedRect(x: 0.050, y: 0.140, width: 0.820, height: 0.560)
+    /// Dải chiến trường trong Minimap (nằm hoàn toàn dưới nút đỏ [X] và phía trên dải số vàng -5..15 / 0..20).
+    public static let minimapStrip = CGRect(x: 0.848, y: 0.045, width: 0.148, height: 0.095)
+    /// Vùng chiến trường nửa trên chứa chữ `Góc XX°` cạnh nhân vật.
+    public static let angleBattlefield = CGRect(x: 0.050, y: 0.140, width: 0.820, height: 0.540)
 }
 
-/// Gói dữ liệu siêu nhỏ (< 60 bytes JSON) truyền tức thời 30 FPS qua BSD UDP (`127.0.0.1:45678`).
+/// Gói dữ liệu siêu nhẹ (< 50 bytes JSON) truyền thời gian thực 30 FPS qua BSD UDP (`127.0.0.1:45678`).
 public struct TelemetryData: Codable, Equatable, Sendable {
     public var frameId: Int
     public var angle: Int
@@ -162,7 +138,7 @@ public final class BSDUDPReceiver: @unchecked Sendable {
         _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
         _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, socklen_t(MemoryLayout<Int32>.size))
 
-        var timeout = timeval(tv_sec: 0, tv_usec: 250_000)
+        var timeout = timeval(tv_sec: 0, tv_usec: 200_000)
         _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 
         var addr = sockaddr_in()

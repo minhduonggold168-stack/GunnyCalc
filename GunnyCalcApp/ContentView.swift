@@ -10,9 +10,9 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            // Giữ AVSampleBufferDisplayLayer gắn trong cây view hoạt động để PiP chạy nền ổn định (tỉ lệ 340x115).
+            // Giữ AVSampleBufferDisplayLayer gắn trong cây view hoạt động để PiP chạy nền ổn định (tỉ lệ 320x72).
             PiPHostView(manager: pipManager)
-                .frame(width: 170, height: 58)
+                .frame(width: 160, height: 36)
                 .opacity(0.01)
                 .allowsHitTesting(false)
 

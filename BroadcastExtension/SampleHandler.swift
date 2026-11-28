@@ -9,9 +9,9 @@ import ReplayKit
 
 /// Handler nhận khung hình thụ động từ ReplayKit đạt độ trễ < 0.1s (< 20MB RAM).
 /// - Tắt hoàn toàn EMA (độ trễ = 0 khung hình), chạy 30 FPS (33ms) ngay khi màn hình xoay ngang (`width > height`).
-/// - Quét dải giữa Minimap (`x: 0.848, y: 0.046, w: 0.148, h: 0.096`) theo chuẩn toàn bản đồ = `20.0` đơn vị (`abs(enemyX - playerX) * 20.0`).
-/// - Chạy OCR Grayscale `.fast` song song mỗi 50ms đọc góc nguyên `-35...85`.
-/// - Gửi gói JSON siêu nhỏ (< 60 bytes) qua BSD UDP `127.0.0.1:45678` an toàn tuyệt đối (không `!`, không `fatalError`).
+/// - Quét dải giữa Minimap (`x: 0.848, y: 0.045, w: 0.148, h: 0.095`) qua `ciRectFromTopLeft` theo chuẩn `20.0` đơn vị (`abs(enemyX - playerX) * 20.0`).
+/// - Chạy OCR đen trắng tương phản cao (`contrast = 1.8, saturation = 0.0`, `.accurate`, `["vi-VN", "en-US"]`) song song mỗi 50ms.
+/// - Gửi gói JSON siêu nhỏ (< 50 bytes) qua BSD UDP `127.0.0.1:45678` an toàn tuyệt đối (không `!`, không `fatalError`).
 final class SampleHandler: RPBroadcastSampleHandler {
     private let sharedCIContext = CIContext(options: [
         .useSoftwareRenderer: false,
@@ -180,10 +180,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
             let telemetry = TelemetryData(frameId: currentFrameId, angle: currentAngle, power: power)
             sendUDPPacket(telemetry)
 
-            // 2. Chạy OCR Grayscale .fast trên luồng song song mỗi 50ms.
+            // 2. Chạy OCR đen trắng tương phản cao (.accurate) trên luồng song song mỗi 50ms.
             if shouldDispatchOCR {
-                if let grayAngleCrop = renderGrayscaleAngleCrop(from: ciImage) {
-                    dispatchFastAngleOCR(grayscaleAngleImage: grayAngleCrop)
+                if let contrastAngleCrop = renderContrastAngleCrop(from: ciImage) {
+                    dispatchAngleOCR(contrastAngleImage: contrastAngleCrop)
                 } else {
                     stateLock.lock()
                     isOCRBusy = false
@@ -193,9 +193,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
     }
 
-    // MARK: - Parallel Grayscale Fast Angle OCR (50ms)
+    // MARK: - Parallel High-Contrast Accurate Angle OCR (50ms)
 
-    private func dispatchFastAngleOCR(grayscaleAngleImage: CGImage) {
+    private func dispatchAngleOCR(contrastAngleImage: CGImage) {
         angleOCRQueue.async { [weak self] in
             autoreleasepool {
                 guard let self else { return }
@@ -205,7 +205,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
                     self.stateLock.unlock()
                 }
 
-                guard let detectedAngle = self.visionProcessor.detectAngle(fromGrayscaleImage: grayscaleAngleImage) else {
+                guard let detectedAngle = self.visionProcessor.detectAngle(fromContrastImage: contrastAngleImage) else {
                     return
                 }
 
@@ -388,7 +388,11 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     private func renderNativeMinimapStrip(from ciImage: CIImage) -> CGImage? {
-        let cropRect = GunnyROIs.minimapStrip.ciRect(width: ciImage.extent.width, height: ciImage.extent.height)
+        let cropRect = ciRectFromTopLeft(
+            normRect: GunnyROIs.minimapStrip,
+            imageWidth: ciImage.extent.width,
+            imageHeight: ciImage.extent.height
+        ).intersection(ciImage.extent)
         guard cropRect.width >= 8, cropRect.height >= 6 else { return nil }
 
         let patch = ciImage
@@ -405,9 +409,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return sharedCIContext.createCGImage(patch, from: bounds)
     }
 
-    /// Cắt vùng chữ góc và chuyển thẳng sang ảnh xám 8-bit (`CIFormat.L8`) trên GPU để tăng tốc OCR gấp 3 lần.
-    private func renderGrayscaleAngleCrop(from ciImage: CIImage) -> CGImage? {
-        let cropRect = GunnyROIs.angleBattlefield.ciRect(width: ciImage.extent.width, height: ciImage.extent.height)
+    /// Cắt vùng chữ góc bằng `ciRectFromTopLeft` và chuyển sang đen trắng tương phản cao (`contrast = 1.8`, `saturation = 0.0`).
+    private func renderContrastAngleCrop(from ciImage: CIImage) -> CGImage? {
+        let cropRect = ciRectFromTopLeft(
+            normRect: GunnyROIs.angleBattlefield,
+            imageWidth: ciImage.extent.width,
+            imageHeight: ciImage.extent.height
+        ).intersection(ciImage.extent)
         guard cropRect.width >= 16, cropRect.height >= 16 else { return nil }
 
         var patch = ciImage
@@ -422,9 +430,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
         patch = patch.applyingFilter(
             "CIColorControls",
             parameters: [
-                kCIInputSaturationKey: 0.0,
-                kCIInputContrastKey: 1.45,
-                kCIInputBrightnessKey: 0.04
+                kCIInputContrastKey: 1.8,
+                kCIInputSaturationKey: 0.0
             ]
         )
 

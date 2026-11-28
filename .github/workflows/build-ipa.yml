@@ -17,6 +17,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Run Automated Swift Tests (CoreImage + Vision + UDP)
+        run: |
+          swiftc -O -parse-as-library \
+            -framework CoreGraphics \
+            -framework CoreImage \
+            -framework CoreText \
+            -framework Vision \
+            Shared/Models.swift \
+            Shared/BallisticsEngine.swift \
+            Shared/VisionProcessor.swift \
+            Tests/GunnyCalcTests.swift \
+            -o GunnyCalcTestRunner
+          ./GunnyCalcTestRunner
+          rm -f GunnyCalcTestRunner
+
       - name: Install XcodeGen and generate Xcode project
         run: |
           if ! command -v xcodegen >/dev/null 2>&1; then

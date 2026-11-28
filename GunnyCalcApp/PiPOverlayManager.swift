@@ -35,9 +35,10 @@ struct PiPHostView: UIViewRepresentable {
     }
 }
 
-/// Quản lý cửa sổ nổi Picture-in-Picture siêu gọn (`340 x 115` px, nhỏ hơn 50%):
-/// - Chỉ hiển thị 2 thông số cỡ lớn (`GÓC` và `LỰC BẮN`) kèm thanh thước lực `0 — 20 — 40 — 60 — 80 — 100`.
-/// - Đẩy `CMSampleBuffer` ngay lập tức trong callback nhận UDP (`127.0.0.1:45678`) để đạt độ trễ < 100ms.
+/// Quản lý thanh ngang Picture-in-Picture siêu mảnh (`320 x 72` px, giảm >50% diện tích):
+/// - Phần trên (`50px`): 2 cột lớn `GÓC: [angle]°` (vàng #FFD60A) và `LỰC: [power]` (xanh neon #00FF88).
+/// - Phần dưới (`22px`): thanh thước lực `0 — 20 — 40 — 60 — 80 — 100` kèm kim chỉ thị đỏ rực.
+/// - Đẩy `CMSampleBuffer` ngay lập tức trong callback nhận UDP (`127.0.0.1:45678`) để đạt độ trễ < 0.1s.
 @MainActor
 final class PiPOverlayManager: NSObject, ObservableObject {
     static let shared = PiPOverlayManager()
@@ -48,7 +49,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     @Published private(set) var latestFrameId: Int = 0
     @Published private(set) var statusMessage: String?
 
-    let sampleBufferView = PiPSampleBufferView(frame: CGRect(x: 0, y: 0, width: 340, height: 115))
+    let sampleBufferView = PiPSampleBufferView(frame: CGRect(x: 0, y: 0, width: 320, height: 72))
 
     private var pipController: AVPictureInPictureController?
     private var currentTelemetry: TelemetryData = .initialLive
@@ -61,7 +62,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     private let udpReceiver = BSDUDPReceiver()
     private var isUDPStarted = false
 
-    private let renderSize = CGSize(width: 340, height: 115)
+    private let renderSize = CGSize(width: 320, height: 72)
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
     private let liveTimeoutSeconds: TimeInterval = 1.5
 
@@ -324,87 +325,67 @@ final class PiPOverlayManager: NSObject, ObservableObject {
 
     private func drawMinimalHUD(in rect: CGRect, telemetry: TelemetryData, cgContext: CGContext) {
         let neonGreen = UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 1.0)
-        let brightYellow = UIColor(red: 1.0, green: 0.86, blue: 0.10, alpha: 1.0)
-        let lightGray = UIColor(white: 0.72, alpha: 1.0)
+        let brightYellow = UIColor(red: 1.0, green: 0.839, blue: 0.039, alpha: 1.0) // #FFD60A
 
-        // Nền đen bán trong suốt (alpha = 0.85) + viền mảnh xanh lá #00FF88.
+        // Nền đen bán trong suốt (alpha = 0.85) + viền mảnh xanh lá #00FF88 trên thanh 320 x 72 px.
         cgContext.clear(rect)
-        let outerPath = UIBezierPath(roundedRect: rect.insetBy(dx: 1.2, dy: 1.2), cornerRadius: 10)
+        let outerPath = UIBezierPath(roundedRect: rect.insetBy(dx: 1.0, dy: 1.0), cornerRadius: 8)
         UIColor(white: 0.0, alpha: 0.85).setFill()
         outerPath.fill()
 
         neonGreen.setStroke()
-        outerPath.lineWidth = 1.5
+        outerPath.lineWidth = 1.4
         outerPath.stroke()
 
-        // MARK: Phần trên (75px): 2 cột lớn GÓC & LỰC BẮN
-        let topHeight: CGFloat = 75.0
+        // MARK: Phần trên (50px): 2 cột ngang GÓC: [angle]° & LỰC: [power]
+        let topHeight: CGFloat = 50.0
         let midX = rect.width / 2.0
 
         let verticalSep = UIBezierPath()
-        verticalSep.move(to: CGPoint(x: midX, y: 10))
+        verticalSep.move(to: CGPoint(x: midX, y: 8))
         verticalSep.addLine(to: CGPoint(x: midX, y: topHeight - 8))
-        UIColor(white: 1.0, alpha: 0.16).setStroke()
+        UIColor(white: 1.0, alpha: 0.18).setStroke()
         verticalSep.lineWidth = 1.0
         verticalSep.stroke()
 
-        let labelAttrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.systemFont(ofSize: 11.0, weight: .bold),
-            .foregroundColor: lightGray
-        ]
-
-        // Cột trái: GÓC (36pt vàng rực)
-        let angleLabel = NSAttributedString(string: "GÓC", attributes: labelAttrs)
-        let angleLabelSize = angleLabel.size()
-        angleLabel.draw(at: CGPoint(x: midX / 2.0 - angleLabelSize.width / 2.0, y: 8))
-
-        let angleValue = NSAttributedString(
-            string: "\(telemetry.angle)°",
-            attributes: [
-                .font: UIFont.monospacedDigitSystemFont(ofSize: 36.0, weight: .heavy),
-                .foregroundColor: brightYellow
-            ]
+        // Cột trái: GÓC: [angle]° (vàng #FFD60A 26pt đậm, tự co nhẹ chỉ khi vượt độ rộng cột)
+        drawFittedMetric(
+            text: "GÓC: \(telemetry.angle)°",
+            color: brightYellow,
+            baseSize: 26.0,
+            in: CGRect(x: 4, y: 0, width: midX - 8, height: topHeight)
         )
-        let angleValSize = angleValue.size()
-        angleValue.draw(at: CGPoint(x: midX / 2.0 - angleValSize.width / 2.0, y: 22))
 
-        // Cột phải: LỰC BẮN (36pt xanh neon #00FF88, 1 chữ số thập phân)
-        let powerLabel = NSAttributedString(string: "LỰC BẮN", attributes: labelAttrs)
-        let powerLabelSize = powerLabel.size()
-        powerLabel.draw(at: CGPoint(x: midX + midX / 2.0 - powerLabelSize.width / 2.0, y: 8))
-
-        let powerValue = NSAttributedString(
-            string: String(format: "%.1f", telemetry.power),
-            attributes: [
-                .font: UIFont.monospacedDigitSystemFont(ofSize: 36.0, weight: .heavy),
-                .foregroundColor: neonGreen
-            ]
+        // Cột phải: LỰC: [power] (xanh neon #00FF88 26pt đậm, 1 chữ số thập phân)
+        drawFittedMetric(
+            text: String(format: "LỰC: %.1f", telemetry.power),
+            color: neonGreen,
+            baseSize: 26.0,
+            in: CGRect(x: midX + 4, y: 0, width: midX - 8, height: topHeight)
         )
-        let powerValSize = powerValue.size()
-        powerValue.draw(at: CGPoint(x: midX + midX / 2.0 - powerValSize.width / 2.0, y: 22))
 
-        // Đường ngăn ngang giữa phần trên (75px) và thanh thước lực (40px).
+        // Đường ngăn ngang giữa phần trên (50px) và thanh thước lực (22px).
         let horizontalSep = UIBezierPath()
-        horizontalSep.move(to: CGPoint(x: 8, y: topHeight))
-        horizontalSep.addLine(to: CGPoint(x: rect.width - 8, y: topHeight))
-        UIColor(white: 1.0, alpha: 0.16).setStroke()
-        horizontalSep.lineWidth = 1.0
+        horizontalSep.move(to: CGPoint(x: 6, y: topHeight))
+        horizontalSep.addLine(to: CGPoint(x: rect.width - 6, y: topHeight))
+        UIColor(white: 1.0, alpha: 0.18).setStroke()
+        horizontalSep.lineWidth = 0.9
         horizontalSep.stroke()
 
-        // MARK: Phần dưới (40px): Thanh thước lực 0 — 20 — 40 — 60 — 80 — 100 toàn chiều ngang 340px
-        let barMarginX: CGFloat = 10.0
+        // MARK: Phần dưới (22px): Thanh thước lực 0 — 20 — 40 — 60 — 80 — 100 toàn chiều ngang 320px
+        let barMarginX: CGFloat = 8.0
         let barRect = CGRect(
             x: barMarginX,
-            y: topHeight + 6.0,
+            y: topHeight + 2.5,
             width: rect.width - barMarginX * 2.0,
-            height: 14.0
+            height: 7.5
         )
 
         let clampedPower = CGFloat(min(max(telemetry.power, 0.0), 100.0))
         let fillWidth = barRect.width * (clampedPower / 100.0)
         let markerX = barRect.minX + fillWidth
 
-        let trackPath = UIBezierPath(roundedRect: barRect, cornerRadius: 4)
+        let trackPath = UIBezierPath(roundedRect: barRect, cornerRadius: 3)
         UIColor(red: 0.12, green: 0.14, blue: 0.18, alpha: 1.0).setFill()
         trackPath.fill()
 
@@ -431,12 +412,12 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         }
 
         UIColor(white: 1.0, alpha: 0.34).setStroke()
-        trackPath.lineWidth = 0.9
+        trackPath.lineWidth = 0.8
         trackPath.stroke()
 
         let tickAttrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .bold),
-            .foregroundColor: UIColor(white: 0.84, alpha: 1.0)
+            .font: UIFont.monospacedDigitSystemFont(ofSize: 8.2, weight: .bold),
+            .foregroundColor: UIColor(white: 0.86, alpha: 1.0)
         ]
 
         for step in stride(from: 0, through: 100, by: 10) {
@@ -445,9 +426,9 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             let tick = UIBezierPath()
             if isMajor {
                 tick.move(to: CGPoint(x: tx, y: barRect.minY))
-                tick.addLine(to: CGPoint(x: tx, y: barRect.maxY + 3.0))
-                UIColor(white: 1.0, alpha: 0.80).setStroke()
-                tick.lineWidth = 1.1
+                tick.addLine(to: CGPoint(x: tx, y: barRect.maxY + 1.5))
+                UIColor(white: 1.0, alpha: 0.82).setStroke()
+                tick.lineWidth = 1.0
                 tick.stroke()
 
                 let label = NSAttributedString(string: "\(step)", attributes: tickAttrs)
@@ -460,32 +441,59 @@ final class PiPOverlayManager: NSObject, ObservableObject {
                 } else {
                     labelX = tx - labelSize.width / 2.0
                 }
-                label.draw(at: CGPoint(x: labelX, y: barRect.maxY + 3.5))
+                label.draw(at: CGPoint(x: labelX, y: barRect.maxY + 1.0))
             } else {
-                tick.move(to: CGPoint(x: tx, y: barRect.maxY - 4.5))
-                tick.addLine(to: CGPoint(x: tx, y: barRect.maxY + 1.0))
-                UIColor(white: 1.0, alpha: 0.30).setStroke()
-                tick.lineWidth = 0.8
+                tick.move(to: CGPoint(x: tx, y: barRect.maxY - 3.0))
+                tick.addLine(to: CGPoint(x: tx, y: barRect.maxY))
+                UIColor(white: 1.0, alpha: 0.32).setStroke()
+                tick.lineWidth = 0.7
                 tick.stroke()
             }
         }
 
-        // Vạch kim đỏ rực chỉ chính xác vị trí `power` để canh thẳng xuống thanh lực game.
+        // Kim chỉ thị màu đỏ rực tại vị trí `power`.
         let redNeedle = UIBezierPath()
-        redNeedle.move(to: CGPoint(x: markerX, y: barRect.minY - 3.0))
-        redNeedle.addLine(to: CGPoint(x: markerX, y: barRect.maxY + 3.0))
+        redNeedle.move(to: CGPoint(x: markerX, y: barRect.minY - 1.8))
+        redNeedle.addLine(to: CGPoint(x: markerX, y: barRect.maxY + 1.8))
         redNeedle.lineCapStyle = .round
         UIColor(red: 1.0, green: 0.14, blue: 0.12, alpha: 1.0).setStroke()
-        redNeedle.lineWidth = 3.8
+        redNeedle.lineWidth = 3.4
         redNeedle.stroke()
 
         let whiteCore = UIBezierPath()
-        whiteCore.move(to: CGPoint(x: markerX, y: barRect.minY - 2.0))
-        whiteCore.addLine(to: CGPoint(x: markerX, y: barRect.maxY + 2.0))
+        whiteCore.move(to: CGPoint(x: markerX, y: barRect.minY - 1.0))
+        whiteCore.addLine(to: CGPoint(x: markerX, y: barRect.maxY + 1.0))
         whiteCore.lineCapStyle = .round
         UIColor.white.setStroke()
-        whiteCore.lineWidth = 1.4
+        whiteCore.lineWidth = 1.2
         whiteCore.stroke()
+    }
+
+    private func drawFittedMetric(text: String, color: UIColor, baseSize: CGFloat, in rect: CGRect) {
+        var fontSize = baseSize
+        var attr = NSAttributedString(
+            string: text,
+            attributes: [
+                .font: UIFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .heavy),
+                .foregroundColor: color
+            ]
+        )
+        var size = attr.size()
+        while size.width > rect.width && fontSize > 18.0 {
+            fontSize -= 1.0
+            attr = NSAttributedString(
+                string: text,
+                attributes: [
+                    .font: UIFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .heavy),
+                    .foregroundColor: color
+                ]
+            )
+            size = attr.size()
+        }
+        attr.draw(at: CGPoint(
+            x: rect.midX - size.width / 2.0,
+            y: rect.midY - size.height / 2.0
+        ))
     }
 }
 

@@ -2,34 +2,76 @@ import CoreGraphics
 import Foundation
 import Vision
 
-/// Kết quả tọa độ ngang chuẩn hóa (`0.0 ... 1.0`) đọc từ dải giữa Minimap (`x: 0.848, y: 0.046, w: 0.148, h: 0.096`).
+/// Kết quả tọa độ ngang chuẩn hóa (`0.0 ... 1.0`) đọc từ dải giữa Minimap (`x: 0.848, y: 0.045, w: 0.148, h: 0.095`).
 public struct MinimapStripPositions: Equatable, Sendable {
     public let playerX: Double?
     public let enemyXs: [Double]
 }
 
-/// Bộ xử lý thị giác độ trễ siêu thấp (< 100ms, < 20MB RAM) dùng thuần CoreGraphics và Vision (`.fast`).
-public final class VisionProcessor {
-    private static let gocRawRegex = try? NSRegularExpression(
-        pattern: #"g[oóôòỏõọốồổỗộớờởỡợ]c\s*[:=]?\s*(-?\d{1,2})\s*[°º]?"#,
+/// Bộ tách góc bắn 2 tầng regex cho Gunny Mobi (`-35 ... 85`), hỗ trợ cả lỗi OCR (`G6c`, `G0c`, thiếu chữ `Góc`).
+public enum AngleParser {
+    private static let tier1RawRegex = try? NSRegularExpression(
+        pattern: #"(?:g[oóôòỏõọốồổỗộớờởỡợ06]c)\s*(?::|-\s+)?\s*(-?\d{1,2})"#,
         options: [.caseInsensitive]
     )
-    private static let gocFoldedRegex = try? NSRegularExpression(
-        pattern: #"goc\s*[:=]?\s*(-?\d{1,2})\s*[°º]?"#,
+    private static let tier1FoldedRegex = try? NSRegularExpression(
+        pattern: #"(?:g[o06]c)\s*(?::|-\s+)?\s*(-?\d{1,2})"#,
         options: [.caseInsensitive]
     )
-    private static let degreeOnlyRegex = try? NSRegularExpression(
-        pattern: #"(-?\d{1,2})\s*[°º]"#,
+    private static let tier2DegreeRegex = try? NSRegularExpression(
+        pattern: #"(-?\d{1,2})\s*[°ºo](?![a-zA-Z])"#,
         options: []
     )
 
+    /// Tách góc bắn nguyên hợp lệ (`-35 ... 85`) từ danh sách chuỗi OCR theo 2 tầng ưu tiên.
+    public static func extractAngle(from texts: [String]) -> Int? {
+        // Tầng 1: Bắt cụm "Góc 65°", "Goc 65", "G6c 65", "Góc -18°".
+        for raw in texts {
+            if let regex = tier1RawRegex,
+               let value = extractFirstInt(using: regex, in: raw),
+               value >= -35 && value <= 85 {
+                return value
+            }
+            let folded = raw.folding(options: .diacriticInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+            if let regex = tier1FoldedRegex,
+               let value = extractFirstInt(using: regex, in: folded),
+               value >= -35 && value <= 85 {
+                return value
+            }
+        }
+
+        // Tầng 2: Bắt "65°", "65º", "65o" ngay cả khi chữ "Góc" bị pet hoặc cánh che khuất.
+        for raw in texts {
+            if let regex = tier2DegreeRegex,
+               let value = extractFirstInt(using: regex, in: raw),
+               value >= -35 && value <= 85 {
+                return value
+            }
+        }
+
+        return nil
+    }
+
+    private static func extractFirstInt(using regex: NSRegularExpression, in text: String) -> Int? {
+        let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: fullRange),
+              match.numberOfRanges >= 2,
+              let range = Range(match.range(at: 1), in: text) else {
+            return nil
+        }
+        return Int(text[range])
+    }
+}
+
+/// Bộ xử lý thị giác độ chính xác cao (< 20MB RAM) dùng thuần CoreGraphics và Vision.
+public final class VisionProcessor {
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
 
     public init() {}
 
     // MARK: - 1. Native Minimap Middle-Strip X Detection (30 FPS)
 
-    /// Quét trực tiếp dải giữa Minimap (dưới nút [X], trên thước vàng) ở độ phân giải gốc để lấy `playerX` và các `enemyXs` (`0.0...1.0`).
+    /// Quét trực tiếp dải giữa Minimap ở độ phân giải gốc để lấy `playerX` và `enemyXs` (`0.0...1.0`).
     public func detectMinimapStripPositions(from cropped: CGImage) -> MinimapStripPositions? {
         let outW = cropped.width
         let outH = cropped.height
@@ -56,11 +98,11 @@ public final class VisionProcessor {
                 let b = Int(rowPtr[px + 2])
                 let idx = y * outW + x
 
-                // Cụm xanh dương đậm của người chơi.
-                if b > 170 && (b - r) > 80 && (b - g) > 60 {
+                // Cụm xanh dương đậm của người chơi: B > 165, B - R > 75, B - G > 55.
+                if b > 165 && (b - r) > 75 && (b - g) > 55 {
                     blueMask[idx] = true
                 }
-                // Cụm đỏ mục tiêu địch.
+                // Cụm đỏ mục tiêu: R > 155, R - G > 55, R - B > 55 (chấp nhận từ 2 pixel).
                 else if r > 155 && (r - g) > 55 && (r - b) > 55 {
                     redMask[idx] = true
                 }
@@ -252,16 +294,16 @@ public final class VisionProcessor {
         return xs
     }
 
-    // MARK: - 2. Ultra-Fast Grayscale Angle OCR (.fast, -35 ... 85)
+    // MARK: - 2. Accurate Vietnamese/English Angle OCR (-35 ... 85)
 
-    /// Nhận diện siêu tốc (< 50ms) số nguyên góc `-35...85` cạnh chữ `Góc` hoặc ký hiệu `°` trên ảnh xám Grayscale.
-    public func detectAngle(fromGrayscaleImage cropped: CGImage) -> Int? {
+    /// Chạy `VNRecognizeTextRequest` (`.accurate`, `usesLanguageCorrection = false`, `["vi-VN", "en-US"]`) trên ảnh đen trắng tương phản cao và trích góc bằng `AngleParser`.
+    public func detectAngle(fromContrastImage cropped: CGImage) -> Int? {
         guard cropped.width >= 16, cropped.height >= 16 else { return nil }
 
         let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .fast
+        request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
-        request.minimumTextHeight = 0.025
+        request.recognitionLanguages = ["vi-VN", "en-US"]
 
         let handler = VNImageRequestHandler(cgImage: cropped, options: [:])
         do {
@@ -272,60 +314,14 @@ public final class VisionProcessor {
 
         guard let observations = request.results, !observations.isEmpty else { return nil }
 
+        var recognizedTexts: [String] = []
+        recognizedTexts.reserveCapacity(observations.count * 2)
         for obs in observations {
-            guard let text = obs.topCandidates(1).first?.string else { continue }
-            if let matched = Self.matchGocRegex(in: text) {
-                return matched
+            for candidate in obs.topCandidates(2) {
+                recognizedTexts.append(candidate.string)
             }
         }
-
-        for obs in observations {
-            if obs.boundingBox.minX < 0.16 && obs.boundingBox.minY < 0.14 {
-                continue
-            }
-            guard let text = obs.topCandidates(1).first?.string else { continue }
-            if let matched = Self.matchDegreeFallback(in: text), matched != 0 {
-                return matched
-            }
-        }
-
-        return nil
-    }
-
-    public static func matchGocRegex(in rawText: String) -> Int? {
-        if let regex = gocRawRegex,
-           let val = extractFirstIntegerGroup(using: regex, in: rawText),
-           val >= -35 && val <= 85 {
-            return val
-        }
-
-        let folded = rawText.folding(options: .diacriticInsensitive, locale: Locale(identifier: "en_US_POSIX"))
-        if let regex = gocFoldedRegex,
-           let val = extractFirstIntegerGroup(using: regex, in: folded),
-           val >= -35 && val <= 85 {
-            return val
-        }
-
-        return nil
-    }
-
-    private static func matchDegreeFallback(in rawText: String) -> Int? {
-        guard let regex = degreeOnlyRegex,
-              let val = extractFirstIntegerGroup(using: regex, in: rawText),
-              val >= -35 && val <= 85 else {
-            return nil
-        }
-        return val
-    }
-
-    private static func extractFirstIntegerGroup(using regex: NSRegularExpression, in text: String) -> Int? {
-        let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
-        guard let match = regex.firstMatch(in: text, options: [], range: fullRange),
-              match.numberOfRanges >= 2,
-              let groupRange = Range(match.range(at: 1), in: text) else {
-            return nil
-        }
-        return Int(text[groupRange])
+        return AngleParser.extractAngle(from: recognizedTexts)
     }
 
     // MARK: - CoreGraphics Helper
