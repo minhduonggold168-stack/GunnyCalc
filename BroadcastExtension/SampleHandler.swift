@@ -1,25 +1,17 @@
 import CoreGraphics
-import CoreImage
 import CoreMedia
 import CoreVideo
 import Darwin
 import Foundation
-import ImageIO
 import ReplayKit
 
-/// Handler nhận khung hình thụ động từ ReplayKit theo kiến trúc hợp nhất 3 tầng (Multi-Cue Fusion, < 25MB RAM, < 35ms):
-/// - Chạy 24/24 ở tốc độ 30 FPS (mỗi 33ms) khi màn hình xoay ngang (`width > height`), dùng 1 `CIContext` duy nhất trong `autoreleasepool`.
-/// - Tầng 1 (Ưu tiên cao nhất): Quét thanh máu xanh người chơi và thanh máu đỏ địch trên màn hình chính (`< 10` đơn vị).
-/// - Tầng 2: Cắt Minimap (`0.848, 0.042, 0.148, 0.106`), tìm tâm X + đáy chân `groundY` và dò viền đứng khung camera `10.0` đơn vị (`0.42...0.86`).
-/// - Tầng 3: Đối chiếu vạch chia `5.0` đơn vị trên thước vàng đáy Minimap (`0.848, 0.148, 0.148, 0.015`, mặc định dự phòng `0.62`).
-/// - Đọc góc bắn `-35° ... 85°` song song 50ms và truyền tức thời qua BSD UDP `127.0.0.1:45678` (an toàn tuyệt đối, không force-unwrap).
+/// Handler nhận khung hình thụ động từ ReplayKit theo kiến trúc Zero-Crash (< 4 MB RAM, < 2ms/khung hình):
+/// - Đọc trực tiếp vùng nhớ thô từ `CVPixelBuffer` (`BGRA` / `420f` / `420v`) qua `CVPixelBufferLockBaseAddress(..., .readOnly)`.
+/// - Tự động xoay ánh xạ tọa độ logic bằng phép tính chỉ số mảng khi buffer đang ở chiều dọc, không cấp phát bộ nhớ mới.
+/// - Đo cự ly bằng thước vàng đáy Minimap (`pixelsPerUnit = tickSpacingPixels / 5.0`), dự phòng khung camera trắng `/ 10.0`.
+/// - Đọc góc bắn từ tâm D-pad (`16×24` bitmap matching) đối chiếu tia chấm vàng, giữ nguyên góc khi D-pad hiện `0`.
+/// - Truyền tức thời gói JSON siêu nhẹ 25 FPS (mỗi 40ms) qua BSD UDP `127.0.0.1:45678`.
 final class SampleHandler: RPBroadcastSampleHandler {
-    private let sharedCIContext = CIContext(options: [
-        .useSoftwareRenderer: false,
-        .cacheIntermediates: false
-    ])
-    private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
-    private let grayColorSpace = CGColorSpaceCreateDeviceGray()
     private let visionProcessor = VisionProcessor()
     private let ballisticsEngine = BallisticsEngine()
     private let ipc = SharedIPC.shared
@@ -27,7 +19,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private let stateLock = NSLock()
     private let udpLock = NSLock()
     private let heartbeatQueue = DispatchQueue(label: "com.gunny.pipcalc.broadcast.heartbeat", qos: .utility)
-    private let angleOCRQueue = DispatchQueue(label: "com.gunny.pipcalc.broadcast.angleOCR", qos: .userInteractive)
 
     private var heartbeatTimer: DispatchSourceTimer?
     private var udpSocketFD: Int32 = -1
@@ -35,23 +26,19 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     private var lastProcessedTime: TimeInterval = 0
     private var lastPacketSentTime: TimeInterval = 0
-    private var lastOCRStartedAt: TimeInterval = 0
     private var isProcessingFrame = false
-    private var isOCRBusy = false
     private var isCurrentlyLandscape = false
     private var frameCounter: Int = 0
 
-    // Trạng thái tức thời (không làm mượt EMA).
-    private var lastPlayerPos = CGPoint(x: 0.25, y: 0.65)
-    private var lastEnemyPos: CGPoint?
-    private var lastScreenWidthNorm: Double = VisionProcessor.defaultScreenWidthNorm // 0.62
+    // Trạng thái tức thời (không làm mượt trễ EMA).
+    private var lastPlayerPx: CGPoint?
+    private var lastEnemyPx: CGPoint?
+    private var lastPixelsPerUnit: Double?
     private var lastDistanceUnits: Double = 10.0
     private var lastDeltaYUnits: Double = 0.0
     private var lastAngle: Int = 50
 
-    private let minimumFrameInterval: TimeInterval = 0.033 // 30 FPS (33ms)
-    private let minimumOCRInterval: TimeInterval = 0.050   // 20 Hz (50ms)
-    private let maxAngleCropWidth: CGFloat = 640.0
+    private let minimumFrameInterval: TimeInterval = 0.040 // 25 FPS (40ms)
 
     deinit {
         stopHeartbeatTimer()
@@ -62,15 +49,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let now = Date().timeIntervalSince1970
         stateLock.lock()
         lastProcessedTime = 0
-        lastOCRStartedAt = 0
         isProcessingFrame = false
-        isOCRBusy = false
         isCurrentlyLandscape = false
         frameCounter = 1
         lastPacketSentTime = now
-        lastPlayerPos = CGPoint(x: 0.25, y: 0.65)
-        lastEnemyPos = nil
-        lastScreenWidthNorm = VisionProcessor.defaultScreenWidthNorm
+        lastPlayerPx = nil
+        lastEnemyPx = nil
+        lastPixelsPerUnit = nil
         lastDistanceUnits = 10.0
         lastDeltaYUnits = 0.0
         lastAngle = 50
@@ -96,7 +81,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
     override func broadcastFinished() {
         stopHeartbeatTimer()
         closeUDPSocket()
-        sharedCIContext.clearCaches()
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
@@ -120,19 +104,17 @@ final class SampleHandler: RPBroadcastSampleHandler {
             }
 
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+            let lockResult = CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+            guard lockResult == kCVReturnSuccess else { return }
+            defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
-            let orientation = extractVideoOrientation(from: sampleBuffer)
-            var ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
-            let origin = ciImage.extent.origin
-            if origin != .zero {
-                ciImage = ciImage.transformed(by: CGAffineTransform(translationX: -origin.x, y: -origin.y))
+            let orientation = extractRawOrientation(from: sampleBuffer)
+            guard let rawFrame = RawFrameBuffer(lockedPixelBuffer: pixelBuffer, orientation: orientation) else {
+                return
             }
 
-            let extent = ciImage.extent
-            guard extent.width > 0, extent.height > 0 else { return }
-
-            // Bỏ qua khung hình dọc (màn hình chính iPhone / app GunnyCalc).
-            guard extent.width > extent.height else {
+            // Bỏ qua khung hình đang dựng dọc (màn hình chính iPhone / app GunnyCalc).
+            guard rawFrame.isLandscape else {
                 stateLock.lock()
                 isCurrentlyLandscape = false
                 stateLock.unlock()
@@ -140,64 +122,36 @@ final class SampleHandler: RPBroadcastSampleHandler {
             }
 
             stateLock.lock()
-            let fallbackPlayer = lastPlayerPos
-            let previousEnemy = lastEnemyPos
+            let cachedPlayer = lastPlayerPx
+            let cachedEnemy = lastEnemyPx
+            let cachedPpu = lastPixelsPerUnit
             stateLock.unlock()
 
-            // Tầng 1 (Ưu tiên cao nhất): Quét thanh máu người chơi & địch trực tiếp trên màn hình chính (< 10 đơn vị).
-            let tier1Result: MainScreenHealthBarResult?
-            if let battlefieldCrop = renderBattlefieldForTier1(from: ciImage) {
-                tier1Result = visionProcessor.detectMainScreenHealthBars(battlefieldCrop: battlefieldCrop)
-            } else {
-                tier1Result = nil
-            }
-
-            // Tầng 2 + Tầng 3: Khi địch ngoài màn hình chính hoặc bị che thanh máu -> đo Minimap theo viền camera + thước vàng.
-            let minimapAnalysis: MinimapAnalysisResult?
-            if tier1Result == nil {
-                if let minimapCrop = renderNativeROI(GunnyROIs.minimapStrip, from: ciImage) {
-                    let yellowRulerCrop = renderNativeROI(GunnyROIs.minimapYellowRuler, from: ciImage)
-                    minimapAnalysis = visionProcessor.analyzeMinimap(
-                        minimapCrop: minimapCrop,
-                        yellowRulerCrop: yellowRulerCrop,
-                        fallbackPlayerPos: fallbackPlayer,
-                        previousEnemyPos: previousEnemy
-                    )
-                } else {
-                    minimapAnalysis = nil
-                }
-            } else {
-                minimapAnalysis = nil
-            }
+            let analysis = visionProcessor.analyzeFrame(
+                rawFrame,
+                fallbackPlayerPx: cachedPlayer,
+                previousEnemyPx: cachedEnemy,
+                cachedPixelsPerUnit: cachedPpu
+            )
 
             stateLock.lock()
             isCurrentlyLandscape = true
 
-            if let tier1 = tier1Result {
-                lastDistanceUnits = tier1.distanceUnits
-                lastDeltaYUnits = tier1.deltaYUnits
-            } else if let analysis = minimapAnalysis {
-                if let measuredWidth = analysis.screenWidthNorm,
-                   measuredWidth >= 0.42 && measuredWidth <= 0.86 {
-                    lastScreenWidthNorm = measuredWidth
-                }
-
-                if let playerPos = analysis.playerPos {
-                    lastPlayerPos = playerPos
-                }
-
-                if let enemyPos = analysis.enemyPos {
-                    lastEnemyPos = enemyPos
-                    let safeScreenW = min(max(lastScreenWidthNorm, 0.42), 0.86)
-                    lastDistanceUnits = (abs(Double(enemyPos.x - lastPlayerPos.x)) / safeScreenW) * BallisticsEngine.unitsPerScreen
-                    lastDeltaYUnits = (Double(lastPlayerPos.y - enemyPos.y) / (safeScreenW * 0.55)) * BallisticsEngine.unitsPerScreen
-                }
+            if let ppu = analysis.pixelsPerUnit, ppu > 2.0 {
+                lastPixelsPerUnit = ppu
             }
-
-            let shouldDispatchOCR = !isOCRBusy && (now - lastOCRStartedAt) >= minimumOCRInterval
-            if shouldDispatchOCR {
-                isOCRBusy = true
-                lastOCRStartedAt = now
+            if let pPx = analysis.playerPx {
+                lastPlayerPx = pPx
+            }
+            if let ePx = analysis.enemyPx {
+                lastEnemyPx = ePx
+            }
+            if let dist = analysis.distanceUnits, dist.isFinite, dist > 0.05 {
+                lastDistanceUnits = dist
+                lastDeltaYUnits = analysis.deltaYUnits ?? 0.0
+            }
+            if let detectedAngle = analysis.angle {
+                lastAngle = detectedAngle
             }
 
             frameCounter += 1
@@ -207,50 +161,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
             stateLock.unlock()
 
             sendUDPPacket(telemetry)
-
-            // Chạy OCR đen trắng tương phản cao (.accurate) trên luồng song song mỗi 50ms (-35° ... 85°).
-            if shouldDispatchOCR {
-                if let contrastAngleCrop = renderContrastAngleCrop(from: ciImage) {
-                    dispatchAngleOCR(contrastAngleImage: contrastAngleCrop)
-                } else {
-                    stateLock.lock()
-                    isOCRBusy = false
-                    stateLock.unlock()
-                }
-            }
-        }
-    }
-
-    // MARK: - Parallel High-Contrast Accurate Angle OCR (50ms)
-
-    private func dispatchAngleOCR(contrastAngleImage: CGImage) {
-        angleOCRQueue.async { [weak self] in
-            autoreleasepool {
-                guard let self else { return }
-                defer {
-                    self.stateLock.lock()
-                    self.isOCRBusy = false
-                    self.stateLock.unlock()
-                }
-
-                guard let detectedAngle = self.visionProcessor.detectAngle(fromContrastImage: contrastAngleImage) else {
-                    return
-                }
-
-                self.stateLock.lock()
-                let angleChanged = detectedAngle != self.lastAngle
-                self.lastAngle = detectedAngle
-                if angleChanged {
-                    self.frameCounter += 1
-                    let immediateId = self.frameCounter
-                    self.lastPacketSentTime = Date().timeIntervalSince1970
-                    let immediateTelemetry = self.buildTelemetryLocked(frameId: immediateId)
-                    self.stateLock.unlock()
-                    self.sendUDPPacket(immediateTelemetry)
-                    return
-                }
-                self.stateLock.unlock()
-            }
         }
     }
 
@@ -268,13 +178,26 @@ final class SampleHandler: RPBroadcastSampleHandler {
         )
     }
 
-    // MARK: - Heartbeat Timer (0.5s when static landscape)
+    // MARK: - Orientation Helper (Zero Allocation)
+
+    private func extractRawOrientation(from sampleBuffer: CMSampleBuffer) -> RawBufferOrientation {
+        if let attachment = CMGetAttachment(
+            sampleBuffer,
+            key: RPVideoSampleOrientationKey as CFString,
+            attachmentModeOut: nil
+        ) as? NSNumber {
+            return RawBufferOrientation(exifRawValue: attachment.uint32Value)
+        }
+        return .up
+    }
+
+    // MARK: - Heartbeat Timer (0.35s keeps live green LED pulsing on static screens)
 
     private func startHeartbeatTimer() {
         stopHeartbeatTimer()
 
         let timer = DispatchSource.makeTimerSource(queue: heartbeatQueue)
-        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        timer.schedule(deadline: .now() + 0.35, repeating: 0.35)
         timer.setEventHandler { [weak self] in
             self?.handleHeartbeatTick()
         }
@@ -299,7 +222,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private func handleHeartbeatTick() {
         let now = Date().timeIntervalSince1970
         stateLock.lock()
-        guard isCurrentlyLandscape, (now - lastPacketSentTime) >= 0.45 else {
+        guard isCurrentlyLandscape, (now - lastPacketSentTime) >= 0.30 else {
             stateLock.unlock()
             return
         }
@@ -400,106 +323,5 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
         udpDestination = nil
         udpLock.unlock()
-    }
-
-    // MARK: - Orientation, Tier-1 Nearest-Sampled Crop, Native ROI Crop & High-Contrast Angle Crop
-
-    private func extractVideoOrientation(from sampleBuffer: CMSampleBuffer) -> CGImagePropertyOrientation {
-        if let attachment = CMGetAttachment(
-            sampleBuffer,
-            key: RPVideoSampleOrientationKey as CFString,
-            attachmentModeOut: nil
-        ) as? NSNumber {
-            return CGImagePropertyOrientation(rawValue: attachment.uint32Value) ?? .up
-        }
-        return .up
-    }
-
-    /// Cắt vùng chiến trường chính Tầng 1 (`0.05, 0.18, 0.90, 0.65`) với giảm 0.5x chiều ngang (nearest-neighbor để không lem màu thanh máu)
-    /// và giữ nguyên độ phân giải dọc 100% để bảo toàn chính xác thanh máu mảnh (`h: 0.006...0.016`).
-    private func renderBattlefieldForTier1(from ciImage: CIImage) -> CGImage? {
-        let cropRect = ciRectFromTopLeft(
-            normRect: GunnyROIs.mainBattlefield,
-            imageWidth: ciImage.extent.width,
-            imageHeight: ciImage.extent.height
-        ).intersection(ciImage.extent)
-        guard cropRect.width >= 32, cropRect.height >= 16 else { return nil }
-
-        var patch = ciImage
-            .cropped(to: cropRect)
-            .transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
-
-        if patch.extent.width > 960.0 {
-            patch = patch
-                .samplingNearest()
-                .transformed(by: CGAffineTransform(scaleX: 0.5, y: 1.0))
-        }
-
-        let bounds = CGRect(
-            x: 0,
-            y: 0,
-            width: floor(patch.extent.width),
-            height: floor(patch.extent.height)
-        )
-        guard bounds.width >= 32, bounds.height >= 16 else { return nil }
-        return sharedCIContext.createCGImage(patch, from: bounds, format: .RGBA8, colorSpace: rgbColorSpace)
-    }
-
-    private func renderNativeROI(_ normRect: CGRect, from ciImage: CIImage) -> CGImage? {
-        let cropRect = ciRectFromTopLeft(
-            normRect: normRect,
-            imageWidth: ciImage.extent.width,
-            imageHeight: ciImage.extent.height
-        ).intersection(ciImage.extent)
-        guard cropRect.width >= 8, cropRect.height >= 2 else { return nil }
-
-        let patch = ciImage
-            .cropped(to: cropRect)
-            .transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
-
-        let bounds = CGRect(
-            x: 0,
-            y: 0,
-            width: floor(patch.extent.width),
-            height: floor(patch.extent.height)
-        )
-        guard bounds.width >= 8, bounds.height >= 2 else { return nil }
-        return sharedCIContext.createCGImage(patch, from: bounds, format: .RGBA8, colorSpace: rgbColorSpace)
-    }
-
-    /// Cắt vùng chữ góc bằng `ciRectFromTopLeft` và chuyển sang đen trắng tương phản cao (`contrast = 1.8`, `saturation = 0.0`).
-    private func renderContrastAngleCrop(from ciImage: CIImage) -> CGImage? {
-        let cropRect = ciRectFromTopLeft(
-            normRect: GunnyROIs.angleBattlefield,
-            imageWidth: ciImage.extent.width,
-            imageHeight: ciImage.extent.height
-        ).intersection(ciImage.extent)
-        guard cropRect.width >= 16, cropRect.height >= 16 else { return nil }
-
-        var patch = ciImage
-            .cropped(to: cropRect)
-            .transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
-
-        if patch.extent.width > maxAngleCropWidth, patch.extent.width > 0 {
-            let scale = maxAngleCropWidth / patch.extent.width
-            patch = patch.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        }
-
-        patch = patch.applyingFilter(
-            "CIColorControls",
-            parameters: [
-                kCIInputContrastKey: 1.8,
-                kCIInputSaturationKey: 0.0
-            ]
-        )
-
-        let bounds = CGRect(
-            x: 0,
-            y: 0,
-            width: floor(patch.extent.width),
-            height: floor(patch.extent.height)
-        )
-        guard bounds.width >= 16, bounds.height >= 16 else { return nil }
-        return sharedCIContext.createCGImage(patch, from: bounds, format: .L8, colorSpace: grayColorSpace)
     }
 }

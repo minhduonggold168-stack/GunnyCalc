@@ -17,13 +17,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run Automated Swift Tests (CoreImage + Vision + UDP)
+      - name: Run Automated Swift Tests (Zero-Vision Raw BGRA + UDP)
         run: |
+          if grep -rnE "(import\s+Vision|import\s+CoreImage|\bCIContext\b|\bUIImage\b)" BroadcastExtension Shared; then
+            echo "ERROR: Forbidden Vision/CoreImage/UIImage API found in BroadcastExtension or Shared"
+            exit 1
+          fi
           swiftc -O -parse-as-library \
             -framework CoreGraphics \
-            -framework CoreImage \
+            -framework CoreVideo \
             -framework CoreText \
-            -framework Vision \
             Shared/Models.swift \
             Shared/BallisticsEngine.swift \
             Shared/VisionProcessor.swift \

@@ -11,16 +11,16 @@ public func ciRectFromTopLeft(normRect: CGRect, imageWidth: CGFloat, imageHeight
     return CGRect(x: x, y: y, width: w, height: h).integral
 }
 
-/// Các vùng quét cố định (tọa độ chuẩn hóa Top-Left `0.0 - 1.0`) cho kiến trúc hợp nhất 3 tầng (Multi-Cue Fusion).
+/// Các vùng quét cố định (tọa độ chuẩn hóa Top-Left `0.0 - 1.0`) cho kiến trúc Zero-Crash đọc trực tiếp bộ nhớ BGRA thô.
 public enum GunnyROIs {
-    /// Tầng 1: Vùng chiến trường chính tìm thanh máu xanh người chơi và thanh máu đỏ địch (< 10 đơn vị).
-    public static let mainBattlefield = CGRect(x: 0.050, y: 0.180, width: 0.900, height: 0.650)
-    /// Tầng 2: Vùng Minimap tìm chấm xanh người chơi, chấm đỏ mục tiêu và viền đứng khung camera 10.0 đơn vị.
-    public static let minimapStrip = CGRect(x: 0.848, y: 0.042, width: 0.148, height: 0.106)
-    /// Tầng 3: Dải thước vàng đáy Minimap đo khoảng cách 5.0 đơn vị giữa 2 vạch chia dọc tối màu.
-    public static let minimapYellowRuler = CGRect(x: 0.848, y: 0.148, width: 0.148, height: 0.015)
-    /// Vùng chiến trường chứa chữ `Góc XX°` cạnh nhân vật (`-35° ... 85°`).
-    public static let angleBattlefield = CGRect(x: 0.050, y: 0.140, width: 0.820, height: 0.540)
+    /// Nguồn 1 góc bắn: Tâm phím D-pad nền tròn tối hiển thị số góc `-35° ... 85°`.
+    public static let dpadAngle = CGRect(x: 0.082, y: 0.745, width: 0.063, height: 0.110)
+    /// Nguồn 2 góc bắn: Vùng chiến trường tìm thanh máu xanh và tia chấm vàng chỉ hướng bắn.
+    public static let yellowAimRay = CGRect(x: 0.150, y: 0.150, width: 0.650, height: 0.600)
+    /// Bước 1 cự ly: Dải thước vàng dưới đáy Minimap (đo bước vạch tối 5.0 đơn vị -> `pixelsPerUnit`).
+    public static let minimapYellowRuler = CGRect(x: 0.848, y: 0.147, width: 0.147, height: 0.016)
+    /// Bước 2 cự ly: Vùng Minimap tìm người chơi xanh, mục tiêu đỏ tươi và khung camera trắng dự phòng.
+    public static let minimapStrip = CGRect(x: 0.848, y: 0.042, width: 0.147, height: 0.105)
 }
 
 /// Gói dữ liệu siêu nhẹ truyền thời gian thực 30 FPS qua BSD UDP (`127.0.0.1:45678`).

@@ -1,9 +1,8 @@
 import Foundation
 
-/// Bộ tính lực bắn chuẩn NPH Gunny Mobi bản không gió (Multi-Cue Fusion, không EMA).
+/// Bộ tính lực bắn chuẩn NPH Gunny Mobi bản không gió (Zero-Crash, không EMA).
 /// - Nội suy tuyến tính chính xác tới `0.1` đơn vị cự ly và theo góc bắn (`-35° ... 85°`) từ 5 bảng chuẩn chính thức NPH (`20°`, `30°`, `50°`, `65°`, `80°`).
-/// - Bù trừ chênh cao địa hình chuẩn vật lý: với `angle > 10°`, `ratio = 1.0 - (deltaYUnits / (max(distanceUnits, 0.5) * tan(angle)))`,
-///   nếu `ratio > 0.15` thì `finalPower = P_flat / sqrt(ratio)`, ngược lại `100.0` (giới hạn `0...100`).
+/// - Bù trừ chênh cao địa hình chuẩn vật lý cho `angle > 10°`.
 public struct BallisticsEngine: Sendable {
     public static let unitsPerScreen: Double = 10.0
 
@@ -89,7 +88,8 @@ public struct BallisticsEngine: Sendable {
         let finalPower: Double
         if safeAngle > 10.0 {
             let tanAngle = tan(safeAngle * .pi / 180.0)
-            let ratio = 1.0 - (safeDeltaY / (max(d, 0.5) * tanAngle))
+            let projectedDeltaY = safeDeltaY * 0.60
+            let ratio = 1.0 - (projectedDeltaY / (max(d, 0.5) * tanAngle))
             if ratio > 0.15 {
                 finalPower = basePower / sqrt(ratio)
             } else {

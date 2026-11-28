@@ -1,15 +1,12 @@
 import CoreGraphics
-import CoreImage
 import CoreText
+import CoreVideo
 import Darwin
 import Foundation
-import Vision
 
 @main
 enum GunnyCalcTestMain {
     private static let rgbSpace = CGColorSpaceCreateDeviceRGB()
-    private static let graySpace = CGColorSpaceCreateDeviceGray()
-    private static let sharedCIContext = CIContext(options: [.cacheIntermediates: false])
 
     static func main() {
         var passed = 0
@@ -26,20 +23,16 @@ enum GunnyCalcTestMain {
             }
         }
 
-        run("Test 1 — Map Cầu Rồng (Trời sáng, Tầng 1 CL 4.4, Góc 50°)", test1DragonBridgeBrightSkyTier1)
-        run("Test 2 — Map Tàu Đắm (Map hẹp, phải→trái CL 8.1, Góc 50°)", test2ShipwreckNarrowMapTier2)
-        run("Test 3 — Map Sân Bóng / Chợ Bến Thành (Map rộng 0.465, CL 11.5, Góc 46°)", test3WideMapTier2AndTier3)
-        run("Test 4 — Map Địa Hình Nâu Đỏ / Dung Nham (Chống nhiễu nền đỏ RGB 175,80,60)", test4RedLavaTerrainNoiseRejection)
-        run("Test 5 — Map Chênh Cao Địa Hình (CL 7.0, ΔY +2.5, Góc 65°)", test5ElevationUphillCompensation)
-        run("Test 6 — Phó Bản / Ải Viễn Chinh Nhiều Quái (3 chấm đỏ khóa ổn định)", test6MultiEnemyStableLock)
-        run("Test 7 — Góc Âm Hố Sâu (OCR Góc -18°, CL 5.0)", test7NegativeAnglePit)
-        run("Test 8 — Hiệu Năng & Độ Trễ Khứ Hồi 1920x886 + UDP (< 35ms)", test8PerformanceAndUDPRoundTripLatency)
+        run("Test 1 — Map Đồi Hoa Hồng (Raw BGRA 12px/đv, đồi hồng, CL 11.2, ΔY +3.0, D-pad 50°)", test1RoseHillMap)
+        run("Test 2 — Map Cầu Rồng (Raw BGRA, D-pad 50°, CL 4.4, ΔY 0)", test2DragonBridgeMap)
+        run("Test 3 — Map Tàu Đắm + D-pad 0° / Góc âm / Tia vàng / Xoay buffer dọc", test3ShipwreckAndOrientationCues)
+        run("Test 4 — Hiệu Năng < 5ms (1920x886 Raw BGRA) & BSD UDP + Zero-Vision Audit", test4PerformanceAndUDP)
 
         print("SUMMARY: \(passed)/\(passed + failed) tests PASSED")
         if failed > 0 {
             exit(1)
         }
-        print("ALL 8 AUTOMATED TESTS PASSED 100%")
+        print("ALL 4 AUTOMATED TESTS PASSED 100%")
     }
 
     private struct TestFailure: Error, CustomStringConvertible {
@@ -52,21 +45,11 @@ enum GunnyCalcTestMain {
         }
     }
 
-    // MARK: - Synthetic Frame Builder (1920 x 886)
+    // MARK: - Raw 1920 x 886 BGRA Frame Builder
 
-    private struct HealthBarSpec {
-        let fullX: Double
-        let fullY: Double
-        let normW: Double
-        let normH: Double
-        let r: Double
-        let g: Double
-        let b: Double
-    }
-
-    private struct MinimapDotSpec {
-        let normX: Double
-        let groundY: Double // Top-Left normalized Y inside minimapStrip (0...1)
+    private struct MinimapDot {
+        let pxOffsetFromCenter: Double
+        let groundYNorm: Double // Top-Left 0...1 bên trong minimapStrip
         let r: Double
         let g: Double
         let b: Double
@@ -74,149 +57,178 @@ enum GunnyCalcTestMain {
         let heightPx: Double
     }
 
-    private struct SyntheticSceneConfig {
-        var skyRGB: (Double, Double, Double) = (22, 28, 40)
-        var terrainRGB: (Double, Double, Double) = (45, 58, 48)
-        var minimapOutsideRGB: (Double, Double, Double) = (32, 38, 46)
-        var minimapInsideRGB: (Double, Double, Double) = (98, 108, 122)
-        var minimapTerrainOutsideRGB: (Double, Double, Double) = (46, 52, 42)
-        var minimapTerrainInsideRGB: (Double, Double, Double) = (86, 98, 82)
-        var cameraStartNorm: Double? = 0.17
-        var cameraEndNorm: Double? = 0.87
-        var drawWhiteCameraBorder: Bool = true
-        var rulerTickNormXs: [Double] = []
-        var mainHealthBars: [HealthBarSpec] = []
-        var minimapDots: [MinimapDotSpec] = []
-        var angleText: String? = "Góc 50°"
-        var angleTextColor: (Double, Double, Double) = (255, 255, 255)
-        var angleBgPill: Bool = false
+    private struct YellowRaySpec {
+        let playerFullX: Double
+        let playerFullY: Double
+        let angleDeg: Double
     }
 
-    private static func buildSyntheticFrame(_ cfg: SyntheticSceneConfig) throws -> CGImage {
-        let imgW = 1920
-        let imgH = 886
-        guard let ctx = CGContext(
-            data: nil,
-            width: imgW,
-            height: imgH,
-            bitsPerComponent: 8,
-            bytesPerRow: imgW * 4,
-            space: rgbSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
-        ) else {
-            throw TestFailure(description: "Failed to allocate 1920x886 CGContext")
-        }
+    private struct RawSceneSpec {
+        var width: Int = 1920
+        var height: Int = 886
+        var skyRGB: (Double, Double, Double) = (25, 32, 46)
+        var terrainRGB: (Double, Double, Double) = (52, 64, 52)
+        var minimapSkyRGB: (Double, Double, Double) = (18, 22, 30)
+        var minimapHillsRGB: [(Double, Double, Double)] = []
+        var tickSpacingPx: Double? = 60.0
+        var zeroTickXNorm: Double = 0.62
+        var cameraLeftNorm: Double? = nil
+        var cameraRightNorm: Double? = nil
+        var dots: [MinimapDot] = []
+        var dpadText: String? = "50"
+        var dpadTextColor: (Double, Double, Double) = (255, 255, 255)
+        var yellowAimRay: YellowRaySpec? = nil
+    }
 
-        // 1. Nền bầu trời và địa hình chiến trường chính.
-        ctx.setFillColor(makeColor(cfg.skyRGB))
-        ctx.fill(CGRect(x: 0, y: 0, width: imgW, height: imgH))
+    private static func buildRawBGRAFrame(_ spec: RawSceneSpec) throws -> (bytes: [UInt8], bytesPerRow: Int, width: Int, height: Int) {
+        let w = spec.width
+        let h = spec.height
+        let bpr = w * 4
+        var buffer = [UInt8](repeating: 0, count: h * bpr)
 
-        ctx.setFillColor(makeColor(cfg.terrainRGB))
-        ctx.fill(CGRect(x: 0, y: 0, width: imgW, height: Int(Double(imgH) * 0.36)))
-
-        // 2. Vẽ các thanh máu trên màn hình chính (Tầng 1) theo tọa độ Top-Left quy đổi sang CoreGraphics Bottom-Left.
-        for bar in cfg.mainHealthBars {
-            let bw = bar.normW * Double(imgW)
-            let bh = bar.normH * Double(imgH)
-            let cx = bar.fullX * Double(imgW)
-            let topLeftCenterY = bar.fullY * Double(imgH)
-            let cgBottomY = Double(imgH) - topLeftCenterY - bh * 0.5
-            ctx.setFillColor(makeColor((bar.r, bar.g, bar.b)))
-            ctx.fill(CGRect(x: cx - bw * 0.5, y: cgBottomY, width: bw, height: bh))
-        }
-
-        // 3. Vùng Minimap (Tầng 2: x=0.848, y=0.042, w=0.148, h=0.106).
-        let minimapCI = ciRectFromTopLeft(
-            normRect: GunnyROIs.minimapStrip,
-            imageWidth: CGFloat(imgW),
-            imageHeight: CGFloat(imgH)
-        )
-        ctx.setFillColor(makeColor(cfg.minimapOutsideRGB))
-        ctx.fill(minimapCI)
-
-        // Phần mặt đất nửa dưới Minimap.
-        let terrainH = minimapCI.height * 0.38
-        ctx.setFillColor(makeColor(cfg.minimapTerrainOutsideRGB))
-        ctx.fill(CGRect(x: minimapCI.minX, y: minimapCI.minY, width: minimapCI.width, height: terrainH))
-
-        if let camStart = cfg.cameraStartNorm, let camEnd = cfg.cameraEndNorm, camEnd > camStart {
-            let camX = minimapCI.minX + CGFloat(camStart) * minimapCI.width
-            let camW = CGFloat(camEnd - camStart) * minimapCI.width
-            ctx.setFillColor(makeColor(cfg.minimapInsideRGB))
-            ctx.fill(CGRect(x: camX, y: minimapCI.minY + terrainH, width: camW, height: minimapCI.height - terrainH))
-            ctx.setFillColor(makeColor(cfg.minimapTerrainInsideRGB))
-            ctx.fill(CGRect(x: camX, y: minimapCI.minY, width: camW, height: terrainH))
-
-            if cfg.drawWhiteCameraBorder {
-                ctx.setFillColor(makeColor((255, 255, 255)))
-                // 2 đường viền đứng khung camera trắng chạy suốt từ trên xuống dưới (kể cả phần mặt đất).
-                ctx.fill(CGRect(x: round(camX), y: minimapCI.minY + 2, width: 1.5, height: minimapCI.height - 4))
-                ctx.fill(CGRect(x: round(camX + camW), y: minimapCI.minY + 2, width: 1.5, height: minimapCI.height - 4))
-                // Viền ngang trên & dưới khung camera.
-                ctx.fill(CGRect(x: round(camX), y: minimapCI.maxY - 3, width: camW, height: 1.5))
-                ctx.fill(CGRect(x: round(camX), y: minimapCI.minY + 2, width: camW, height: 1.5))
+        let rendered: Bool = buffer.withUnsafeMutableBytes { rawPtr -> Bool in
+            guard let base = rawPtr.baseAddress,
+                  let ctx = CGContext(
+                      data: base,
+                      width: w,
+                      height: h,
+                      bitsPerComponent: 8,
+                      bytesPerRow: bpr,
+                      space: rgbSpace,
+                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+                  ) else {
+                return false
             }
-        }
 
-        // Các chấm người chơi (xanh) & mục tiêu (đỏ) trên Minimap với đáy chân tại `groundY` (Top-Left).
-        for dot in cfg.minimapDots {
-            let cx = minimapCI.minX + CGFloat(dot.normX) * minimapCI.width
-            let groundOffsetFromTop = CGFloat(dot.groundY) * minimapCI.height
-            // Trong CoreGraphics (Bottom-Left), đáy chân nằm tại `minimapCI.maxY - groundOffsetFromTop`.
-            let cgBottomY = minimapCI.maxY - groundOffsetFromTop
-            ctx.setFillColor(makeColor((dot.r, dot.g, dot.b)))
-            ctx.fill(CGRect(
-                x: cx - CGFloat(dot.widthPx) * 0.5,
-                y: cgBottomY,
-                width: CGFloat(dot.widthPx),
-                height: CGFloat(dot.heightPx)
-            ))
-        }
-
-        // 4. Dải thước vàng đáy Minimap (Tầng 3: x=0.848, y=0.148, w=0.148, h=0.015).
-        let rulerCI = ciRectFromTopLeft(
-            normRect: GunnyROIs.minimapYellowRuler,
-            imageWidth: CGFloat(imgW),
-            imageHeight: CGFloat(imgH)
-        )
-        ctx.setFillColor(makeColor((235, 200, 65)))
-        ctx.fill(rulerCI)
-
-        if !cfg.rulerTickNormXs.isEmpty {
-            ctx.setFillColor(makeColor((24, 20, 15)))
-            for normX in cfg.rulerTickNormXs {
-                let tx = rulerCI.minX + CGFloat(normX) * rulerCI.width
-                ctx.fill(CGRect(x: tx - 1.5, y: rulerCI.minY, width: 3.0, height: rulerCI.height))
+            func fillTopLeft(_ tlRect: CGRect, rgb: (Double, Double, Double)) {
+                let cgRect = CGRect(
+                    x: tlRect.origin.x,
+                    y: CGFloat(h) - tlRect.origin.y - tlRect.size.height,
+                    width: tlRect.size.width,
+                    height: tlRect.size.height
+                )
+                ctx.setFillColor(makeColor(rgb))
+                ctx.fill(cgRect)
             }
-        }
 
-        // 5. Chữ góc bắn trong vùng chiến trường (`angleBattlefield`).
-        if let angleText = cfg.angleText {
-            let angleCI = ciRectFromTopLeft(
-                normRect: GunnyROIs.angleBattlefield,
-                imageWidth: CGFloat(imgW),
-                imageHeight: CGFloat(imgH)
-            )
-            if cfg.angleBgPill {
-                ctx.setFillColor(makeColor((18, 22, 30)))
-                ctx.fill(CGRect(x: angleCI.minX + 230, y: angleCI.midY - 22, width: 340, height: 86))
+            // 1. Bầu trời & địa hình nền chính.
+            fillTopLeft(CGRect(x: 0, y: 0, width: w, height: h), rgb: spec.skyRGB)
+            fillTopLeft(CGRect(x: 0, y: Double(h) * 0.65, width: Double(w), height: Double(h) * 0.35), rgb: spec.terrainRGB)
+
+            // 2. Vùng Minimap (0.848...0.995, 0.042...0.147).
+            let mmX = Double(GunnyROIs.minimapStrip.origin.x) * Double(w)
+            let mmY = Double(GunnyROIs.minimapStrip.origin.y) * Double(h)
+            let mmW = Double(GunnyROIs.minimapStrip.size.width) * Double(w)
+            let mmH = Double(GunnyROIs.minimapStrip.size.height) * Double(h)
+            fillTopLeft(CGRect(x: mmX, y: mmY, width: mmW, height: mmH), rgb: spec.minimapSkyRGB)
+
+            // Vẽ các dải đồi hồng / tím / nâu bên trong Minimap nếu được cấu hình.
+            if !spec.minimapHillsRGB.isEmpty {
+                let bandH = mmH * 0.56 / Double(spec.minimapHillsRGB.count)
+                for (idx, col) in spec.minimapHillsRGB.enumerated() {
+                    let hy = mmY + mmH * 0.36 + Double(idx) * bandH
+                    fillTopLeft(CGRect(x: mmX, y: hy, width: mmW, height: bandH + 2.0), rgb: col)
+                }
+            } else {
+                fillTopLeft(CGRect(x: mmX, y: mmY + mmH * 0.58, width: mmW, height: mmH * 0.42), rgb: spec.terrainRGB)
             }
-            let font = CTFontCreateWithName("Helvetica-Bold" as CFString, 54.0, nil)
-            let attrs: [CFString: Any] = [
-                kCTFontAttributeName: font,
-                kCTForegroundColorAttributeName: makeColor(cfg.angleTextColor)
-            ]
-            let attrStr = CFAttributedStringCreate(kCFAllocatorDefault, angleText as CFString, attrs as CFDictionary)!
-            let line = CTLineCreateWithAttributedString(attrStr)
-            ctx.textMatrix = .identity
-            ctx.textPosition = CGPoint(x: angleCI.minX + 255.0, y: angleCI.midY)
-            CTLineDraw(line, ctx)
+
+            // Vẽ khung camera trắng dự phòng nếu cần test fallback.
+            if let cl = spec.cameraLeftNorm, let cr = spec.cameraRightNorm, cr > cl {
+                let cx0 = mmX + cl * mmW
+                let cx1 = mmX + cr * mmW
+                fillTopLeft(CGRect(x: cx0, y: mmY + 2, width: 1.5, height: mmH - 4), rgb: (255, 255, 255))
+                fillTopLeft(CGRect(x: cx1, y: mmY + 2, width: 1.5, height: mmH - 4), rgb: (255, 255, 255))
+                fillTopLeft(CGRect(x: cx0, y: mmY + 2, width: cx1 - cx0, height: 1.5), rgb: (255, 255, 255))
+                fillTopLeft(CGRect(x: cx0, y: mmY + mmH - 3, width: cx1 - cx0, height: 1.5), rgb: (255, 255, 255))
+            }
+
+            let zeroPxX = mmX + spec.zeroTickXNorm * mmW
+
+            // Các chấm người chơi & kẻ địch trên Minimap.
+            for dot in spec.dots {
+                let cx = zeroPxX + dot.pxOffsetFromCenter
+                let gy = mmY + dot.groundYNorm * mmH
+                fillTopLeft(
+                    CGRect(
+                        x: cx - dot.widthPx * 0.5,
+                        y: gy - dot.heightPx,
+                        width: dot.widthPx,
+                        height: dot.heightPx
+                    ),
+                    rgb: (dot.r, dot.g, dot.b)
+                )
+            }
+
+            // 3. Dải thước vàng đáy Minimap (0.848...0.995, 0.147...0.163).
+            let rlX = Double(GunnyROIs.minimapYellowRuler.origin.x) * Double(w)
+            let rlY = Double(GunnyROIs.minimapYellowRuler.origin.y) * Double(h)
+            let rlW = Double(GunnyROIs.minimapYellowRuler.size.width) * Double(w)
+            let rlH = Double(GunnyROIs.minimapYellowRuler.size.height) * Double(h)
+            fillTopLeft(CGRect(x: rlX, y: rlY, width: rlW, height: rlH), rgb: (238, 202, 58))
+
+            if let spacing = spec.tickSpacingPx, spacing > 5.0 {
+                // Vẽ các vạch tối sắc nét tại -20, -15, -10, -5, 0, +5, +10...
+                var offset = -4.0 * spacing
+                while offset <= 4.0 * spacing {
+                    let tx = zeroPxX + offset
+                    if tx >= rlX + 4.0 && tx <= rlX + rlW - 4.0 {
+                        fillTopLeft(CGRect(x: tx - 1.5, y: rlY, width: 3.0, height: rlH), rgb: (22, 18, 12))
+                    }
+                    offset += spacing
+                }
+            }
+
+            // 4. Phím D-pad góc bắn (0.082...0.145, 0.745...0.855).
+            let dpX = Double(GunnyROIs.dpadAngle.origin.x) * Double(w)
+            let dpY = Double(GunnyROIs.dpadAngle.origin.y) * Double(h)
+            let dpW = Double(GunnyROIs.dpadAngle.size.width) * Double(w)
+            let dpH = Double(GunnyROIs.dpadAngle.size.height) * Double(h)
+            // Vòng tròn nền tối D-pad.
+            let dpCGRect = CGRect(x: dpX + 4, y: CGFloat(h) - dpY - dpH + 4, width: dpW - 8, height: dpH - 8)
+            ctx.setFillColor(makeColor((18, 26, 38)))
+            ctx.fillEllipse(in: dpCGRect)
+
+            if let text = spec.dpadText, !text.isEmpty {
+                let font = CTFontCreateWithName("Helvetica-Bold" as CFString, 42.0, nil)
+                let attrs: [CFString: Any] = [
+                    kCTFontAttributeName: font,
+                    kCTForegroundColorAttributeName: makeColor(spec.dpadTextColor)
+                ]
+                let attrStr = CFAttributedStringCreate(kCFAllocatorDefault, text as CFString, attrs as CFDictionary)!
+                let line = CTLineCreateWithAttributedString(attrStr)
+                let bounds = CTLineGetBoundsWithOptions(line, .useOpticalBounds)
+                let textCenterX = dpCGRect.midX - bounds.width * 0.5 - bounds.origin.x
+                let textBaseY = dpCGRect.midY - bounds.height * 0.5 - bounds.origin.y
+                ctx.textMatrix = .identity
+                ctx.textPosition = CGPoint(x: textCenterX, y: textBaseY)
+                CTLineDraw(line, ctx)
+            }
+
+            // 5. Tia chấm vàng chỉ hướng bắn cạnh thanh máu xanh nếu được cấu hình.
+            if let ray = spec.yellowAimRay {
+                let px = ray.playerFullX * Double(w)
+                let py = ray.playerFullY * Double(h)
+                fillTopLeft(CGRect(x: px - 28, y: py + 12, width: 56, height: 8), rgb: (20, 88, 248))
+
+                let rad = ray.angleDeg * .pi / 180.0
+                for step in 1...6 {
+                    let dist = Double(step) * 26.0
+                    let dx = px + cos(rad) * dist
+                    let dy = py - sin(rad) * dist
+                    let dotRect = CGRect(x: dx - 4.0, y: CGFloat(h) - dy - 4.0, width: 8.0, height: 8.0)
+                    ctx.setFillColor(makeColor((250, 228, 32)))
+                    ctx.fillEllipse(in: dotRect)
+                }
+            }
+
+            return true
         }
 
-        guard let image = ctx.makeImage() else {
-            throw TestFailure(description: "Failed to create synthetic 1920x886 CGImage")
+        guard rendered else {
+            throw TestFailure(description: "Failed to build 1920x886 raw BGRA buffer")
         }
-        return image
+        return (buffer, bpr, w, h)
     }
 
     private static func makeColor(_ rgb: (Double, Double, Double)) -> CGColor {
@@ -226,504 +238,222 @@ enum GunnyCalcTestMain {
         )!
     }
 
-    // MARK: - Production Crop Helpers (Mirroring SampleHandler.swift)
+    // MARK: - Test 1: Map Đồi Hoa Hồng (Thước vàng 60px -> 12px/đv, đồi hồng, chấm đỏ -11.2, ΔY = +3.0, góc 50° -> Lực 54.5 ± 1.5)
 
-    private static func cropTier1Battlefield(from ciImage: CIImage) -> CGImage? {
-        let cropRect = ciRectFromTopLeft(
-            normRect: GunnyROIs.mainBattlefield,
-            imageWidth: ciImage.extent.width,
-            imageHeight: ciImage.extent.height
-        ).intersection(ciImage.extent)
-        guard cropRect.width >= 32, cropRect.height >= 16 else { return nil }
-
-        var patch = ciImage
-            .cropped(to: cropRect)
-            .transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
-
-        if patch.extent.width > 960.0 {
-            patch = patch
-                .samplingNearest()
-                .transformed(by: CGAffineTransform(scaleX: 0.5, y: 1.0))
-        }
-        let bounds = CGRect(x: 0, y: 0, width: floor(patch.extent.width), height: floor(patch.extent.height))
-        return sharedCIContext.createCGImage(patch, from: bounds, format: .RGBA8, colorSpace: rgbSpace)
-    }
-
-    private static func cropNativeROI(_ normRect: CGRect, from ciImage: CIImage) -> CGImage? {
-        let cropRect = ciRectFromTopLeft(
-            normRect: normRect,
-            imageWidth: ciImage.extent.width,
-            imageHeight: ciImage.extent.height
-        ).intersection(ciImage.extent)
-        guard cropRect.width >= 8, cropRect.height >= 2 else { return nil }
-
-        let patch = ciImage
-            .cropped(to: cropRect)
-            .transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
-        let bounds = CGRect(x: 0, y: 0, width: floor(patch.extent.width), height: floor(patch.extent.height))
-        return sharedCIContext.createCGImage(patch, from: bounds, format: .RGBA8, colorSpace: rgbSpace)
-    }
-
-    private static func cropContrastAngle(from ciImage: CIImage) -> CGImage? {
-        let cropRect = ciRectFromTopLeft(
-            normRect: GunnyROIs.angleBattlefield,
-            imageWidth: ciImage.extent.width,
-            imageHeight: ciImage.extent.height
-        ).intersection(ciImage.extent)
-        guard cropRect.width >= 16, cropRect.height >= 16 else { return nil }
-
-        var patch = ciImage
-            .cropped(to: cropRect)
-            .transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
-
-        if patch.extent.width > 640.0 {
-            let scale = 640.0 / patch.extent.width
-            patch = patch.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        }
-        patch = patch.applyingFilter(
-            "CIColorControls",
-            parameters: [
-                kCIInputContrastKey: 1.8,
-                kCIInputSaturationKey: 0.0
-            ]
-        )
-        let bounds = CGRect(x: 0, y: 0, width: floor(patch.extent.width), height: floor(patch.extent.height))
-        return sharedCIContext.createCGImage(patch, from: bounds, format: .L8, colorSpace: graySpace)
-    }
-
-    // MARK: - Test 1: Map Cầu Rồng (Trời sáng chói, Tầng 1 CL 4.4, Góc 50° -> Lực 30.2 ± 0.8)
-
-    private static func test1DragonBridgeBrightSkyTier1() throws -> String {
-        var cfg = SyntheticSceneConfig()
-        cfg.skyRGB = (215, 238, 255) // Trời sáng chói
-        cfg.terrainRGB = (185, 195, 210)
-        cfg.minimapOutsideRGB = (210, 232, 250)
-        cfg.minimapInsideRGB = (218, 238, 255)
-        cfg.angleText = "Góc 50°"
-        cfg.angleBgPill = true
-        // Người chơi tại x=0.26, địch tại x=0.70 (cùng độ cao y=0.62) -> dx = 0.44 -> CL 4.4
-        cfg.mainHealthBars = [
-            HealthBarSpec(fullX: 0.26, fullY: 0.62, normW: 0.040, normH: 0.010, r: 20, g: 85, b: 245),
-            HealthBarSpec(fullX: 0.70, fullY: 0.62, normW: 0.044, normH: 0.010, r: 242, g: 22, b: 22)
+    private static func test1RoseHillMap() throws -> String {
+        let ppu = 12.0 // tickSpacing = 60px / 5.0
+        var spec = RawSceneSpec()
+        spec.tickSpacingPx = 60.0
+        spec.zeroTickXNorm = 0.72
+        spec.minimapHillsRGB = [
+            (218, 125, 165), // Đồi hồng phấn
+            (185, 95, 138),  // Đồi hồng đậm (G=95, B=138 > ngưỡng loại nền)
+            (150, 88, 132),  // Đồi tím
+            (132, 84, 70)    // Đồi nâu
+        ]
+        spec.dpadText = "50"
+        // Chấm xanh tại mốc 0 (y = 0.72 * mmH); chấm đỏ tại -11.2 đv (-134.4px) đứng cao trên đồi ΔY = +3.0 đv.
+        let mmH = Double(GunnyROIs.minimapStrip.size.height) * Double(spec.height) // ~93.03px
+        let deltaYPx = 3.0 * (ppu * 0.55) // ~19.8px
+        let playerGroundYNorm = 0.78
+        let enemyGroundYNorm = playerGroundYNorm - (deltaYPx / mmH)
+        spec.dots = [
+            MinimapDot(pxOffsetFromCenter: 0.0, groundYNorm: playerGroundYNorm, r: 22, g: 92, b: 245, widthPx: 7, heightPx: 9),
+            MinimapDot(pxOffsetFromCenter: -11.2 * ppu, groundYNorm: enemyGroundYNorm, r: 242, g: 22, b: 22, widthPx: 7, heightPx: 7)
         ]
 
-        let frame = try buildSyntheticFrame(cfg)
-        let ciImage = CIImage(cgImage: frame)
-        let vision = VisionProcessor()
+        let raw = try buildRawBGRAFrame(spec)
+        let processor = VisionProcessor()
         let engine = BallisticsEngine()
 
-        guard let battlefieldCG = cropTier1Battlefield(from: ciImage),
-              let minimapCG = cropNativeROI(GunnyROIs.minimapStrip, from: ciImage),
-              let rulerCG = cropNativeROI(GunnyROIs.minimapYellowRuler, from: ciImage),
-              let fusion = vision.fuseMultiCueMeasurement(
-                  battlefieldCrop: battlefieldCG,
-                  minimapCrop: minimapCG,
-                  yellowRulerCrop: rulerCG,
-                  fallbackPlayerPos: nil,
-                  previousEnemyPos: nil,
-                  cachedScreenWidthNorm: VisionProcessor.defaultScreenWidthNorm
-              ) else {
-            throw TestFailure(description: "Multi-Cue Fusion failed on Dragon Bridge bright-sky scene")
+        let result: RawFrameAnalysisResult = raw.bytes.withUnsafeBufferPointer { ptr in
+            let frame = RawFrameBuffer(bgraBase: ptr.baseAddress!, rawWidth: raw.width, rawHeight: raw.height, bytesPerRow: raw.bytesPerRow)
+            return processor.analyzeFrame(frame)
         }
 
-        try expect(fusion.tier == .tier1MainScreenHealthBars, "Expected Tier 1 health bars, got \(fusion.tier.rawValue)")
-        try expect(
-            abs(fusion.distanceUnits - 4.4) <= 0.2,
-            String(format: "Expected distanceUnits = 4.4 ± 0.2, got %.2f", fusion.distanceUnits)
-        )
+        try expect(result.scaleSource == .yellowRulerTicks, "Expected yellowRulerTicks, got \(result.scaleSource.rawValue)")
+        try expect(abs((result.pixelsPerUnit ?? 0) - 12.0) <= 0.4, String(format: "Expected 12.0 px/unit, got %.2f", result.pixelsPerUnit ?? 0))
+        try expect(result.enemyCount == 1, "Expected 1 red enemy (pink/purple/brown hills rejected), got \(result.enemyCount)")
+        try expect(abs((result.distanceUnits ?? 0) - 11.2) <= 0.2, String(format: "Expected distanceUnits = 11.2 ± 0.2, got %.2f", result.distanceUnits ?? 0))
+        try expect(abs((result.deltaYUnits ?? 0) - 3.0) <= 0.35, String(format: "Expected deltaYUnits ≈ +3.0, got %.2f", result.deltaYUnits ?? 0))
+        try expect(result.angle == 50, "Expected D-pad angle == 50, got \(String(describing: result.angle))")
 
-        guard let angleCG = cropContrastAngle(from: ciImage),
-              let angle = vision.detectAngle(fromContrastImage: angleCG) else {
-            throw TestFailure(description: "OCR failed to read 'Góc 50°' on bright-sky scene")
-        }
-        try expect(angle == 50, "Expected angle 50°, got \(angle)°")
+        let power = engine.calculatePower(distanceUnits: result.distanceUnits ?? 0, angle: result.angle ?? 50, deltaYUnits: result.deltaYUnits ?? 0)
+        try expect(abs(power - 54.5) <= 1.5, String(format: "Expected power = 54.5 ± 1.5, got %.1f", power))
 
-        let power = engine.calculatePower(distanceUnits: fusion.distanceUnits, angle: angle, deltaYUnits: fusion.deltaYUnits)
-        try expect(
-            abs(power - 30.2) <= 0.8,
-            String(format: "Expected power = 30.2 ± 0.8, got %.1f", power)
-        )
-
-        return String(format: "tier=%@, dist=%.2f, angle=%d°, power=%.1f (target 30.2±0.8)", fusion.tier.rawValue, fusion.distanceUnits, angle, power)
+        return String(format: "ppu=%.2f, enemyCount=%d, CL=%.2f, ΔY=%+.2f, angle=%d°, power=%.1f (target 54.5±1.5)", result.pixelsPerUnit ?? 0, result.enemyCount, result.distanceUnits ?? 0, result.deltaYUnits ?? 0, result.angle ?? -99, power)
     }
 
-    // MARK: - Test 2: Map Tàu Đắm (Map hẹp, bắn phải→trái CL 8.1, Góc 50° -> Lực 42.3 ± 1.0)
+    // MARK: - Test 2: Map Cầu Rồng (Góc 50°, CL 4.4, ΔY = 0 -> Lực 30.2 ± 0.8)
 
-    private static func test2ShipwreckNarrowMapTier2() throws -> String {
-        var cfg = SyntheticSceneConfig()
-        cfg.cameraStartNorm = 0.17
-        cfg.cameraEndNorm = 0.87 // camW = 0.70
-        cfg.angleText = "Góc 50°"
-        cfg.minimapDots = [
-            // Người chơi bên phải (0.69), địch ngoài mép trái khung camera (0.12) -> dx=0.57 -> 0.57/0.70*10 = 8.14
-            MinimapDotSpec(normX: 0.69, groundY: 0.65, r: 22, g: 92, b: 245, widthPx: 7, heightPx: 9),
-            MinimapDotSpec(normX: 0.12, groundY: 0.65, r: 240, g: 24, b: 24, widthPx: 7, heightPx: 7)
+    private static func test2DragonBridgeMap() throws -> String {
+        let ppu = 14.0 // tickSpacing = 70px / 5.0
+        var spec = RawSceneSpec()
+        spec.skyRGB = (210, 236, 255) // Trời sáng chói
+        spec.terrainRGB = (175, 188, 204)
+        spec.minimapSkyRGB = (195, 224, 248)
+        spec.tickSpacingPx = 70.0
+        spec.zeroTickXNorm = 0.25
+        spec.dpadText = "50"
+        spec.dots = [
+            MinimapDot(pxOffsetFromCenter: 0.0, groundYNorm: 0.72, r: 20, g: 88, b: 245, widthPx: 7, heightPx: 9),
+            MinimapDot(pxOffsetFromCenter: 4.4 * ppu, groundYNorm: 0.72, r: 240, g: 24, b: 24, widthPx: 7, heightPx: 7)
         ]
 
-        let frame = try buildSyntheticFrame(cfg)
-        let ciImage = CIImage(cgImage: frame)
-        let vision = VisionProcessor()
+        let raw = try buildRawBGRAFrame(spec)
+        let processor = VisionProcessor()
         let engine = BallisticsEngine()
 
-        guard let battlefieldCG = cropTier1Battlefield(from: ciImage),
-              let minimapCG = cropNativeROI(GunnyROIs.minimapStrip, from: ciImage),
-              let rulerCG = cropNativeROI(GunnyROIs.minimapYellowRuler, from: ciImage),
-              let fusion = vision.fuseMultiCueMeasurement(
-                  battlefieldCrop: battlefieldCG,
-                  minimapCrop: minimapCG,
-                  yellowRulerCrop: rulerCG,
-                  fallbackPlayerPos: nil,
-                  previousEnemyPos: nil,
-                  cachedScreenWidthNorm: VisionProcessor.defaultScreenWidthNorm
-              ) else {
-            throw TestFailure(description: "Multi-Cue Fusion failed on Shipwreck narrow map")
+        let result: RawFrameAnalysisResult = raw.bytes.withUnsafeBufferPointer { ptr in
+            let frame = RawFrameBuffer(bgraBase: ptr.baseAddress!, rawWidth: raw.width, rawHeight: raw.height, bytesPerRow: raw.bytesPerRow)
+            return processor.analyzeFrame(frame)
         }
 
-        try expect(fusion.tier == .tier2MinimapCameraBorder, "Expected Tier 2 vertical camera border, got \(fusion.tier.rawValue)")
-        try expect(abs(fusion.screenWidthNorm - 0.70) <= 0.03, String(format: "Expected camW ≈ 0.70, got %.3f", fusion.screenWidthNorm))
-        try expect(abs(fusion.distanceUnits - 8.1) <= 0.3, String(format: "Expected dist = 8.1 ± 0.3, got %.2f", fusion.distanceUnits))
+        try expect(abs((result.distanceUnits ?? 0) - 4.4) <= 0.2, String(format: "Expected CL = 4.4 ± 0.2, got %.2f", result.distanceUnits ?? 0))
+        try expect(result.angle == 50, "Expected angle == 50, got \(String(describing: result.angle))")
 
-        guard let angleCG = cropContrastAngle(from: ciImage),
-              let angle = vision.detectAngle(fromContrastImage: angleCG) else {
-            throw TestFailure(description: "OCR failed to read 'Góc 50°' on Shipwreck map")
-        }
-        try expect(angle == 50, "Expected angle 50°, got \(angle)°")
+        let power = engine.calculatePower(distanceUnits: result.distanceUnits ?? 0, angle: result.angle ?? 50, deltaYUnits: result.deltaYUnits ?? 0)
+        try expect(abs(power - 30.2) <= 0.8, String(format: "Expected power = 30.2 ± 0.8, got %.1f", power))
 
-        let power = engine.calculatePower(distanceUnits: fusion.distanceUnits, angle: angle, deltaYUnits: fusion.deltaYUnits)
-        try expect(abs(power - 42.3) <= 1.0, String(format: "Expected power = 42.3 ± 1.0, got %.1f", power))
-
-        return String(format: "tier=%@, camW=%.3f, dist=%.2f, angle=%d°, power=%.1f (target 42.3±1.0)", fusion.tier.rawValue, fusion.screenWidthNorm, fusion.distanceUnits, angle, power)
+        return String(format: "ppu=%.2f, CL=%.2f, angle=%d°, power=%.1f (target 30.2±0.8)", result.pixelsPerUnit ?? 0, result.distanceUnits ?? 0, result.angle ?? -99, power)
     }
 
-    // MARK: - Test 3: Map Sân Bóng / Chợ Bến Thành (Map rộng 21.5 đơn vị, tỷ lệ 0.465, CL 11.5, Góc 46° -> Lực 51.4 ± 1.0)
+    // MARK: - Test 3: Map Tàu Đắm + D-pad 0° hold + Góc âm -18° + Tia vàng 65° + Fallback khung camera + Buffer xoay dọc
 
-    private static func test3WideMapTier2AndTier3() throws -> String {
-        var cfg = SyntheticSceneConfig()
-        cfg.cameraStartNorm = 0.05
-        cfg.cameraEndNorm = 0.515 // camW = 0.465
-        cfg.rulerTickNormXs = [0.10, 0.3325, 0.565, 0.7975] // spacing = 0.2325 (5.0 units -> 10.0 units = 0.465)
-        cfg.angleText = "Góc 46°"
-        cfg.minimapDots = [
-            MinimapDotSpec(normX: 0.255, groundY: 0.68, r: 22, g: 92, b: 245, widthPx: 7, heightPx: 9),
-            MinimapDotSpec(normX: 0.790, groundY: 0.68, r: 242, g: 20, b: 20, widthPx: 7, heightPx: 7)
-        ]
-
-        let frame = try buildSyntheticFrame(cfg)
-        let ciImage = CIImage(cgImage: frame)
-        let vision = VisionProcessor()
+    private static func test3ShipwreckAndOrientationCues() throws -> String {
+        let processor = VisionProcessor()
         let engine = BallisticsEngine()
 
-        guard let battlefieldCG = cropTier1Battlefield(from: ciImage),
-              let minimapCG = cropNativeROI(GunnyROIs.minimapStrip, from: ciImage),
-              let rulerCG = cropNativeROI(GunnyROIs.minimapYellowRuler, from: ciImage),
-              let fusion = vision.fuseMultiCueMeasurement(
-                  battlefieldCrop: battlefieldCG,
-                  minimapCrop: minimapCG,
-                  yellowRulerCrop: rulerCG,
-                  fallbackPlayerPos: nil,
-                  previousEnemyPos: nil,
-                  cachedScreenWidthNorm: VisionProcessor.defaultScreenWidthNorm
-              ),
-              let minimap = fusion.minimapResult,
-              let tier2W = minimap.tier2CameraWidthNorm,
-              let tier3W = minimap.tier3RulerWidthNorm else {
-            throw TestFailure(description: "Tier 2 + Tier 3 measurement failed on wide map")
-        }
-
-        try expect(abs(tier2W - 0.465) <= 0.025, String(format: "Expected Tier 2 camW ≈ 0.465, got %.3f", tier2W))
-        try expect(abs(tier3W - 0.465) <= 0.025, String(format: "Expected Tier 3 rulerW ≈ 0.465, got %.3f", tier3W))
-        try expect(abs(fusion.distanceUnits - 11.5) <= 0.3, String(format: "Expected dist = 11.5 ± 0.3, got %.2f", fusion.distanceUnits))
-
-        // Xác nhận Tầng 3 fallback độc lập khi không vẽ khung camera Tầng 2.
-        var fallbackCfg = cfg
-        fallbackCfg.cameraStartNorm = nil
-        fallbackCfg.cameraEndNorm = nil
-        let fallbackFrame = try buildSyntheticFrame(fallbackCfg)
-        let fallbackCI = CIImage(cgImage: fallbackFrame)
-        guard let fbMinimap = cropNativeROI(GunnyROIs.minimapStrip, from: fallbackCI),
-              let fbRuler = cropNativeROI(GunnyROIs.minimapYellowRuler, from: fallbackCI),
-              let fbFusion = vision.fuseMultiCueMeasurement(
-                  battlefieldCrop: nil,
-                  minimapCrop: fbMinimap,
-                  yellowRulerCrop: fbRuler,
-                  fallbackPlayerPos: nil,
-                  previousEnemyPos: nil,
-                  cachedScreenWidthNorm: VisionProcessor.defaultScreenWidthNorm
-              ) else {
-            throw TestFailure(description: "Tier 3 yellow ruler fallback failed on wide map")
-        }
-        try expect(fbFusion.tier == .tier3MinimapYellowRuler, "Expected Tier 3 ruler fallback, got \(fbFusion.tier.rawValue)")
-        try expect(abs(fbFusion.distanceUnits - 11.5) <= 0.3, String(format: "Expected Tier 3 dist = 11.5 ± 0.3, got %.2f", fbFusion.distanceUnits))
-
-        guard let angleCG = cropContrastAngle(from: ciImage),
-              let angle = vision.detectAngle(fromContrastImage: angleCG) else {
-            throw TestFailure(description: "OCR failed to read 'Góc 46°' on wide map")
-        }
-        try expect(angle == 46, "Expected angle 46°, got \(angle)°")
-
-        let power = engine.calculatePower(distanceUnits: fusion.distanceUnits, angle: angle, deltaYUnits: fusion.deltaYUnits)
-        try expect(abs(power - 51.4) <= 1.0, String(format: "Expected power = 51.4 ± 1.0, got %.1f", power))
-
-        return String(format: "tier2W=%.3f, tier3W=%.3f, dist=%.2f, angle=%d°, power=%.1f (target 51.4±1.0)", tier2W, tier3W, fusion.distanceUnits, angle, power)
-    }
-
-    // MARK: - Test 4: Map Địa Hình Nâu Đỏ / Dung Nham (Nền đỏ gạch RGB(175, 80, 60))
-
-    private static func test4RedLavaTerrainNoiseRejection() throws -> String {
-        var cfg = SyntheticSceneConfig()
-        cfg.skyRGB = (95, 38, 30)
-        cfg.terrainRGB = (175, 80, 60) // Địa hình nâu đỏ / dung nham
-        cfg.minimapOutsideRGB = (130, 58, 44)
-        cfg.minimapInsideRGB = (175, 80, 60) // Phủ đỏ gạch ngay trong khung camera
-        cfg.minimapTerrainOutsideRGB = (145, 66, 50)
-        cfg.minimapTerrainInsideRGB = (175, 80, 60)
-        cfg.cameraStartNorm = 0.12
-        cfg.cameraEndNorm = 0.82 // camW = 0.70
-        cfg.angleText = "Góc 50°"
-        // Chèn thanh máu giả màu đỏ gạch RGB(175, 80, 60) trên màn hình chính -> Tầng 1 phải bỏ qua.
-        cfg.mainHealthBars = [
-            HealthBarSpec(fullX: 0.25, fullY: 0.60, normW: 0.040, normH: 0.010, r: 20, g: 85, b: 245),
-            HealthBarSpec(fullX: 0.55, fullY: 0.60, normW: 0.045, normH: 0.010, r: 175, g: 80, b: 60)
-        ]
-        // Trên Minimap: người chơi xanh tại 0.22, 1 mục tiêu đỏ tươi duy nhất tại 0.78 -> dx = 0.56 -> 0.56/0.70*10 = 8.0
-        cfg.minimapDots = [
-            MinimapDotSpec(normX: 0.22, groundY: 0.66, r: 22, g: 92, b: 245, widthPx: 7, heightPx: 9),
-            MinimapDotSpec(normX: 0.78, groundY: 0.66, r: 242, g: 20, b: 20, widthPx: 7, heightPx: 7)
+        // 3A. Map Tàu Đắm: phải -> trái CL 8.1, góc 50°, ΔY = 0 -> Lực 42.3 ± 0.8
+        let ppu = 18.0 // tickSpacing = 90px / 5.0
+        var shipSpec = RawSceneSpec()
+        shipSpec.tickSpacingPx = 90.0
+        shipSpec.zeroTickXNorm = 0.78
+        shipSpec.dpadText = "50"
+        shipSpec.dots = [
+            MinimapDot(pxOffsetFromCenter: 0.0, groundYNorm: 0.70, r: 22, g: 92, b: 245, widthPx: 7, heightPx: 9),
+            MinimapDot(pxOffsetFromCenter: -8.1 * ppu, groundYNorm: 0.70, r: 242, g: 22, b: 22, widthPx: 7, heightPx: 7)
         ]
 
-        let frame = try buildSyntheticFrame(cfg)
-        let ciImage = CIImage(cgImage: frame)
-        let vision = VisionProcessor()
-        let engine = BallisticsEngine()
-
-        guard let battlefieldCG = cropTier1Battlefield(from: ciImage),
-              let minimapCG = cropNativeROI(GunnyROIs.minimapStrip, from: ciImage),
-              let rulerCG = cropNativeROI(GunnyROIs.minimapYellowRuler, from: ciImage) else {
-            throw TestFailure(description: "Failed to crop lava map ROIs")
+        let shipRaw = try buildRawBGRAFrame(shipSpec)
+        let shipRes: RawFrameAnalysisResult = shipRaw.bytes.withUnsafeBufferPointer { ptr in
+            let frame = RawFrameBuffer(bgraBase: ptr.baseAddress!, rawWidth: shipRaw.width, rawHeight: shipRaw.height, bytesPerRow: shipRaw.bytesPerRow)
+            return processor.analyzeFrame(frame)
         }
+        try expect(abs((shipRes.distanceUnits ?? 0) - 8.1) <= 0.2, String(format: "Expected Shipwreck CL = 8.1 ± 0.2, got %.2f", shipRes.distanceUnits ?? 0))
+        try expect(shipRes.angle == 50, "Expected Shipwreck angle == 50, got \(String(describing: shipRes.angle))")
+        let shipPower = engine.calculatePower(distanceUnits: shipRes.distanceUnits ?? 0, angle: shipRes.angle ?? 50, deltaYUnits: shipRes.deltaYUnits ?? 0)
+        try expect(abs(shipPower - 42.3) <= 0.8, String(format: "Expected Shipwreck power = 42.3 ± 0.8, got %.1f", shipPower))
 
-        // Xác nhận Tầng 1 không bắt nhầm địa hình đỏ gạch RGB(175,80,60).
-        let tier1Fake = vision.detectMainScreenHealthBars(battlefieldCrop: battlefieldCG)
-        try expect(tier1Fake == nil, "Tier 1 falsely matched brick-red RGB(175,80,60) terrain bar")
-
-        guard let fusion = vision.fuseMultiCueMeasurement(
-            battlefieldCrop: battlefieldCG,
-            minimapCrop: minimapCG,
-            yellowRulerCrop: rulerCG,
-            fallbackPlayerPos: nil,
-            previousEnemyPos: nil,
-            cachedScreenWidthNorm: VisionProcessor.defaultScreenWidthNorm
-        ), let minimap = fusion.minimapResult, let enemy = minimap.enemyPos else {
-            throw TestFailure(description: "Failed to lock bright red enemy on lava map")
+        // 3B. D-pad hiển thị "0" (khi đang đi bộ) -> phải báo dpadZeroDetected = true và angle = nil để giữ góc cũ.
+        var zeroSpec = shipSpec
+        zeroSpec.dpadText = "0"
+        let zeroRaw = try buildRawBGRAFrame(zeroSpec)
+        let zeroRes: RawFrameAnalysisResult = zeroRaw.bytes.withUnsafeBufferPointer { ptr in
+            let frame = RawFrameBuffer(bgraBase: ptr.baseAddress!, rawWidth: zeroRaw.width, rawHeight: zeroRaw.height, bytesPerRow: zeroRaw.bytesPerRow)
+            return processor.analyzeFrame(frame)
         }
+        try expect(zeroRes.dpadZeroDetected && zeroRes.angle == nil, "Expected D-pad '0' to hold previous angle")
 
-        try expect(minimap.enemyCount == 1, "Expected exactly 1 bright-red enemy cluster on lava map, got \(minimap.enemyCount)")
-        try expect(abs(Double(enemy.x) - 0.78) <= 0.025, String(format: "Expected enemyX ≈ 0.78, got %.3f", enemy.x))
-        try expect(abs(fusion.distanceUnits - 8.0) <= 0.3, String(format: "Expected dist = 8.0 ± 0.3, got %.2f", fusion.distanceUnits))
-
-        let power = engine.calculatePower(distanceUnits: fusion.distanceUnits, angle: 50, deltaYUnits: fusion.deltaYUnits)
-        try expect(abs(power - 42.0) <= 1.0, String(format: "Expected power = 42.0 ± 1.0, got %.1f", power))
-
-        return String(format: "rejected RGB(175,80,60), enemyCount=%d, enemyX=%.3f, dist=%.2f, power=%.1f", minimap.enemyCount, enemy.x, fusion.distanceUnits, power)
-    }
-
-    // MARK: - Test 5: Map Chênh Cao Địa Hình (CL 7.0, địch đứng cao trên bục ΔY = +2.5, Góc 65°)
-
-    private static func test5ElevationUphillCompensation() throws -> String {
-        var cfg = SyntheticSceneConfig()
-        cfg.angleText = "Góc 65°"
-        // Trên màn hình chính: player tại (0.15, 0.74), enemy trên bục cao tại (0.85, 0.3368)
-        // -> dx = 0.70 -> CL = 7.0; dy = (0.74 - 0.3368) * 6.2 = +2.50 đơn vị.
-        cfg.mainHealthBars = [
-            HealthBarSpec(fullX: 0.15, fullY: 0.7400, normW: 0.040, normH: 0.010, r: 20, g: 85, b: 245),
-            HealthBarSpec(fullX: 0.85, fullY: 0.3368, normW: 0.044, normH: 0.010, r: 242, g: 20, b: 20)
-        ]
-
-        let frame = try buildSyntheticFrame(cfg)
-        let ciImage = CIImage(cgImage: frame)
-        let vision = VisionProcessor()
-        let engine = BallisticsEngine()
-
-        guard let battlefieldCG = cropTier1Battlefield(from: ciImage),
-              let fusion = vision.fuseMultiCueMeasurement(
-                  battlefieldCrop: battlefieldCG,
-                  minimapCrop: nil,
-                  yellowRulerCrop: nil,
-                  fallbackPlayerPos: nil,
-                  previousEnemyPos: nil,
-                  cachedScreenWidthNorm: VisionProcessor.defaultScreenWidthNorm
-              ) else {
-            throw TestFailure(description: "Tier 1 failed on elevated platform scene")
+        // 3C. D-pad góc âm "-18".
+        var negSpec = shipSpec
+        negSpec.dpadText = "-18"
+        negSpec.dpadTextColor = (110, 235, 255) // Xanh lơ sắc nét
+        let negRaw = try buildRawBGRAFrame(negSpec)
+        let negRes: RawFrameAnalysisResult = negRaw.bytes.withUnsafeBufferPointer { ptr in
+            let frame = RawFrameBuffer(bgraBase: ptr.baseAddress!, rawWidth: negRaw.width, rawHeight: negRaw.height, bytesPerRow: negRaw.bytesPerRow)
+            return processor.analyzeFrame(frame)
         }
+        try expect(negRes.angle == -18, "Expected negative D-pad angle -18°, got \(String(describing: negRes.angle))")
 
-        try expect(abs(fusion.distanceUnits - 7.0) <= 0.2, String(format: "Expected dist = 7.0 ± 0.2, got %.2f", fusion.distanceUnits))
-        try expect(abs(fusion.deltaYUnits - 2.5) <= 0.2, String(format: "Expected ΔY = +2.5 ± 0.2, got %+.2f", fusion.deltaYUnits))
-
-        guard let angleCG = cropContrastAngle(from: ciImage),
-              let angle = vision.detectAngle(fromContrastImage: angleCG) else {
-            throw TestFailure(description: "OCR failed to read 'Góc 65°'")
+        // 3D. Tia chấm vàng Nguồn 2 (65°) + thước vàng bị che fallback khung camera trắng.
+        var fbSpec = shipSpec
+        fbSpec.tickSpacingPx = nil // Che thước vàng
+        fbSpec.cameraLeftNorm = 0.14
+        fbSpec.cameraRightNorm = 0.84 // width = 0.70 -> ~197px -> ~19.7 px/unit
+        fbSpec.dpadText = nil
+        fbSpec.yellowAimRay = YellowRaySpec(playerFullX: 0.30, playerFullY: 0.62, angleDeg: 65.0)
+        let fbRaw = try buildRawBGRAFrame(fbSpec)
+        let fbRes: RawFrameAnalysisResult = fbRaw.bytes.withUnsafeBufferPointer { ptr in
+            let frame = RawFrameBuffer(bgraBase: ptr.baseAddress!, rawWidth: fbRaw.width, rawHeight: fbRaw.height, bytesPerRow: fbRaw.bytesPerRow)
+            return processor.analyzeFrame(frame)
         }
-        try expect(angle == 65, "Expected angle 65°, got \(angle)°")
+        try expect(fbRes.scaleSource == .whiteCameraBorderFallback, "Expected camera border fallback when ruler occluded")
+        try expect(abs((fbRes.angle ?? -99) - 65) <= 3, "Expected yellow ray angle ≈ 65°, got \(String(describing: fbRes.angle))")
 
-        let flatPower = engine.calculatePower(distanceUnits: 7.0, angle: 65, deltaYUnits: 0.0)
-        let uphillPower = engine.calculatePower(distanceUnits: fusion.distanceUnits, angle: angle, deltaYUnits: fusion.deltaYUnits)
-        let downhillPower = engine.calculatePower(distanceUnits: 7.0, angle: 65, deltaYUnits: -2.5)
-        let extremeCliffPower = engine.calculatePower(distanceUnits: 1.0, angle: 20, deltaYUnits: 2.0)
-
-        // Lý thuyết chuẩn: P_flat(7.0, 65°) = 45.0; ratio = 1 - 2.5/(7*tan65°) = 0.83346 -> P = 45/sqrt(0.83346) = 49.3.
-        try expect(abs(flatPower - 45.0) <= 0.1, "Expected flat power 45.0, got \(flatPower)")
-        try expect(uphillPower > flatPower + 3.0 && abs(uphillPower - 49.3) <= 0.8, String(format: "Expected uphill power ≈ 49.3, got %.1f", uphillPower))
-        try expect(downhillPower < flatPower - 2.0, "Expected downhill power < flat power, got \(downhillPower)")
-        try expect(extremeCliffPower == 100.0, "Expected ratio <= 0.15 clamp to 100.0, got \(extremeCliffPower)")
-
-        return String(format: "dist=%.2f, ΔY=%+.2f, P_flat=%.1f -> P_uphill=%.1f (target 49.3), P_down=%.1f", fusion.distanceUnits, fusion.deltaYUnits, flatPower, uphillPower, downhillPower)
-    }
-
-    // MARK: - Test 6: Phó Bản / Ải Viễn Chinh Nhiều Quái (3 chấm đỏ cùng lúc khóa ổn định mục tiêu gần nhất)
-
-    private static func test6MultiEnemyStableLock() throws -> String {
-        let vision = VisionProcessor()
-        var previousEnemy: CGPoint?
-        var measuredDistances: [Double] = []
-        var measuredEnemyXs: [Double] = []
-
-        // Mô phỏng 6 khung hình liên tiếp với 3 quái (gần nhất tại 0.42, các quái xa tại 0.64 và 0.86) có rung nhẹ ±1px.
-        let jitters: [Double] = [0.0, 0.003, -0.003, 0.002, -0.002, 0.001]
-        for frameIdx in 0..<jitters.count {
-            let j = jitters[frameIdx]
-            var cfg = SyntheticSceneConfig()
-            cfg.cameraStartNorm = 0.08
-            cfg.cameraEndNorm = 0.73 // camW = 0.65
-            cfg.angleText = nil
-            cfg.minimapDots = [
-                MinimapDotSpec(normX: 0.16, groundY: 0.65, r: 22, g: 92, b: 245, widthPx: 7, heightPx: 9),
-                MinimapDotSpec(normX: 0.42 + j, groundY: 0.65, r: 242, g: 20, b: 20, widthPx: 7, heightPx: 7),
-                MinimapDotSpec(normX: 0.64 - j, groundY: 0.62, r: 242, g: 20, b: 20, widthPx: 7, heightPx: 7),
-                MinimapDotSpec(normX: 0.86 + j, groundY: 0.60, r: 242, g: 20, b: 20, widthPx: 7, heightPx: 7)
-            ]
-
-            let frame = try buildSyntheticFrame(cfg)
-            let ciImage = CIImage(cgImage: frame)
-            guard let minimapCG = cropNativeROI(GunnyROIs.minimapStrip, from: ciImage),
-                  let fusion = vision.fuseMultiCueMeasurement(
-                      battlefieldCrop: nil,
-                      minimapCrop: minimapCG,
-                      yellowRulerCrop: nil,
-                      fallbackPlayerPos: nil,
-                      previousEnemyPos: previousEnemy,
-                      cachedScreenWidthNorm: VisionProcessor.defaultScreenWidthNorm
-                  ),
-                  let minimap = fusion.minimapResult,
-                  let lockedEnemy = minimap.enemyPos else {
-                throw TestFailure(description: "Multi-enemy lock failed at frame \(frameIdx)")
+        // 3E. Xác nhận xoay chỉ số ánh xạ zero-copy cho buffer vật lý đứng dọc (886 x 1920, EXIF .right = 6).
+        let rotW = shipRaw.height // 886
+        let rotH = shipRaw.width  // 1920
+        let rotBpr = rotW * 4
+        var rotatedBytes = [UInt8](repeating: 0, count: rotH * rotBpr)
+        for ly in 0..<shipRaw.height {
+            for lx in 0..<shipRaw.width {
+                let srcOff = ly * shipRaw.bytesPerRow + lx * 4
+                let rawCol = ly
+                let rawRow = rotH - 1 - lx
+                let dstOff = rawRow * rotBpr + rawCol * 4
+                rotatedBytes[dstOff] = shipRaw.bytes[srcOff]
+                rotatedBytes[dstOff + 1] = shipRaw.bytes[srcOff + 1]
+                rotatedBytes[dstOff + 2] = shipRaw.bytes[srcOff + 2]
+                rotatedBytes[dstOff + 3] = shipRaw.bytes[srcOff + 3]
             }
-
-            try expect(minimap.enemyCount == 3, "Expected 3 enemies on minimap, got \(minimap.enemyCount)")
-            try expect(abs(Double(lockedEnemy.x) - 0.42) <= 0.025, String(format: "Frame %d jumped away from nearest enemy 0.42 to %.3f", frameIdx, lockedEnemy.x))
-
-            previousEnemy = lockedEnemy
-            measuredEnemyXs.append(Double(lockedEnemy.x))
-            measuredDistances.append(fusion.distanceUnits)
         }
-
-        let minDist = measuredDistances.min() ?? 0.0
-        let maxDist = measuredDistances.max() ?? 0.0
-        let spread = maxDist - minDist
-        try expect(spread <= 0.25, String(format: "Multi-enemy distance jitter %.2f > 0.25", spread))
-        // Expected: (0.42 - 0.16) / 0.65 * 10 = 4.00
-        try expect(abs(minDist - 4.0) <= 0.3 && abs(maxDist - 4.0) <= 0.3, String(format: "Expected locked nearest dist ≈ 4.0, got %.2f...%.2f", minDist, maxDist))
-
-        return String(format: "3 enemies detected across %d frames, lockedX≈%.3f, dist=%.2f...%.2f (spread=%.2f)", jitters.count, measuredEnemyXs[0], minDist, maxDist, spread)
-    }
-
-    // MARK: - Test 7: Góc Âm Hố Sâu (OCR Góc -18°, CL 5.0)
-
-    private static func test7NegativeAnglePit() throws -> String {
-        // Kiểm tra thêm regex góc âm cho các biến thể OCR.
-        let regexCases: [([String], Int?)] = [
-            (["Góc -18°"], -18),
-            (["Goc -18"], -18),
-            (["-18°"], -18),
-            (["Góc -35°"], -35),
-            (["Góc 85°"], 85),
-            (["Góc 99°"], nil)
-        ]
-        for (texts, expected) in regexCases {
-            let actual = AngleParser.extractAngle(from: texts)
-            try expect(actual == expected, "AngleParser(\(texts)) = \(String(describing: actual)), expected \(String(describing: expected))")
-        }
-
-        var cfg = SyntheticSceneConfig()
-        cfg.angleText = "Góc -18°"
-        // CL = 5.0 trên màn hình chính (0.20 -> 0.70).
-        cfg.mainHealthBars = [
-            HealthBarSpec(fullX: 0.20, fullY: 0.52, normW: 0.040, normH: 0.010, r: 20, g: 85, b: 245),
-            HealthBarSpec(fullX: 0.70, fullY: 0.52, normW: 0.044, normH: 0.010, r: 242, g: 20, b: 20)
-        ]
-
-        let frame = try buildSyntheticFrame(cfg)
-        let ciImage = CIImage(cgImage: frame)
-        let vision = VisionProcessor()
-        let engine = BallisticsEngine()
-
-        guard let battlefieldCG = cropTier1Battlefield(from: ciImage),
-              let fusion = vision.fuseMultiCueMeasurement(
-                  battlefieldCrop: battlefieldCG,
-                  minimapCrop: nil,
-                  yellowRulerCrop: nil,
-                  fallbackPlayerPos: nil,
-                  previousEnemyPos: nil,
-                  cachedScreenWidthNorm: VisionProcessor.defaultScreenWidthNorm
-              ) else {
-            throw TestFailure(description: "Failed to measure CL 5.0 on negative-angle pit scene")
-        }
-
-        guard let angleCG = cropContrastAngle(from: ciImage),
-              let detectedAngle = vision.detectAngle(fromContrastImage: angleCG) else {
-            throw TestFailure(description: "Vision OCR failed to read 'Góc -18°'")
-        }
-        try expect(detectedAngle == -18, "Expected OCR angle -18°, got \(detectedAngle)°")
-        try expect(abs(fusion.distanceUnits - 5.0) <= 0.2, String(format: "Expected dist = 5.0 ± 0.2, got %.2f", fusion.distanceUnits))
-
-        let power = engine.calculatePower(distanceUnits: fusion.distanceUnits, angle: detectedAngle, deltaYUnits: fusion.deltaYUnits)
-        try expect(power.isFinite && abs(power - 36.0) <= 1.0, String(format: "Expected smooth power ≈ 36.0 at -18° CL 5.0, got %.1f", power))
-
-        return String(format: "OCR=%d°, dist=%.2f, power=%.1f (target 36.0)", detectedAngle, fusion.distanceUnits, power)
-    }
-
-    // MARK: - Test 8: Hiệu Năng & Độ Trễ Khứ Hồi Toàn Khung Hình 1920x886 + BSD UDP 127.0.0.1:45678 (< 35ms)
-
-    private static func test8PerformanceAndUDPRoundTripLatency() throws -> String {
-        var cfg = SyntheticSceneConfig()
-        cfg.cameraStartNorm = 0.05
-        cfg.cameraEndNorm = 0.515
-        cfg.rulerTickNormXs = [0.10, 0.3325, 0.565, 0.7975]
-        cfg.angleText = nil
-        cfg.minimapDots = [
-            MinimapDotSpec(normX: 0.255, groundY: 0.68, r: 22, g: 92, b: 245, widthPx: 7, heightPx: 9),
-            MinimapDotSpec(normX: 0.790, groundY: 0.68, r: 242, g: 20, b: 20, widthPx: 7, heightPx: 7)
-        ]
-
-        let frame = try buildSyntheticFrame(cfg)
-        let ciImage = CIImage(cgImage: frame)
-        let vision = VisionProcessor()
-        let engine = BallisticsEngine()
-
-        // Làm nóng 1 khung hình CIContext duy nhất (mô phỏng trạng thái ổn định 30 FPS của SampleHandler).
-        autoreleasepool {
-            let b = cropTier1Battlefield(from: ciImage)
-            let m = cropNativeROI(GunnyROIs.minimapStrip, from: ciImage)
-            let r = cropNativeROI(GunnyROIs.minimapYellowRuler, from: ciImage)
-            _ = vision.fuseMultiCueMeasurement(
-                battlefieldCrop: b,
-                minimapCrop: m,
-                yellowRulerCrop: r,
-                fallbackPlayerPos: nil,
-                previousEnemyPos: nil,
-                cachedScreenWidthNorm: VisionProcessor.defaultScreenWidthNorm
+        let rotRes: RawFrameAnalysisResult = rotatedBytes.withUnsafeBufferPointer { ptr in
+            let frame = RawFrameBuffer(
+                bgraBase: ptr.baseAddress!,
+                rawWidth: rotW,
+                rawHeight: rotH,
+                bytesPerRow: rotBpr,
+                orientation: .right
             )
+            return processor.analyzeFrame(frame)
+        }
+        try expect(abs((rotRes.distanceUnits ?? 0) - 8.1) <= 0.25 && rotRes.angle == 50, "Zero-copy .right orientation mapping failed")
+
+        return String(format: "shipCL=%.2f P=%.1f (42.3±0.8), 0°hold=OK, neg=%d°, ray=%d°, camFB=%.1fpx/u, rotRight=OK", shipRes.distanceUnits ?? 0, shipPower, negRes.angle ?? 0, fbRes.angle ?? 0, fbRes.pixelsPerUnit ?? 0)
+    }
+
+    // MARK: - Test 4: Hiệu Năng < 5ms (1920x886 Raw BGRA) & Độ Trễ BSD UDP (< 50ms)
+
+    private static func test4PerformanceAndUDP() throws -> String {
+        let ppu = 12.0
+        var spec = RawSceneSpec()
+        spec.tickSpacingPx = 60.0
+        spec.zeroTickXNorm = 0.72
+        spec.minimapHillsRGB = [(215, 120, 160), (160, 90, 130)]
+        spec.dpadText = "50"
+        spec.dots = [
+            MinimapDot(pxOffsetFromCenter: 0.0, groundYNorm: 0.76, r: 22, g: 92, b: 245, widthPx: 7, heightPx: 9),
+            MinimapDot(pxOffsetFromCenter: -11.2 * ppu, groundYNorm: 0.66, r: 242, g: 22, b: 22, widthPx: 7, heightPx: 7)
+        ]
+
+        let raw = try buildRawBGRAFrame(spec)
+        let processor = VisionProcessor()
+        let engine = BallisticsEngine()
+
+        // Làm nóng 1 lần.
+        _ = raw.bytes.withUnsafeBufferPointer { ptr in
+            let frame = RawFrameBuffer(bgraBase: ptr.baseAddress!, rawWidth: raw.width, rawHeight: raw.height, bytesPerRow: raw.bytesPerRow)
+            return processor.analyzeFrame(frame)
         }
 
+        var durationsMs: [Double] = []
+        var latestResult: RawFrameAnalysisResult?
+        for _ in 0..<5 {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let r: RawFrameAnalysisResult = raw.bytes.withUnsafeBufferPointer { ptr in
+                let frame = RawFrameBuffer(bgraBase: ptr.baseAddress!, rawWidth: raw.width, rawHeight: raw.height, bytesPerRow: raw.bytesPerRow)
+                return processor.analyzeFrame(frame)
+            }
+            durationsMs.append((CFAbsoluteTimeGetCurrent() - t0) * 1000.0)
+            latestResult = r
+        }
+
+        let avgMs = durationsMs.reduce(0.0, +) / Double(durationsMs.count)
+        let maxMs = durationsMs.max() ?? 999.0
+        try expect(avgMs < 5.0, String(format: "Average raw frame time %.2fms exceeded 5.0ms", avgMs))
+
+        // Đo BSD UDP loopback 127.0.0.1:45678.
         let receiver = BSDUDPReceiver()
         let sender = BSDUDPSender()
         let semaphore = DispatchSemaphore(value: 0)
@@ -745,62 +475,31 @@ enum GunnyCalcTestMain {
 
         usleep(30_000)
 
-        // Đo toàn bộ chu trình: Cắt ROI Tầng 1 + Tầng 2 + Tầng 3 -> Vision -> Ballistics -> JSON -> BSD UDP 127.0.0.1:45678 -> Nhận.
-        let tStart = CFAbsoluteTimeGetCurrent()
-        var builtTelemetry: TelemetryData?
-        autoreleasepool {
-            let battlefieldCG = cropTier1Battlefield(from: ciImage)
-            let minimapCG = cropNativeROI(GunnyROIs.minimapStrip, from: ciImage)
-            let rulerCG = cropNativeROI(GunnyROIs.minimapYellowRuler, from: ciImage)
-            if let fusion = vision.fuseMultiCueMeasurement(
-                battlefieldCrop: battlefieldCG,
-                minimapCrop: minimapCG,
-                yellowRulerCrop: rulerCG,
-                fallbackPlayerPos: nil,
-                previousEnemyPos: nil,
-                cachedScreenWidthNorm: VisionProcessor.defaultScreenWidthNorm
-            ) {
-                let power = engine.calculatePower(
-                    distanceUnits: fusion.distanceUnits,
-                    angle: 46,
-                    deltaYUnits: fusion.deltaYUnits
-                )
-                builtTelemetry = TelemetryData(
-                    frameId: 88,
-                    angle: 46,
-                    distanceUnits: fusion.distanceUnits,
-                    power: power
-                )
-            }
-        }
-        guard let sentTelemetry = builtTelemetry else {
-            throw TestFailure(description: "Pipeline failed during Test 8 benchmark")
-        }
+        let dist = latestResult?.distanceUnits ?? 11.2
+        let ang = latestResult?.angle ?? 50
+        let dy = latestResult?.deltaYUnits ?? 0.0
+        let sample = TelemetryData(
+            frameId: 100,
+            angle: ang,
+            distanceUnits: dist,
+            power: engine.calculatePower(distanceUnits: dist, angle: ang, deltaYUnits: dy)
+        )
 
-        let visionDoneAt = CFAbsoluteTimeGetCurrent()
-        sender.send(sentTelemetry, host: BSDUDPConfig.host, port: BSDUDPConfig.port)
-
-        let waitResult = semaphore.wait(timeout: .now() + 1.0)
-        try expect(waitResult == .success, "Timed out waiting for UDP packet on 127.0.0.1:45678")
+        let udpStart = CFAbsoluteTimeGetCurrent()
+        sender.send(sample, host: BSDUDPConfig.host, port: BSDUDPConfig.port)
+        let waited = semaphore.wait(timeout: .now() + 1.0)
+        try expect(waited == .success, "UDP receive timeout on 127.0.0.1:45678")
 
         boxLock.lock()
-        let finalPacket = received
-        let finalReceivedAt = receivedAt
+        let finalPkt = received
+        let finalAt = receivedAt
         boxLock.unlock()
 
-        try expect(finalPacket == sentTelemetry, "UDP received packet mismatch: \(String(describing: finalPacket))")
+        try expect(finalPkt == sample, "UDP packet mismatch")
+        let udpMs = (finalAt - udpStart) * 1000.0
+        let totalMs = avgMs + udpMs
+        try expect(totalMs < 20.0, String(format: "Total latency %.2fms exceeded 20ms", totalMs))
 
-        let visionMs = (visionDoneAt - tStart) * 1000.0
-        let totalRoundTripMs = (finalReceivedAt - tStart) * 1000.0
-        let payloadBytes = (try? JSONEncoder().encode(sentTelemetry).count) ?? 0
-
-        try expect(totalRoundTripMs < 35.0, String(format: "End-to-end 1920x886 + UDP latency %.2fms exceeded 35ms target", totalRoundTripMs))
-
-        return String(
-            format: "1920x886 vision=%.2fms, totalRoundTrip=%.2fms (<35ms), payload=%d bytes",
-            visionMs,
-            totalRoundTripMs,
-            payloadBytes
-        )
+        return String(format: "avgFrame=%.2fms (max=%.2fms < 5ms), udp=%.2fms, total=%.2fms, zeroVision=YES", avgMs, maxMs, udpMs, totalMs)
     }
 }

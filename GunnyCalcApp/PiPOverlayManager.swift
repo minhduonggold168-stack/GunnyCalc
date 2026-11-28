@@ -58,13 +58,15 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     private var packetTimestamps: [TimeInterval] = []
     private var statsMonitorTimer: Timer?
     private var silentAudioPlayer: AVAudioPlayer?
+    private var isStreamAlive = false
+    private var ledPulseBright = false
 
     private let udpReceiver = BSDUDPReceiver()
     private var isUDPStarted = false
 
     private let renderSize = CGSize(width: 420, height: 64)
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
-    private let liveTimeoutSeconds: TimeInterval = 1.5
+    private let liveTimeoutSeconds: TimeInterval = 0.50
 
     private override init() {
         super.init()
@@ -128,6 +130,8 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     private func handleIncomingTelemetry(_ telemetry: TelemetryData) {
         let now = Date().timeIntervalSince1970
         lastPacketReceivedAt = now
+        isStreamAlive = true
+        ledPulseBright.toggle()
 
         packetTimestamps.append(now)
         packetTimestamps.removeAll { (now - $0) > 1.0 }
@@ -140,18 +144,22 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         }
 
         currentTelemetry = telemetry
-        // Đẩy CMSampleBuffer mới ngay lập tức trong callback nhận UDP (không qua timer trễ).
+        // Đẩy CMSampleBuffer mới ngay lập tức trong callback nhận UDP (< 0.05s).
         enqueueHUDFrame(for: telemetry)
     }
 
     private func startStatsMonitor() {
         statsMonitorTimer?.invalidate()
-        statsMonitorTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        statsMonitorTimer = Timer.scheduledTimer(withTimeInterval: 0.20, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let now = Date().timeIntervalSince1970
                 self.packetTimestamps.removeAll { (now - $0) > 1.0 }
                 let liveNow = self.lastPacketReceivedAt > 0 && (now - self.lastPacketReceivedAt) <= self.liveTimeoutSeconds
+                if liveNow != self.isStreamAlive {
+                    self.isStreamAlive = liveNow
+                    self.enqueueHUDFrame(for: self.currentTelemetry)
+                }
                 if !liveNow && (self.isReceivingLiveStream || self.liveFPS != 0) {
                     self.isReceivingLiveStream = false
                     self.liveFPS = 0
@@ -357,15 +365,37 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             in: CGRect(x: 6, y: 0, width: dividerX - 12, height: topHeight)
         )
 
-        // Phải: CL [distanceUnits]  |  LỰC: [power] (xanh neon #00FF88 24pt đậm)
+        // Phải: CL [distanceUnits]  |  LỰC: [power] (xanh neon #00FF88 24pt đậm), chừa khoảng cho đèn báo góc trên phải.
         let rightMetric = String(format: "CL %.1f  |  LỰC: %.1f", telemetry.distanceUnits, telemetry.power)
         drawFittedMetric(
             text: rightMetric,
             color: neonGreen,
             baseSize: 24.0,
             minSize: 15.0,
-            in: CGRect(x: dividerX + 6, y: 0, width: rect.width - dividerX - 12, height: topHeight)
+            in: CGRect(x: dividerX + 6, y: 0, width: rect.width - dividerX - 24, height: topHeight)
         )
+
+        // Chấm tròn 8px ở góc trên phải báo trạng thái luồng đọc từ BroadcastExtension (xanh nhấp nháy <-> đỏ nếu > 0.5s).
+        let ledRect = CGRect(x: rect.width - 14.0, y: 6.0, width: 8.0, height: 8.0)
+        if isStreamAlive {
+            let glowColor = ledPulseBright
+                ? UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 0.40)
+                : UIColor(red: 0.0, green: 0.72, blue: 0.38, alpha: 0.15)
+            glowColor.setFill()
+            UIBezierPath(ovalIn: ledRect.insetBy(dx: -2.0, dy: -2.0)).fill()
+
+            let coreColor = ledPulseBright
+                ? neonGreen
+                : UIColor(red: 0.0, green: 0.72, blue: 0.38, alpha: 1.0)
+            coreColor.setFill()
+            UIBezierPath(ovalIn: ledRect).fill()
+        } else {
+            UIColor(red: 1.0, green: 0.18, blue: 0.18, alpha: 0.32).setFill()
+            UIBezierPath(ovalIn: ledRect.insetBy(dx: -1.5, dy: -1.5)).fill()
+
+            UIColor(red: 1.0, green: 0.18, blue: 0.18, alpha: 1.0).setFill()
+            UIBezierPath(ovalIn: ledRect).fill()
+        }
 
         // Đường ngăn ngang giữa phần trên (44px) và thanh thước lực (20px).
         let horizontalSep = UIBezierPath()
