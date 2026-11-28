@@ -345,6 +345,43 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         outerPath.lineWidth = 1.3
         outerPath.stroke()
 
+        // Đèn trạng thái luồng đọc góc trên phải (8px xanh nhấp nháy <-> đỏ nếu > 0.5s không nhận gói tin).
+        let ledRect = CGRect(x: rect.width - 14.0, y: 6.0, width: 8.0, height: 8.0)
+        func drawStatusLED() {
+            if isStreamAlive {
+                let glowColor = ledPulseBright
+                    ? UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 0.40)
+                    : UIColor(red: 0.0, green: 0.72, blue: 0.38, alpha: 0.15)
+                glowColor.setFill()
+                UIBezierPath(ovalIn: ledRect.insetBy(dx: -2.0, dy: -2.0)).fill()
+
+                let coreColor = ledPulseBright
+                    ? neonGreen
+                    : UIColor(red: 0.0, green: 0.72, blue: 0.38, alpha: 1.0)
+                coreColor.setFill()
+                UIBezierPath(ovalIn: ledRect).fill()
+            } else {
+                UIColor(red: 1.0, green: 0.18, blue: 0.18, alpha: 0.32).setFill()
+                UIBezierPath(ovalIn: ledRect.insetBy(dx: -1.5, dy: -1.5)).fill()
+
+                UIColor(red: 1.0, green: 0.18, blue: 0.18, alpha: 1.0).setFill()
+                UIBezierPath(ovalIn: ledRect).fill()
+            }
+        }
+
+        // Khi chưa phát hiện nút [X] vào trận -> hiển thị tĩnh "CHỜ VÀO TRẬN GUNNY MOBI".
+        guard telemetry.isInBattle else {
+            drawFittedMetric(
+                text: "CHỜ VÀO TRẬN GUNNY MOBI",
+                color: neonGreen,
+                baseSize: 16.5,
+                minSize: 12.0,
+                in: CGRect(x: 16, y: 0, width: rect.width - 36, height: rect.height)
+            )
+            drawStatusLED()
+            return
+        }
+
         // MARK: Phần trên (44px): Trái `GÓC: [angle]°` | Phải `CL [distanceUnits]  |  LỰC: [power]`
         let topHeight: CGFloat = 44.0
         let dividerX: CGFloat = 148.0
@@ -375,27 +412,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             in: CGRect(x: dividerX + 6, y: 0, width: rect.width - dividerX - 24, height: topHeight)
         )
 
-        // Chấm tròn 8px ở góc trên phải báo trạng thái luồng đọc từ BroadcastExtension (xanh nhấp nháy <-> đỏ nếu > 0.5s).
-        let ledRect = CGRect(x: rect.width - 14.0, y: 6.0, width: 8.0, height: 8.0)
-        if isStreamAlive {
-            let glowColor = ledPulseBright
-                ? UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 0.40)
-                : UIColor(red: 0.0, green: 0.72, blue: 0.38, alpha: 0.15)
-            glowColor.setFill()
-            UIBezierPath(ovalIn: ledRect.insetBy(dx: -2.0, dy: -2.0)).fill()
-
-            let coreColor = ledPulseBright
-                ? neonGreen
-                : UIColor(red: 0.0, green: 0.72, blue: 0.38, alpha: 1.0)
-            coreColor.setFill()
-            UIBezierPath(ovalIn: ledRect).fill()
-        } else {
-            UIColor(red: 1.0, green: 0.18, blue: 0.18, alpha: 0.32).setFill()
-            UIBezierPath(ovalIn: ledRect.insetBy(dx: -1.5, dy: -1.5)).fill()
-
-            UIColor(red: 1.0, green: 0.18, blue: 0.18, alpha: 1.0).setFill()
-            UIBezierPath(ovalIn: ledRect).fill()
-        }
+        drawStatusLED()
 
         // Đường ngăn ngang giữa phần trên (44px) và thanh thước lực (20px).
         let horizontalSep = UIBezierPath()

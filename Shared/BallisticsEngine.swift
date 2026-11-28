@@ -88,8 +88,7 @@ public struct BallisticsEngine: Sendable {
         let finalPower: Double
         if safeAngle > 10.0 {
             let tanAngle = tan(safeAngle * .pi / 180.0)
-            let projectedDeltaY = safeDeltaY * 0.60
-            let ratio = 1.0 - (projectedDeltaY / (max(d, 0.5) * tanAngle))
+            let ratio = 1.0 - (safeDeltaY / (max(d, 0.5) * tanAngle))
             if ratio > 0.15 {
                 finalPower = basePower / sqrt(ratio)
             } else {

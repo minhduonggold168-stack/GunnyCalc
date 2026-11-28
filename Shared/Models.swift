@@ -11,32 +11,43 @@ public func ciRectFromTopLeft(normRect: CGRect, imageWidth: CGFloat, imageHeight
     return CGRect(x: x, y: y, width: w, height: h).integral
 }
 
-/// Các vùng quét cố định (tọa độ chuẩn hóa Top-Left `0.0 - 1.0`) cho kiến trúc Zero-Crash đọc trực tiếp bộ nhớ BGRA thô.
+/// Các vùng quét cố định (tọa độ chuẩn hóa Top-Left `0.0 - 1.0`) cho kiến trúc 3 tầng (< 12 MB RAM).
 public enum GunnyROIs {
-    /// Nguồn 1 góc bắn: Tâm phím D-pad nền tròn tối hiển thị số góc `-35° ... 85°`.
-    public static let dpadAngle = CGRect(x: 0.082, y: 0.745, width: 0.063, height: 0.110)
-    /// Nguồn 2 góc bắn: Vùng chiến trường tìm thanh máu xanh và tia chấm vàng chỉ hướng bắn.
-    public static let yellowAimRay = CGRect(x: 0.150, y: 0.150, width: 0.650, height: 0.600)
-    /// Bước 1 cự ly: Dải thước vàng dưới đáy Minimap (đo bước vạch tối 5.0 đơn vị -> `pixelsPerUnit`).
-    public static let minimapYellowRuler = CGRect(x: 0.848, y: 0.147, width: 0.147, height: 0.016)
-    /// Bước 2 cự ly: Vùng Minimap tìm người chơi xanh, mục tiêu đỏ tươi và khung camera trắng dự phòng.
-    public static let minimapStrip = CGRect(x: 0.848, y: 0.042, width: 0.147, height: 0.105)
+    /// Tâm nút đóng màu đỏ `[X]` góc trên phải màn hình trận đấu (`normX: 0.955, normY: 0.025`).
+    public static let redCloseButtonCenter = CGPoint(x: 0.955, y: 0.025)
+    /// Tầng 1 & định vị thanh máu xanh người chơi: vùng chiến trường chính (`normX: 0.10...0.86, normY: 0.20...0.82`).
+    public static let mainBattlefield = CGRect(x: 0.100, y: 0.200, width: 0.760, height: 0.620)
+    /// Vùng cắt góc bắn mặc định khi chưa phát hiện thanh máu xanh (`normX: 0.12...0.65, normY: 0.18...0.56`).
+    public static let defaultAngleFallback = CGRect(x: 0.120, y: 0.180, width: 0.530, height: 0.380)
+    /// Tầng 2: vùng Minimap tìm chấm xanh người chơi, chấm đỏ mục tiêu và khung camera sáng (`normX: 0.848...0.996, normY: 0.042...0.147`).
+    public static let minimapStrip = CGRect(x: 0.848, y: 0.042, width: 0.148, height: 0.105)
 }
 
-/// Gói dữ liệu siêu nhẹ truyền thời gian thực 30 FPS qua BSD UDP (`127.0.0.1:45678`).
+/// Gói dữ liệu siêu nhẹ (< 64 bytes JSON) truyền tức thời qua BSD UDP (`127.0.0.1:45678`).
 public struct TelemetryData: Codable, Equatable, Sendable {
     public var frameId: Int
+    public var isInBattle: Bool
     public var angle: Int
     public var distanceUnits: Double
     public var power: Double
 
+    enum CodingKeys: String, CodingKey {
+        case frameId = "f"
+        case isInBattle = "b"
+        case angle = "a"
+        case distanceUnits = "d"
+        case power = "p"
+    }
+
     public init(
         frameId: Int = 0,
+        isInBattle: Bool = false,
         angle: Int = 50,
         distanceUnits: Double = 10.0,
         power: Double = 48.0
     ) {
         self.frameId = max(frameId, 0)
+        self.isInBattle = isInBattle
         self.angle = min(max(angle, -35), 85)
         let clampedDist = distanceUnits.isFinite ? max(distanceUnits, 0.0) : 10.0
         self.distanceUnits = (clampedDist * 10.0).rounded() / 10.0
@@ -46,6 +57,7 @@ public struct TelemetryData: Codable, Equatable, Sendable {
 
     public static let initialLive = TelemetryData(
         frameId: 0,
+        isInBattle: false,
         angle: 50,
         distanceUnits: 10.0,
         power: 48.0
