@@ -18,20 +18,6 @@ public struct NormalizedRect: Codable, Equatable, Sendable {
         self.height = min(Self.clamp01(height), 1.0 - clampedY)
     }
 
-    public func pixelRect(width imageWidth: Int, height imageHeight: Int) -> CGRect {
-        guard imageWidth > 0, imageHeight > 0 else { return .zero }
-        let w = Double(imageWidth)
-        let h = Double(imageHeight)
-        let raw = CGRect(
-            x: x * w,
-            y: y * h,
-            width: width * w,
-            height: height * h
-        ).integral
-        let bounds = CGRect(x: 0, y: 0, width: w, height: h)
-        return raw.intersection(bounds)
-    }
-
     /// Chuyển đổi sang tọa độ CoreImage (gốc dưới-trái) cho ảnh đã dịch về gốc `(0, 0)`.
     public func ciRect(width imageWidth: CGFloat, height imageHeight: CGFloat) -> CGRect {
         guard imageWidth > 0, imageHeight > 0 else { return .zero }
@@ -49,89 +35,28 @@ public struct NormalizedRect: Codable, Equatable, Sendable {
     }
 }
 
-/// Các vùng quét cố định độ chính xác cao cho Gunny Mobi bản không gió (tỉ lệ 0.0 - 1.0, gốc trên-trái).
+/// 2 vùng quét siêu gọn cho Gunny Mobi bản không gió (tỉ lệ 0.0 - 1.0, gốc trên-trái).
 public enum GunnyROIs {
-    public static let minimap = NormalizedRect(x: 0.846, y: 0.000, width: 0.154, height: 0.168)
+    /// Dải chiến trường ở giữa Minimap (nằm hoàn toàn dưới nút đỏ [X] và trên thước vàng).
+    public static let minimapStrip = NormalizedRect(x: 0.848, y: 0.046, width: 0.148, height: 0.096)
+    /// Vùng chữ góc bắn cạnh nhân vật.
     public static let angleBattlefield = NormalizedRect(x: 0.050, y: 0.140, width: 0.820, height: 0.560)
 }
 
-/// Gói dữ liệu chiến đấu bản không gió chạy đồng bộ 24/24 ở 25 FPS qua BSD UDP (`127.0.0.1:45678`).
+/// Gói dữ liệu siêu nhỏ (< 60 bytes JSON) truyền tức thời 30 FPS qua BSD UDP (`127.0.0.1:45678`).
 public struct TelemetryData: Codable, Equatable, Sendable {
     public var frameId: Int
-    public var isInBattle: Bool
-    public var distanceUnits: Double
-    public var deltaY: Double
-    public var angle: Double
+    public var angle: Int
     public var power: Double
-    public var holdSeconds: Double
-    public var playerNorm: CGPoint
-    public var enemyNorm: CGPoint
-    public var allEnemiesNorm: [CGPoint]
-    public var minimapJPEG: Data?
-    public var trajectoryPoints: [CGPoint]
-    public var power30: Double
-    public var power50: Double
-    public var power65: Double
 
-    public var screens: Double { distanceUnits / 10.0 }
-
-    public init(
-        frameId: Int = 0,
-        isInBattle: Bool = true,
-        distanceUnits: Double = 10.0,
-        deltaY: Double = 0.0,
-        angle: Double = 50.0,
-        power: Double = 48.0,
-        holdSeconds: Double = (48.0 / 100.0) * 2.20,
-        playerNorm: CGPoint = CGPoint(x: 0.20, y: 0.68),
-        enemyNorm: CGPoint = CGPoint(x: 0.82, y: 0.68),
-        allEnemiesNorm: [CGPoint] = [CGPoint(x: 0.82, y: 0.68)],
-        minimapJPEG: Data? = nil,
-        trajectoryPoints: [CGPoint] = [],
-        power30: Double = 47.0,
-        power50: Double = 48.0,
-        power65: Double = 56.0
-    ) {
+    public init(frameId: Int = 0, angle: Int = 50, power: Double = 48.0) {
         self.frameId = max(frameId, 0)
-        self.isInBattle = isInBattle
-        self.distanceUnits = distanceUnits.isFinite ? max(distanceUnits, 0.0) : 10.0
-        self.deltaY = deltaY.isFinite ? deltaY : 0.0
-        self.angle = angle.isFinite ? min(max(angle, -35.0), 85.0) : 50.0
-        self.power = power.isFinite ? min(max(power, 0.0), 100.0) : 0.0
-        self.holdSeconds = holdSeconds.isFinite ? max(holdSeconds, 0.0) : (self.power / 100.0) * 2.20
-        self.playerNorm = Self.clampPoint(playerNorm)
-        self.enemyNorm = Self.clampPoint(enemyNorm)
-        self.allEnemiesNorm = allEnemiesNorm.map { Self.clampPoint($0) }
-        self.minimapJPEG = minimapJPEG
-        self.trajectoryPoints = trajectoryPoints.map { Self.clampPoint($0) }
-        self.power30 = power30.isFinite ? min(max(power30, 0.0), 100.0) : 0.0
-        self.power50 = power50.isFinite ? min(max(power50, 0.0), 100.0) : 0.0
-        self.power65 = power65.isFinite ? min(max(power65, 0.0), 100.0) : 0.0
+        self.angle = min(max(angle, -35), 85)
+        let clampedPower = power.isFinite ? min(max(power, 0.0), 100.0) : 0.0
+        self.power = (clampedPower * 10.0).rounded() / 10.0
     }
 
-    public static let initialLive = TelemetryData(
-        frameId: 0,
-        isInBattle: true,
-        distanceUnits: 10.0,
-        deltaY: 0.0,
-        angle: 50.0,
-        power: 48.0,
-        holdSeconds: (48.0 / 100.0) * 2.20,
-        playerNorm: CGPoint(x: 0.20, y: 0.68),
-        enemyNorm: CGPoint(x: 0.82, y: 0.68),
-        allEnemiesNorm: [CGPoint(x: 0.82, y: 0.68)],
-        minimapJPEG: nil,
-        trajectoryPoints: [],
-        power30: 47.0,
-        power50: 48.0,
-        power65: 56.0
-    )
-
-    private static func clampPoint(_ pt: CGPoint) -> CGPoint {
-        let x = pt.x.isFinite ? min(max(pt.x, 0.0), 1.0) : 0.5
-        let y = pt.y.isFinite ? min(max(pt.y, 0.0), 1.0) : 0.5
-        return CGPoint(x: x, y: y)
-    }
+    public static let initialLive = TelemetryData(frameId: 0, angle: 50, power: 48.0)
 }
 
 // MARK: - Pure C BSD UDP Socket (127.0.0.1:45678 Loopback)
@@ -139,7 +64,6 @@ public struct TelemetryData: Codable, Equatable, Sendable {
 public enum BSDUDPConfig {
     public static let host = "127.0.0.1"
     public static let port: UInt16 = 45678
-    public static let safeDatagramLimit = 8800
 }
 
 /// Socket gửi UDP thuần POSIX (`Darwin.socket`, `sendto`) gắn vào `127.0.0.1:45678`.
@@ -155,13 +79,7 @@ public final class BSDUDPSender: @unchecked Sendable {
     }
 
     public func send(_ telemetry: TelemetryData, host: String = BSDUDPConfig.host, port: UInt16 = BSDUDPConfig.port) {
-        var encoded = try? encoder.encode(telemetry)
-        if let size = encoded?.count, size > BSDUDPConfig.safeDatagramLimit {
-            var trimmed = telemetry
-            trimmed.minimapJPEG = nil
-            encoded = try? encoder.encode(trimmed)
-        }
-        guard let payload = encoded, !payload.isEmpty else { return }
+        guard let payload = try? encoder.encode(telemetry), !payload.isEmpty else { return }
 
         lock.lock()
         defer { lock.unlock() }
@@ -171,8 +89,6 @@ public final class BSDUDPSender: @unchecked Sendable {
             guard fd >= 0 else { return }
             var noSigPipe: Int32 = 1
             _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
-            var sendBuf: Int32 = 65536
-            _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sendBuf, socklen_t(MemoryLayout<Int32>.size))
             _ = fcntl(fd, F_SETFL, O_NONBLOCK)
             socketFD = fd
         }
@@ -212,7 +128,7 @@ public final class BSDUDPSender: @unchecked Sendable {
     }
 }
 
-/// Socket nhận UDP thuần POSIX (`Darwin.socket`, `bind`, `recvfrom`) trên luồng nền ưu tiên cao.
+/// Socket nhận UDP thuần POSIX (`Darwin.socket`, `bind`, `recvfrom`) độ trễ cực thấp trên luồng `.userInteractive`.
 public final class BSDUDPReceiver: @unchecked Sendable {
     private let stateLock = NSLock()
     private let queue = DispatchQueue.global(qos: .userInteractive)
@@ -246,10 +162,7 @@ public final class BSDUDPReceiver: @unchecked Sendable {
         _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
         _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, socklen_t(MemoryLayout<Int32>.size))
 
-        var rcvBuf: Int32 = 65536
-        _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvBuf, socklen_t(MemoryLayout<Int32>.size))
-
-        var timeout = timeval(tv_sec: 0, tv_usec: 300_000)
+        var timeout = timeval(tv_sec: 0, tv_usec: 250_000)
         _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 
         var addr = sockaddr_in()
@@ -297,7 +210,7 @@ public final class BSDUDPReceiver: @unchecked Sendable {
     }
 
     private func receiveLoop(fd: Int32, onReceive: @escaping @Sendable (TelemetryData) -> Void) {
-        var buffer = [UInt8](repeating: 0, count: 65535)
+        var buffer = [UInt8](repeating: 0, count: 256)
         let decoder = JSONDecoder()
 
         while true {

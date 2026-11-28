@@ -7,38 +7,25 @@ import Foundation
 import ImageIO
 import ReplayKit
 
-/// Handler nhận khung hình thụ động từ ReplayKit chế độ 24/24 khi xoay ngang (< 25MB RAM).
-/// - Chỉ tạm nghỉ gửi khi màn hình đang dựng dọc (`width <= height`).
-/// - Ngay khi xoay ngang (`width > height`), luôn quét Minimap ở độ phân giải gốc 25 FPS (40ms) và gửi sang PiP.
-/// - Luồng OCR riêng chạy mỗi 80ms với `CIColorControls` (`contrast = 1.6`, `brightness = 0.05`) + `.accurate` bắt `Góc -35° ... 85°`.
-/// - Gửi gói JSON qua BSD UDP `127.0.0.1:45678` an toàn tuyệt đối (không `!`, không `fatalError`).
+/// Handler nhận khung hình thụ động từ ReplayKit đạt độ trễ < 0.1s (< 20MB RAM).
+/// - Tắt hoàn toàn EMA (độ trễ = 0 khung hình), chạy 30 FPS (33ms) ngay khi màn hình xoay ngang (`width > height`).
+/// - Quét dải giữa Minimap (`x: 0.848, y: 0.046, w: 0.148, h: 0.096`) theo chuẩn toàn bản đồ = `20.0` đơn vị (`abs(enemyX - playerX) * 20.0`).
+/// - Chạy OCR Grayscale `.fast` song song mỗi 50ms đọc góc nguyên `-35...85`.
+/// - Gửi gói JSON siêu nhỏ (< 60 bytes) qua BSD UDP `127.0.0.1:45678` an toàn tuyệt đối (không `!`, không `fatalError`).
 final class SampleHandler: RPBroadcastSampleHandler {
-    private struct LiveSnapshot {
-        let playerNorm: CGPoint
-        let enemyNorm: CGPoint
-        let allEnemiesNorm: [CGPoint]
-        let cameraWidthNorm: Double
-        let minimapAspectHOverW: Double
-        let angle: Double
-        let minimapJPEG: Data?
-        let hasLiveEnemy: Bool
-        let fallbackDistanceUnits: Double
-        let fallbackDeltaY: Double
-    }
-
     private let sharedCIContext = CIContext(options: [
         .useSoftwareRenderer: false,
         .cacheIntermediates: false
     ])
+    private let grayColorSpace = CGColorSpaceCreateDeviceGray()
     private let visionProcessor = VisionProcessor()
     private let ballisticsEngine = BallisticsEngine()
-    private let emaSmoother = BallisticsEMASmoother(alpha: 0.35)
     private let ipc = SharedIPC.shared
 
     private let stateLock = NSLock()
     private let udpLock = NSLock()
     private let heartbeatQueue = DispatchQueue(label: "com.gunny.pipcalc.broadcast.heartbeat", qos: .utility)
-    private let angleOCRQueue = DispatchQueue(label: "com.gunny.pipcalc.broadcast.angleOCR", qos: .userInitiated)
+    private let angleOCRQueue = DispatchQueue(label: "com.gunny.pipcalc.broadcast.angleOCR", qos: .userInteractive)
 
     private var heartbeatTimer: DispatchSourceTimer?
     private var udpSocketFD: Int32 = -1
@@ -52,32 +39,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var isCurrentlyLandscape = false
     private var frameCounter: Int = 0
 
-    // Bộ đệm trạng thái liên tục 24/24 (không bao giờ khóa màn hình PiP khi thiếu chấm đỏ).
-    private let defaultCameraWidthNorm: Double = 0.62
-    private var lastCameraWidthNorm: Double = 0.62
-    private var hasSeenCameraRect: Bool = false
-    private var missingCameraFrames: Int = 0
-    private var lastMinimapAspect: Double = 0.56
-    private var lastMinimapJPEG: Data?
+    // Trạng thái tức thời (không làm mượt EMA).
+    private var lastPlayerX: Double = 0.20
+    private var lastDistanceUnits: Double = 10.0
+    private var lastAngle: Int = 50
 
-    private var lastPlayerNorm = CGPoint(x: 0.20, y: 0.68)
-    private var lastEnemyNorm = CGPoint(x: 0.82, y: 0.68)
-    private var lastAllEnemiesNorm: [CGPoint] = []
-    private var hasLockedEnemy: Bool = false
-    private var lostTrackCount: Int = 0
-    private var switchCandidateCount: Int = 0
-
-    private var lastValidDistanceUnits: Double = 10.0
-    private var lastValidDeltaY: Double = 0.0
-
-    private var lastAngle: Double = 50.0
-    private var hasConfirmedAngle: Bool = false
-    private var pendingAngle: Double?
-    private var pendingAngleCount: Int = 0
-
-    private let minimumFrameInterval: TimeInterval = 0.040 // 25 FPS (40ms)
-    private let minimumOCRInterval: TimeInterval = 0.080   // 12.5 Hz (80ms)
-    private let maxAngleCropWidth: CGFloat = 960.0
+    private let minimumFrameInterval: TimeInterval = 0.033 // 30 FPS (33ms)
+    private let minimumOCRInterval: TimeInterval = 0.050   // 20 Hz (50ms)
+    private let maxGrayAngleWidth: CGFloat = 640.0
 
     deinit {
         stopHeartbeatTimer()
@@ -94,21 +63,11 @@ final class SampleHandler: RPBroadcastSampleHandler {
         isCurrentlyLandscape = false
         frameCounter = 1
         lastPacketSentTime = now
-        lastCameraWidthNorm = defaultCameraWidthNorm
-        hasSeenCameraRect = false
-        missingCameraFrames = 0
-        hasLockedEnemy = false
-        lostTrackCount = 0
-        switchCandidateCount = 0
-        lastAllEnemiesNorm = []
-        lastValidDistanceUnits = 10.0
-        lastValidDeltaY = 0.0
-        hasConfirmedAngle = false
-        pendingAngle = nil
-        pendingAngleCount = 0
-        emaSmoother.reset()
-        let initialSnapshot = currentSnapshotLocked(hasLiveEnemy: false)
-        let startupTelemetry = buildTelemetryLocked(frameId: 1, from: initialSnapshot, targetSwitched: true)
+        lastPlayerX = 0.20
+        lastDistanceUnits = 10.0
+        lastAngle = 50
+        let startupPower = ballisticsEngine.calculatePower(distanceUnits: lastDistanceUnits, angle: lastAngle)
+        let startupTelemetry = TelemetryData(frameId: 1, angle: lastAngle, power: startupPower)
         stateLock.unlock()
 
         sendUDPPacket(startupTelemetry)
@@ -118,7 +77,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastPaused() {
-        // Giữ heartbeat khi màn hình ngang tạm dừng thay đổi khung hình.
+        // Giữ heartbeat khi khung hình ngang đứng yên.
     }
 
     override func broadcastResumed() {
@@ -165,7 +124,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             let extent = ciImage.extent
             guard extent.width > 0, extent.height > 0 else { return }
 
-            // Chỉ tạm nghỉ gửi dữ liệu khi màn hình đang dựng dọc (Home Screen / trong app GunnyCalc).
+            // Bỏ qua khung hình dọc (màn hình chính iPhone / app GunnyCalc).
             guard extent.width > extent.height else {
                 stateLock.lock()
                 isCurrentlyLandscape = false
@@ -173,55 +132,33 @@ final class SampleHandler: RPBroadcastSampleHandler {
                 return
             }
 
-            // 1. Cắt Minimap trực tiếp ở độ phân giải gốc (tuyệt đối không thu nhỏ trước khi cắt).
-            let minimap: MinimapAnalysis?
-            if let nativeMinimapCrop = renderNativeMinimapCrop(from: ciImage) {
-                minimap = visionProcessor.analyzeMinimapCrop(nativeMinimapCrop, includeJPEG: true)
+            // 1. Cắt trực tiếp dải giữa Minimap (dưới nút [X], trên thước vàng) ở độ phân giải gốc.
+            let stripPositions: MinimapStripPositions?
+            if let nativeStrip = renderNativeMinimapStrip(from: ciImage) {
+                stripPositions = visionProcessor.detectMinimapStripPositions(from: nativeStrip)
             } else {
-                minimap = nil
+                stripPositions = nil
             }
 
             stateLock.lock()
             isCurrentlyLandscape = true
-            var targetSwitched = false
-            var hasLiveEnemy = false
 
-            if let minimap {
-                lastMinimapAspect = minimap.minimapAspectHOverW
-                if let jpeg = minimap.minimapJPEG {
-                    lastMinimapJPEG = jpeg
+            if let strip = stripPositions {
+                if let px = strip.playerX {
+                    lastPlayerX = px
                 }
-
-                // Khung camera trắng = 10.0 đơn vị; nếu không thấy khung trắng thì dùng chuẩn 62% chiều rộng Minimap.
-                if let camRect = minimap.cameraRect, camRect.width >= 0.22, camRect.width <= 0.85 {
-                    if !hasSeenCameraRect {
-                        lastCameraWidthNorm = camRect.width
-                        hasSeenCameraRect = true
-                    } else {
-                        lastCameraWidthNorm = 0.25 * camRect.width + 0.75 * lastCameraWidthNorm
+                if !strip.enemyXs.isEmpty {
+                    var nearestEnemyX = strip.enemyXs[0]
+                    var bestDelta = abs(nearestEnemyX - lastPlayerX)
+                    for ex in strip.enemyXs.dropFirst() {
+                        let d = abs(ex - lastPlayerX)
+                        if d < bestDelta {
+                            bestDelta = d
+                            nearestEnemyX = ex
+                        }
                     }
-                    missingCameraFrames = 0
-                } else {
-                    missingCameraFrames += 1
-                    if !hasSeenCameraRect || missingCameraFrames >= 25 {
-                        lastCameraWidthNorm = defaultCameraWidthNorm
-                    }
-                }
-
-                if let playerPos = minimap.playerPos {
-                    lastPlayerNorm = playerPos
-                }
-
-                if !minimap.enemies.isEmpty {
-                    hasLiveEnemy = true
-                    targetSwitched = updateLockedEnemyLocked(detectedEnemies: minimap.enemies)
-                    let safeCamW = min(max(lastCameraWidthNorm, 0.12), 0.90)
-                    let safeAspect = min(max(lastMinimapAspect, 0.35), 2.5)
-                    lastValidDistanceUnits = (abs(Double(lastEnemyNorm.x - lastPlayerNorm.x)) / safeCamW) * BallisticsEngine.unitsPerScreen
-                    lastValidDeltaY = ((Double(lastPlayerNorm.y - lastEnemyNorm.y) * safeAspect) / safeCamW) * BallisticsEngine.unitsPerScreen
-                } else {
-                    // Chưa thấy chấm đỏ: giữ nguyên cự ly hợp lệ gần nhất (mặc định 10.0), vẫn cập nhật góc & bảng lực.
-                    lastAllEnemiesNorm = []
+                    // Toàn bộ chiều rộng Minimap = 20.0 đơn vị cự ly (1 màn hình = 10.0 đơn vị).
+                    lastDistanceUnits = abs(nearestEnemyX - lastPlayerX) * BallisticsEngine.minimapTotalUnits
                 }
             }
 
@@ -233,19 +170,20 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
             frameCounter += 1
             let currentFrameId = frameCounter
+            let currentAngle = lastAngle
+            let currentDistance = lastDistanceUnits
             lastPacketSentTime = Date().timeIntervalSince1970
-            let snapshot = currentSnapshotLocked(hasLiveEnemy: hasLiveEnemy)
-            let telemetry = buildTelemetryLocked(frameId: currentFrameId, from: snapshot, targetSwitched: targetSwitched)
             stateLock.unlock()
 
-            // Gửi ngay gói UDP 25 FPS sang PiP mà không bao giờ khóa giao diện.
+            // Tính lực bắn tức thời (0 khung hình trễ) và bắn gói UDP < 60 byte ngay lập tức.
+            let power = ballisticsEngine.calculatePower(distanceUnits: currentDistance, angle: currentAngle)
+            let telemetry = TelemetryData(frameId: currentFrameId, angle: currentAngle, power: power)
             sendUDPPacket(telemetry)
-            ipc.saveTelemetry(telemetry)
 
-            // 2. Luồng OCR riêng mỗi 80ms với CIColorControls (contrast = 1.6, brightness = 0.05) + .accurate.
+            // 2. Chạy OCR Grayscale .fast trên luồng song song mỗi 50ms.
             if shouldDispatchOCR {
-                if let contrastAngleCrop = renderContrastAngleCrop(from: ciImage) {
-                    dispatchAngleOCR(contrastAngleImage: contrastAngleCrop)
+                if let grayAngleCrop = renderGrayscaleAngleCrop(from: ciImage) {
+                    dispatchFastAngleOCR(grayscaleAngleImage: grayAngleCrop)
                 } else {
                     stateLock.lock()
                     isOCRBusy = false
@@ -255,9 +193,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
     }
 
-    // MARK: - Asynchronous High-Sensitivity Angle OCR (80ms)
+    // MARK: - Parallel Grayscale Fast Angle OCR (50ms)
 
-    private func dispatchAngleOCR(contrastAngleImage: CGImage) {
+    private func dispatchFastAngleOCR(grayscaleAngleImage: CGImage) {
         angleOCRQueue.async { [weak self] in
             autoreleasepool {
                 guard let self else { return }
@@ -267,146 +205,39 @@ final class SampleHandler: RPBroadcastSampleHandler {
                     self.stateLock.unlock()
                 }
 
-                let detected = self.visionProcessor.detectBattlefieldAngle(fromContrastImage: contrastAngleImage)
-                guard let detected else { return }
+                guard let detectedAngle = self.visionProcessor.detectAngle(fromGrayscaleImage: grayscaleAngleImage) else {
+                    return
+                }
 
                 self.stateLock.lock()
-                self.updateAngleLocked(detectedAngle: detected)
-                self.stateLock.unlock()
-            }
-        }
-    }
-
-    private func updateAngleLocked(detectedAngle: Double) {
-        guard detectedAngle >= -35.0 && detectedAngle <= 85.0 else { return }
-
-        if !hasConfirmedAngle || abs(detectedAngle - lastAngle) <= 22.0 {
-            lastAngle = detectedAngle
-            hasConfirmedAngle = true
-            pendingAngle = nil
-            pendingAngleCount = 0
-            return
-        }
-
-        // Tránh nhảy vọt do 1 khung hình hiệu ứng: yêu cầu 2 lần đọc liên tiếp khớp ±2° (160ms).
-        if let pending = pendingAngle, abs(detectedAngle - pending) <= 2.0 {
-            pendingAngleCount += 1
-            if pendingAngleCount >= 2 {
-                lastAngle = detectedAngle
-                hasConfirmedAngle = true
-                pendingAngle = nil
-                pendingAngleCount = 0
-            }
-        } else {
-            pendingAngle = detectedAngle
-            pendingAngleCount = 1
-        }
-    }
-
-    // MARK: - Hysteresis Target Tracking (Locked)
-
-    private func updateLockedEnemyLocked(detectedEnemies: [CGPoint]) -> Bool {
-        lastAllEnemiesNorm = detectedEnemies
-
-        var nearestIdx = 0
-        var minPlayerDist = Double.greatestFiniteMagnitude
-        for (idx, pt) in detectedEnemies.enumerated() {
-            let d = hypot(Double(pt.x - lastPlayerNorm.x), Double(pt.y - lastPlayerNorm.y))
-            if d < minPlayerDist {
-                minPlayerDist = d
-                nearestIdx = idx
-            }
-        }
-
-        if !hasLockedEnemy {
-            hasLockedEnemy = true
-            lastEnemyNorm = detectedEnemies[nearestIdx]
-            lostTrackCount = 0
-            switchCandidateCount = 0
-            return true
-        }
-
-        let trackRadius = 0.075
-        var trackedIdx: Int?
-        var minTrackDelta = Double.greatestFiniteMagnitude
-        for (idx, pt) in detectedEnemies.enumerated() {
-            let delta = hypot(Double(pt.x - lastEnemyNorm.x), Double(pt.y - lastEnemyNorm.y))
-            if delta <= trackRadius && delta < minTrackDelta {
-                minTrackDelta = delta
-                trackedIdx = idx
-            }
-        }
-
-        if let tracked = trackedIdx {
-            lostTrackCount = 0
-            let trackedDist = hypot(
-                Double(detectedEnemies[tracked].x - lastPlayerNorm.x),
-                Double(detectedEnemies[tracked].y - lastPlayerNorm.y)
-            )
-
-            if nearestIdx != tracked && minPlayerDist < (trackedDist - 0.045) {
-                switchCandidateCount += 1
-                if switchCandidateCount >= 3 {
-                    lastEnemyNorm = detectedEnemies[nearestIdx]
-                    switchCandidateCount = 0
-                    return true
+                let angleChanged = detectedAngle != self.lastAngle
+                self.lastAngle = detectedAngle
+                let currentDistance = self.lastDistanceUnits
+                let immediateFrameId: Int
+                if angleChanged {
+                    self.frameCounter += 1
+                    immediateFrameId = self.frameCounter
+                    self.lastPacketSentTime = Date().timeIntervalSince1970
+                } else {
+                    immediateFrameId = self.frameCounter
                 }
-            } else {
-                switchCandidateCount = 0
+                self.stateLock.unlock()
+
+                // Nếu góc vừa đổi, đẩy ngay gói UDP mới để đạt phản hồi < 50ms mà không cần chờ khung video kế tiếp.
+                if angleChanged {
+                    let immediatePower = self.ballisticsEngine.calculatePower(
+                        distanceUnits: currentDistance,
+                        angle: detectedAngle
+                    )
+                    self.sendUDPPacket(
+                        TelemetryData(frameId: immediateFrameId, angle: detectedAngle, power: immediatePower)
+                    )
+                }
             }
-
-            lastEnemyNorm = detectedEnemies[tracked]
-            return false
         }
-
-        switchCandidateCount = 0
-        lostTrackCount += 1
-        if lostTrackCount >= 3 {
-            lastEnemyNorm = detectedEnemies[nearestIdx]
-            lostTrackCount = 0
-            return true
-        }
-
-        return false
     }
 
-    // MARK: - Snapshot & Heartbeat Timer (0.5s when static landscape)
-
-    private func currentSnapshotLocked(hasLiveEnemy: Bool) -> LiveSnapshot {
-        LiveSnapshot(
-            playerNorm: lastPlayerNorm,
-            enemyNorm: lastEnemyNorm,
-            allEnemiesNorm: lastAllEnemiesNorm,
-            cameraWidthNorm: lastCameraWidthNorm,
-            minimapAspectHOverW: lastMinimapAspect,
-            angle: lastAngle,
-            minimapJPEG: lastMinimapJPEG,
-            hasLiveEnemy: hasLiveEnemy,
-            fallbackDistanceUnits: lastValidDistanceUnits,
-            fallbackDeltaY: lastValidDeltaY
-        )
-    }
-
-    private func buildTelemetryLocked(
-        frameId: Int,
-        from snapshot: LiveSnapshot,
-        targetSwitched: Bool
-    ) -> TelemetryData {
-        ballisticsEngine.buildBattleTelemetry(
-            frameId: frameId,
-            playerNorm: snapshot.playerNorm,
-            enemyNorm: snapshot.enemyNorm,
-            allEnemiesNorm: snapshot.allEnemiesNorm,
-            cameraWidthNorm: snapshot.cameraWidthNorm,
-            minimapAspectHOverW: snapshot.minimapAspectHOverW,
-            angle: snapshot.angle,
-            minimapJPEG: snapshot.minimapJPEG,
-            smoother: emaSmoother,
-            targetSwitched: targetSwitched,
-            distanceOverride: snapshot.hasLiveEnemy ? nil : snapshot.fallbackDistanceUnits,
-            deltaYOverride: snapshot.hasLiveEnemy ? nil : snapshot.fallbackDeltaY
-        )
-    }
+    // MARK: - Heartbeat Timer (0.5s when static landscape)
 
     private func startHeartbeatTimer() {
         stopHeartbeatTimer()
@@ -437,7 +268,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private func handleHeartbeatTick() {
         let now = Date().timeIntervalSince1970
         stateLock.lock()
-        // Chỉ gửi heartbeat khi đang ở màn hình ngang (dừng gửi khi màn hình dựng dọc).
         guard isCurrentlyLandscape, (now - lastPacketSentTime) >= 0.45 else {
             stateLock.unlock()
             return
@@ -445,16 +275,18 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         frameCounter += 1
         let currentFrameId = frameCounter
+        let currentAngle = lastAngle
+        let currentDistance = lastDistanceUnits
         lastPacketSentTime = now
-        let snapshot = currentSnapshotLocked(hasLiveEnemy: !lastAllEnemiesNorm.isEmpty)
-        let telemetry = buildTelemetryLocked(frameId: currentFrameId, from: snapshot, targetSwitched: false)
         stateLock.unlock()
 
+        let power = ballisticsEngine.calculatePower(distanceUnits: currentDistance, angle: currentAngle)
+        let telemetry = TelemetryData(frameId: currentFrameId, angle: currentAngle, power: power)
         sendUDPPacket(telemetry)
         ipc.saveTelemetry(telemetry)
     }
 
-    // MARK: - Safe Darwin BSD UDP Sender
+    // MARK: - Safe Darwin BSD UDP Sender (< 60 bytes JSON)
 
     private func ensureUDPSocketLocked() -> (Int32, sockaddr_in)? {
         if udpSocketFD >= 0, let existingDest = udpDestination {
@@ -470,14 +302,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
             SOL_SOCKET,
             SO_NOSIGPIPE,
             &noSigPipe,
-            socklen_t(MemoryLayout<Int32>.size)
-        )
-        var sendBuf: Int32 = 65536
-        _ = Darwin.setsockopt(
-            fd,
-            SOL_SOCKET,
-            SO_SNDBUF,
-            &sendBuf,
             socklen_t(MemoryLayout<Int32>.size)
         )
         _ = fcntl(fd, F_SETFL, O_NONBLOCK)
@@ -501,21 +325,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     private func sendUDPPacket(_ telemetry: TelemetryData) {
-        let encoder = JSONEncoder()
-        var encoded: Data?
+        let payload: Data
         do {
-            encoded = try encoder.encode(telemetry)
+            payload = try JSONEncoder().encode(telemetry)
         } catch {
             return
         }
-
-        if let data = encoded, data.count > BSDUDPConfig.safeDatagramLimit {
-            var trimmed = telemetry
-            trimmed.minimapJPEG = nil
-            encoded = try? encoder.encode(trimmed)
-        }
-
-        guard let payload = encoded, !payload.isEmpty else { return }
+        guard !payload.isEmpty else { return }
 
         udpLock.lock()
         defer { udpLock.unlock() }
@@ -540,7 +356,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         if sentCount < 0 {
             let err = errno
-            if err != EAGAIN && err != EWOULDBLOCK && err != EMSGSIZE {
+            if err != EAGAIN && err != EWOULDBLOCK {
                 Darwin.close(fd)
                 udpSocketFD = -1
                 udpDestination = nil
@@ -558,7 +374,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         udpLock.unlock()
     }
 
-    // MARK: - Native Minimap Crop & High-Contrast Angle Crop
+    // MARK: - Orientation, Native Strip Crop & Grayscale Angle Crop
 
     private func extractVideoOrientation(from sampleBuffer: CMSampleBuffer) -> CGImagePropertyOrientation {
         if let attachment = CMGetAttachment(
@@ -571,10 +387,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return .up
     }
 
-    /// Cắt trực tiếp vùng Minimap ở 100% độ phân giải gốc từ CVPixelBuffer (không thu nhỏ ảnh trước khi cắt).
-    private func renderNativeMinimapCrop(from ciImage: CIImage) -> CGImage? {
-        let cropRect = GunnyROIs.minimap.ciRect(width: ciImage.extent.width, height: ciImage.extent.height)
-        guard cropRect.width >= 8, cropRect.height >= 8 else { return nil }
+    private func renderNativeMinimapStrip(from ciImage: CIImage) -> CGImage? {
+        let cropRect = GunnyROIs.minimapStrip.ciRect(width: ciImage.extent.width, height: ciImage.extent.height)
+        guard cropRect.width >= 8, cropRect.height >= 6 else { return nil }
 
         let patch = ciImage
             .cropped(to: cropRect)
@@ -586,12 +401,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
             width: floor(patch.extent.width),
             height: floor(patch.extent.height)
         )
-        guard bounds.width >= 8, bounds.height >= 8 else { return nil }
+        guard bounds.width >= 8, bounds.height >= 6 else { return nil }
         return sharedCIContext.createCGImage(patch, from: bounds)
     }
 
-    /// Cắt vùng chữ `Góc XX°` và tăng tương phản bằng `CIColorControls` (`contrast = 1.6`, `brightness = 0.05`) trước khi đưa vào Vision `.accurate`.
-    private func renderContrastAngleCrop(from ciImage: CIImage) -> CGImage? {
+    /// Cắt vùng chữ góc và chuyển thẳng sang ảnh xám 8-bit (`CIFormat.L8`) trên GPU để tăng tốc OCR gấp 3 lần.
+    private func renderGrayscaleAngleCrop(from ciImage: CIImage) -> CGImage? {
         let cropRect = GunnyROIs.angleBattlefield.ciRect(width: ciImage.extent.width, height: ciImage.extent.height)
         guard cropRect.width >= 16, cropRect.height >= 16 else { return nil }
 
@@ -599,16 +414,17 @@ final class SampleHandler: RPBroadcastSampleHandler {
             .cropped(to: cropRect)
             .transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
 
-        if patch.extent.width > maxAngleCropWidth, patch.extent.width > 0 {
-            let scale = maxAngleCropWidth / patch.extent.width
+        if patch.extent.width > maxGrayAngleWidth, patch.extent.width > 0 {
+            let scale = maxGrayAngleWidth / patch.extent.width
             patch = patch.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
         }
 
         patch = patch.applyingFilter(
             "CIColorControls",
             parameters: [
-                kCIInputContrastKey: 1.6,
-                kCIInputBrightnessKey: 0.05
+                kCIInputSaturationKey: 0.0,
+                kCIInputContrastKey: 1.45,
+                kCIInputBrightnessKey: 0.04
             ]
         )
 
@@ -619,6 +435,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
             height: floor(patch.extent.height)
         )
         guard bounds.width >= 16, bounds.height >= 16 else { return nil }
-        return sharedCIContext.createCGImage(patch, from: bounds)
+        return sharedCIContext.createCGImage(patch, from: bounds, format: .L8, colorSpace: grayColorSpace)
     }
 }
