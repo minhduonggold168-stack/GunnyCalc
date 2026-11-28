@@ -4,7 +4,7 @@ import ImageIO
 import UniformTypeIdentifiers
 import Vision
 
-/// Kết quả phân tích Minimap bản không gió: tọa độ người chơi, cụm mục tiêu độc lập, khung camera trắng và ảnh JPEG.
+/// Kết quả phân tích Minimap ở độ phân giải gốc: tọa độ người chơi, các cụm địch, khung camera trắng và ảnh JPEG.
 public struct MinimapAnalysis: Equatable, Sendable {
     public let playerPos: CGPoint?
     public let enemies: [CGPoint]
@@ -13,11 +13,8 @@ public struct MinimapAnalysis: Equatable, Sendable {
     public let minimapJPEG: Data?
 }
 
-/// Bộ xử lý thị giác tốc độ cao (< 20MB RAM) dùng thuần CoreGraphics, ImageIO và Vision (.fast).
-/// - Không quét vùng gió hay đồng hồ đếm ngược lượt ở giữa trên cùng.
+/// Bộ xử lý thị giác độ chính xác cao (< 25MB RAM) dùng thuần CoreGraphics, ImageIO và Vision.
 public final class VisionProcessor {
-    private static let maxMinimapSampleDimension = 160
-    private static let maxBattlefieldAngleDimension = 560
     private static let minimapJPEGWidth = 160
     private static let minimapJPEGHeight = 100
 
@@ -35,151 +32,27 @@ public final class VisionProcessor {
     )
 
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
-    private let grayColorSpace = CGColorSpaceCreateDeviceGray()
 
     public init() {}
 
-    // MARK: - 1. Battle UI Verification (3 Combat Signs)
+    // MARK: - 1. Native-Resolution Minimap Analysis (No Pre-Downscale)
 
-    /// Dấu hiệu 1a: Nút đóng màu đỏ `[X]` ở góc trên bên phải (`x: 0.94...0.99, y: 0.005...0.055`).
-    public func detectRedCloseButton(in cropped: CGImage) -> Bool {
-        let (outW, outH) = clampedSize(width: cropped.width, height: cropped.height, maxDimension: 48)
-        guard outW >= 4, outH >= 4,
-              let context = makeRGBAContext(width: outW, height: outH),
-              let ptr = context.data?.assumingMemoryBound(to: UInt8.self) else {
-            return false
-        }
-
-        context.interpolationQuality = .low
-        context.draw(cropped, in: CGRect(x: 0, y: 0, width: outW, height: outH))
-
-        let bytesPerRow = context.bytesPerRow
-        let total = max(outW * outH, 1)
-        var redHits = 0
-        var brightCrossHits = 0
-
-        for y in 0..<outH {
-            let row = ptr.advanced(by: y * bytesPerRow)
-            for x in 0..<outW {
-                let px = x * 4
-                let r = row[px]
-                let g = row[px + 1]
-                let b = row[px + 2]
-                let hsv = rgbToHSV(r: r, g: g, b: b)
-
-                if (hsv.h <= 22.0 || hsv.h >= 338.0) && hsv.s >= 0.40 && hsv.v >= 0.32 {
-                    redHits += 1
-                } else if r >= 185 && g >= 185 && b >= 185 && hsv.s <= 0.25 {
-                    brightCrossHits += 1
-                }
-            }
-        }
-
-        let redRatio = Double(redHits) / Double(total)
-        let crossRatio = Double(brightCrossHits) / Double(total)
-        return redRatio >= 0.12 && crossRatio >= 0.02
-    }
-
-    /// Dấu hiệu 1b: Thước chia màu vàng `0 - 5 - 10` ở đáy Minimap (`x: 0.848...0.995, y: 0.145...0.175`).
-    public func detectGoldenMinimapRuler(in cropped: CGImage) -> Bool {
-        let (outW, outH) = clampedSize(width: cropped.width, height: cropped.height, maxDimension: 120)
-        guard outW >= 8, outH >= 4,
-              let context = makeRGBAContext(width: outW, height: outH),
-              let ptr = context.data?.assumingMemoryBound(to: UInt8.self) else {
-            return false
-        }
-
-        context.interpolationQuality = .low
-        context.draw(cropped, in: CGRect(x: 0, y: 0, width: outW, height: outH))
-
-        let bytesPerRow = context.bytesPerRow
-        let total = max(outW * outH, 1)
-        var goldHits = 0
-
-        for y in 0..<outH {
-            let row = ptr.advanced(by: y * bytesPerRow)
-            for x in 0..<outW {
-                let px = x * 4
-                let hsv = rgbToHSV(r: row[px], g: row[px + 1], b: row[px + 2])
-                if hsv.h >= 24.0 && hsv.h <= 66.0 && hsv.s >= 0.30 && hsv.v >= 0.40 {
-                    goldHits += 1
-                }
-            }
-        }
-
-        let goldRatio = Double(goldHits) / Double(total)
-        return goldRatio >= 0.035
-    }
-
-    /// Dấu hiệu 2: Thanh thước lực `10 20 30 ... 100` ở cạnh dưới màn hình (`x: 0.30...0.72, y: 0.88...0.95`).
-    public func detectBottomPowerBar(in cropped: CGImage) -> Bool {
-        let (outW, outH) = clampedSize(width: cropped.width, height: cropped.height, maxDimension: 160)
-        guard outW >= 24, outH >= 6,
-              let context = makeGrayscaleContext(width: outW, height: outH),
-              let ptr = context.data?.assumingMemoryBound(to: UInt8.self) else {
-            return false
-        }
-
-        context.interpolationQuality = .low
-        context.draw(cropped, in: CGRect(x: 0, y: 0, width: outW, height: outH))
-
-        let bytesPerRow = context.bytesPerRow
-        let bucketCount = 8
-        var bucketContrastHits = [Int](repeating: 0, count: bucketCount)
-        var bucketBrightHits = [Int](repeating: 0, count: bucketCount)
-        var strongBorderRows = 0
-
-        for y in 0..<(outH - 1) {
-            let row = ptr.advanced(by: y * bytesPerRow)
-            let nextRow = ptr.advanced(by: (y + 1) * bytesPerRow)
-            var rowVertEdges = 0
-
-            for x in 0..<(outW - 1) {
-                let lum = Int(row[x])
-                let rightLum = Int(row[x + 1])
-                let downLum = Int(nextRow[x])
-                let bucket = min((x * bucketCount) / outW, bucketCount - 1)
-
-                if abs(lum - downLum) >= 34 {
-                    rowVertEdges += 1
-                    bucketContrastHits[bucket] += 1
-                } else if abs(lum - rightLum) >= 34 {
-                    bucketContrastHits[bucket] += 1
-                }
-
-                if lum >= 160 {
-                    bucketBrightHits[bucket] += 1
-                }
-            }
-
-            if Double(rowVertEdges) / Double(max(outW - 1, 1)) >= 0.20 {
-                strongBorderRows += 1
-            }
-        }
-
-        let activeContrastBuckets = bucketContrastHits.filter { $0 >= 6 }.count
-        let activeBrightBuckets = bucketBrightHits.filter { $0 >= 3 }.count
-        return strongBorderRows >= 2 && activeContrastBuckets >= 5 && activeBrightBuckets >= 4
-    }
-
-    // MARK: - 2. Direct-Crop Minimap Analysis (25 FPS Fast Path)
-
+    /// Quét trực tiếp ảnh Minimap ở độ phân giải gốc để không làm mất các chấm đỏ nhỏ (từ 2 pixel trở lên).
     public func analyzeMinimapCrop(
         _ cropped: CGImage,
         includeJPEG: Bool = true
     ) -> MinimapAnalysis? {
-        let cropW = cropped.width
-        let cropH = cropped.height
-        guard cropW >= 8, cropH >= 8 else { return nil }
+        let outW = cropped.width
+        let outH = cropped.height
+        guard outW >= 8, outH >= 8 else { return nil }
 
-        let minimapAspectHOverW = Double(cropH) / Double(cropW)
-        let (outW, outH) = clampedSize(width: cropW, height: cropH, maxDimension: Self.maxMinimapSampleDimension)
+        let minimapAspectHOverW = Double(outH) / Double(outW)
         guard let context = makeRGBAContext(width: outW, height: outH),
               let rgbaPtr = context.data?.assumingMemoryBound(to: UInt8.self) else {
             return nil
         }
 
-        context.interpolationQuality = .low
+        context.interpolationQuality = .none
         context.draw(cropped, in: CGRect(x: 0, y: 0, width: outW, height: outH))
 
         let pixelCount = outW * outH
@@ -192,11 +65,12 @@ public final class VisionProcessor {
             let rowPtr = rgbaPtr.advanced(by: y * bytesPerRow)
             for x in 0..<outW {
                 let px = x * 4
-                let r = rowPtr[px]
-                let g = rowPtr[px + 1]
-                let b = rowPtr[px + 2]
+                let r = Int(rowPtr[px])
+                let g = Int(rowPtr[px + 1])
+                let b = Int(rowPtr[px + 2])
                 let idx = y * outW + x
 
+                // Khung camera trắng bên trong Minimap (loại bỏ sát viền 2px ngoài cùng).
                 if x >= 2 && x < (outW - 2) && y >= 2 && y < (outH - 2) {
                     let maxRGB = max(r, max(g, b))
                     let minRGB = min(r, min(g, b))
@@ -205,20 +79,24 @@ public final class VisionProcessor {
                     }
                 }
 
-                let hsv = rgbToHSV(r: r, g: g, b: b)
-                if hsv.h >= 195.0 && hsv.h <= 248.0 && hsv.s >= 0.45 && hsv.v >= 0.38 {
+                // Cụm xanh dương đậm của người chơi: B > 170, B - R > 80, B - G > 60.
+                if b > 170 && (b - r) > 80 && (b - g) > 60 {
                     blueMask[idx] = true
-                } else if (hsv.h <= 18.0 || hsv.h >= 342.0) && hsv.s >= 0.48 && hsv.v >= 0.38 {
+                }
+                // Ngưỡng mở rộng bắt chấm đỏ mục tiêu: R > 155, R - G > 55, R - B > 55.
+                else if r > 155 && (r - g) > 55 && (r - b) > 55 {
                     redMask[idx] = true
                 }
             }
         }
 
-        let playerPos = detectPlayerCluster(mask: blueMask, width: outW, height: outH)
+        let searchRadius = outW >= 240 ? 3 : 2
+        let playerPos = detectPlayerCluster(mask: blueMask, width: outW, height: outH, searchRadius: searchRadius)
         let enemies = detectEnemyClusters(
             mask: redMask,
             width: outW,
             height: outH,
+            searchRadius: searchRadius,
             playerPos: playerPos
         )
         let cameraRect = detectCameraRectangle(whiteMask: whiteMask, width: outW, height: outH)
@@ -245,14 +123,15 @@ public final class VisionProcessor {
         from mask: [Bool],
         width: Int,
         height: Int,
+        searchRadius: Int,
         minPixels: Int,
         maxBBoxWidthRatio: Double,
         maxBBoxHeightRatio: Double
     ) -> [PixelCluster] {
         var visited = [Bool](repeating: false, count: width * height)
         var clusters: [PixelCluster] = []
-        let maxBBoxW = max(4, Int(Double(width) * maxBBoxWidthRatio))
-        let maxBBoxH = max(4, Int(Double(height) * maxBBoxHeightRatio))
+        let maxBBoxW = max(6, Int(Double(width) * maxBBoxWidthRatio))
+        let maxBBoxH = max(6, Int(Double(height) * maxBBoxHeightRatio))
 
         var queueX: [Int] = []
         var queueY: [Int] = []
@@ -292,10 +171,10 @@ public final class VisionProcessor {
                     if cy < minY { minY = cy }
                     if cy > maxY { maxY = cy }
 
-                    let yFrom = max(0, cy - 2)
-                    let yTo = min(height - 1, cy + 2)
-                    let xFrom = max(0, cx - 2)
-                    let xTo = min(width - 1, cx + 2)
+                    let yFrom = max(0, cy - searchRadius)
+                    let yTo = min(height - 1, cy + searchRadius)
+                    let xFrom = max(0, cx - searchRadius)
+                    let xTo = min(width - 1, cx + searchRadius)
 
                     for ny in yFrom...yTo {
                         for nx in xFrom...xTo {
@@ -328,12 +207,18 @@ public final class VisionProcessor {
         return clusters
     }
 
-    private func detectPlayerCluster(mask: [Bool], width: Int, height: Int) -> CGPoint? {
+    private func detectPlayerCluster(
+        mask: [Bool],
+        width: Int,
+        height: Int,
+        searchRadius: Int
+    ) -> CGPoint? {
         let clusters = extractClusters(
             from: mask,
             width: width,
             height: height,
-            minPixels: 4,
+            searchRadius: searchRadius,
+            minPixels: 3,
             maxBBoxWidthRatio: 0.22,
             maxBBoxHeightRatio: 0.26
         )
@@ -342,8 +227,8 @@ public final class VisionProcessor {
         var bestCluster = clusters[0]
         var bestScore = -1.0
         for cluster in clusters {
-            let triangleBonus = Double(cluster.bboxH) >= Double(cluster.bboxW) * 0.85 ? 14.0 : 0.0
-            let score = Double(min(cluster.count, 160)) + triangleBonus
+            let triangleBonus = Double(cluster.bboxH) >= Double(cluster.bboxW) * 0.85 ? 16.0 : 0.0
+            let score = Double(min(cluster.count, 240)) + triangleBonus
             if score > bestScore {
                 bestScore = score
                 bestCluster = cluster
@@ -360,19 +245,22 @@ public final class VisionProcessor {
         mask: [Bool],
         width: Int,
         height: Int,
+        searchRadius: Int,
         playerPos: CGPoint?
     ) -> [CGPoint] {
+        // Chấp nhận cụm mục tiêu đỏ từ 2 pixel trở lên để bắt chấm rất nhỏ sát mép phải hoặc đè vạch 15.
         let rawClusters = extractClusters(
             from: mask,
             width: width,
             height: height,
-            minPixels: 3,
-            maxBBoxWidthRatio: 0.20,
-            maxBBoxHeightRatio: 0.24
+            searchRadius: searchRadius,
+            minPixels: 2,
+            maxBBoxWidthRatio: 0.14,
+            maxBBoxHeightRatio: 0.18
         )
         guard !rawClusters.isEmpty else { return [] }
 
-        let mergeDistPx = max(5.0, Double(width) * 0.045)
+        let mergeDistPx = max(5.0, Double(width) * 0.032)
         var merged = rawClusters
         var didMerge = true
         while didMerge {
@@ -424,11 +312,12 @@ public final class VisionProcessor {
 
     private func detectCameraRectangle(whiteMask: [Bool], width: Int, height: Int) -> NormalizedRect? {
         let minEdgeH = max(8, Int(Double(height) * 0.20))
-        let maxEdgeH = Int(Double(height) * 0.88)
-        let minRectW = max(12, Int(Double(width) * 0.20))
-        let maxRectW = Int(Double(width) * 0.72)
+        let maxEdgeH = Int(Double(height) * 0.90)
+        let minRectW = max(14, Int(Double(width) * 0.22))
+        let maxRectW = Int(Double(width) * 0.85)
         guard width >= 20, height >= 16, minRectW < maxRectW else { return nil }
 
+        let maxGap = width >= 240 ? 2 : 1
         var candidates: [VerticalEdgeCandidate] = []
         for x in 2..<(width - 2) {
             var y = 2
@@ -448,14 +337,14 @@ public final class VisionProcessor {
                         gap = 0
                     } else {
                         gap += 1
-                        if gap > 1 { break }
+                        if gap > maxGap { break }
                     }
                     y += 1
                 }
                 let spanH = endY - startY + 1
                 if spanH >= minEdgeH && spanH <= maxEdgeH {
                     let cov = Double(whiteHits) / Double(spanH)
-                    if cov >= 0.60 {
+                    if cov >= 0.55 {
                         candidates.append(VerticalEdgeCandidate(x: x, yTop: startY, yBottom: endY, coverage: cov))
                     }
                 }
@@ -466,7 +355,7 @@ public final class VisionProcessor {
         candidates.sort {
             ($0.coverage * Double($0.yBottom - $0.yTop)) > ($1.coverage * Double($1.yBottom - $1.yTop))
         }
-        let topEdges = Array(candidates.prefix(20))
+        let topEdges = Array(candidates.prefix(24))
 
         var bestRect: NormalizedRect?
         var bestScore = 0.0
@@ -486,7 +375,7 @@ public final class VisionProcessor {
                 guard rectH >= minEdgeH else { continue }
 
                 let aspect = Double(rectW) / Double(rectH)
-                guard aspect >= 1.0 && aspect <= 3.2 else { continue }
+                guard aspect >= 1.0 && aspect <= 3.4 else { continue }
 
                 let topCov = horizontalWhiteCoverage(whiteMask: whiteMask, width: width, height: height, xStart: left.x, xEnd: right.x, yTarget: yTop)
                 let bottomCov = horizontalWhiteCoverage(whiteMask: whiteMask, width: width, height: height, xStart: left.x, xEnd: right.x, yTarget: yBottom)
@@ -519,8 +408,8 @@ public final class VisionProcessor {
         guard xEnd > xStart else { return 0.0 }
         var hits = 0
         let total = xEnd - xStart + 1
-        let yMin = max(0, yTarget - 1)
-        let yMax = min(height - 1, yTarget + 1)
+        let yMin = max(0, yTarget - 2)
+        let yMax = min(height - 1, yTarget + 2)
 
         for x in xStart...xEnd {
             var found = false
@@ -570,39 +459,33 @@ public final class VisionProcessor {
         return mutableData as Data
     }
 
-    // MARK: - 3. Battlefield Angle OCR (-30° ... 85°, hỗ trợ góc âm "Góc -18°")
+    // MARK: - 2. High-Sensitivity Battlefield Angle OCR (.accurate, -35° ... 85°)
 
-    /// Đọc chuỗi `G[oóô]c\s*(-?\d{1,2})\s*°?` từ vùng chiến trường (`x: 0.04, y: 0.12, w: 0.85, h: 0.62`), bỏ qua cụm D-pad góc dưới trái.
-    public func detectBattlefieldAngle(fromCroppedImage cropped: CGImage) -> Double? {
-        let cropW = cropped.width
-        let cropH = cropped.height
-        guard cropW >= 16, cropH >= 16 else { return nil }
+    /// Nhận diện chuỗi `Góc 38°`, `Góc -18°`, `Góc 67°` bằng `VNRecognizeTextRequest` (`.accurate`) trên ảnh đã tăng tương phản `CIColorControls`.
+    public func detectBattlefieldAngle(fromContrastImage cropped: CGImage) -> Double? {
+        guard cropped.width >= 16, cropped.height >= 16 else { return nil }
 
-        let (outW, outH) = clampedSize(width: cropW, height: cropH, maxDimension: Self.maxBattlefieldAngleDimension)
-        guard let enhancedImage = makeContrastGrayImage(from: cropped, width: outW, height: outH) else {
-            return nil
-        }
-
-        let observations = performFastTextObservations(on: enhancedImage, minimumTextHeight: 0.025)
+        let observations = performAccurateTextObservations(on: cropped, minimumTextHeight: 0.02)
         guard !observations.isEmpty else { return nil }
 
-        // Ưu tiên 1: Khớp chính xác chuỗi "Góc -18°" / "Góc 56°" / "Gôc 45" (-30°...85°).
+        // Ưu tiên 1: Khớp chính xác chuỗi "Góc XX°" / "Góc -18°" (-35°...85°).
         for obs in observations {
-            guard let text = obs.topCandidates(1).first?.string else { continue }
-            if let matched = Self.matchGocRegex(in: text) {
-                return matched
+            for candidate in obs.topCandidates(2) {
+                if let matched = Self.matchGocRegex(in: candidate.string) {
+                    return matched
+                }
             }
         }
 
-        // Ưu tiên 2: Nếu chữ "Góc" bị hiệu ứng che khuất nhưng còn ký hiệu độ `°`, bỏ qua góc dưới trái và bỏ qua số 0 đơn lẻ.
+        // Ưu tiên 2: Nếu chữ "Góc" bị hiệu ứng che khuất nhưng còn ký hiệu độ `°`, bỏ qua góc dưới trái và số 0 đơn lẻ.
         for obs in observations {
-            // Bỏ qua vùng sát góc dưới trái để tuyệt đối tránh cụm D-pad.
-            if obs.boundingBox.minX < 0.18 && obs.boundingBox.minY < 0.15 {
+            if obs.boundingBox.minX < 0.16 && obs.boundingBox.minY < 0.14 {
                 continue
             }
-            guard let text = obs.topCandidates(1).first?.string else { continue }
-            if let matched = Self.matchDegreeFallback(in: text), matched != 0.0 {
-                return matched
+            for candidate in obs.topCandidates(2) {
+                if let matched = Self.matchDegreeFallback(in: candidate.string), matched != 0.0 {
+                    return matched
+                }
             }
         }
 
@@ -612,14 +495,14 @@ public final class VisionProcessor {
     public static func matchGocRegex(in rawText: String) -> Double? {
         if let regex = gocRawRegex,
            let val = extractFirstNumericGroup(using: regex, in: rawText),
-           val >= -30.0 && val <= 85.0 {
+           val >= -35.0 && val <= 85.0 {
             return val
         }
 
         let folded = rawText.folding(options: .diacriticInsensitive, locale: Locale(identifier: "en_US_POSIX"))
         if let regex = gocFoldedRegex,
            let val = extractFirstNumericGroup(using: regex, in: folded),
-           val >= -30.0 && val <= 85.0 {
+           val >= -35.0 && val <= 85.0 {
             return val
         }
 
@@ -629,7 +512,7 @@ public final class VisionProcessor {
     private static func matchDegreeFallback(in rawText: String) -> Double? {
         guard let regex = degreeOnlyRegex,
               let val = extractFirstNumericGroup(using: regex, in: rawText),
-              val >= -30.0 && val <= 85.0 else {
+              val >= -35.0 && val <= 85.0 else {
             return nil
         }
         return val
@@ -647,21 +530,9 @@ public final class VisionProcessor {
 
     // MARK: - CoreGraphics & Vision Helpers
 
-    private func makeContrastGrayImage(from cropped: CGImage, width: Int, height: Int) -> CGImage? {
-        guard let grayContext = makeGrayscaleContext(width: width, height: height),
-              let grayPtr = grayContext.data?.assumingMemoryBound(to: UInt8.self) else {
-            return nil
-        }
-
-        grayContext.interpolationQuality = .medium
-        grayContext.draw(cropped, in: CGRect(x: 0, y: 0, width: width, height: height))
-        enhanceContrastInPlace(grayBuffer: grayPtr, width: width, height: height, bytesPerRow: grayContext.bytesPerRow)
-        return grayContext.makeImage()
-    }
-
-    private func performFastTextObservations(on image: CGImage, minimumTextHeight: Float) -> [VNRecognizedTextObservation] {
+    private func performAccurateTextObservations(on image: CGImage, minimumTextHeight: Float) -> [VNRecognizedTextObservation] {
         let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .fast
+        request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
         request.minimumTextHeight = minimumTextHeight
 
@@ -684,88 +555,5 @@ public final class VisionProcessor {
             space: rgbColorSpace,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
         )
-    }
-
-    private func makeGrayscaleContext(width: Int, height: Int) -> CGContext? {
-        CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: width,
-            space: grayColorSpace,
-            bitmapInfo: CGImageAlphaInfo.none.rawValue
-        )
-    }
-
-    private func enhanceContrastInPlace(
-        grayBuffer: UnsafeMutablePointer<UInt8>,
-        width: Int,
-        height: Int,
-        bytesPerRow: Int
-    ) {
-        var minLum: UInt8 = 255
-        var maxLum: UInt8 = 0
-
-        for y in 0..<height {
-            let row = grayBuffer.advanced(by: y * bytesPerRow)
-            for x in 0..<width {
-                let val = row[x]
-                if val < minLum { minLum = val }
-                if val > maxLum { maxLum = val }
-            }
-        }
-
-        let span = Int(maxLum) - Int(minLum)
-        guard span > 8 else { return }
-
-        let minInt = Int(minLum)
-        for y in 0..<height {
-            let row = grayBuffer.advanced(by: y * bytesPerRow)
-            for x in 0..<width {
-                let stretched = ((Int(row[x]) - minInt) * 255) / span
-                let boosted = ((stretched - 128) * 16) / 10 + 128
-                row[x] = UInt8(min(max(boosted, 0), 255))
-            }
-        }
-    }
-
-    private func clampedSize(width: Int, height: Int, maxDimension: Int) -> (Int, Int) {
-        let longest = max(width, height)
-        guard longest > maxDimension else { return (width, height) }
-        let ratio = Double(maxDimension) / Double(longest)
-        return (
-            max(1, Int((Double(width) * ratio).rounded())),
-            max(1, Int((Double(height) * ratio).rounded()))
-        )
-    }
-
-    private func rgbToHSV(r: UInt8, g: UInt8, b: UInt8) -> (h: Double, s: Double, v: Double) {
-        let rf = Double(r) / 255.0
-        let gf = Double(g) / 255.0
-        let bf = Double(b) / 255.0
-
-        let maxC = max(rf, gf, bf)
-        let minC = min(rf, gf, bf)
-        let delta = maxC - minC
-
-        let v = maxC
-        let s = maxC > 0.0 ? delta / maxC : 0.0
-
-        var h = 0.0
-        if delta > 0.00001 {
-            if maxC == rf {
-                h = 60.0 * (((gf - bf) / delta).truncatingRemainder(dividingBy: 6.0))
-            } else if maxC == gf {
-                h = 60.0 * (((bf - rf) / delta) + 2.0)
-            } else {
-                h = 60.0 * (((rf - gf) / delta) + 4.0)
-            }
-            if h < 0.0 {
-                h += 360.0
-            }
-        }
-
-        return (h, s, v)
     }
 }

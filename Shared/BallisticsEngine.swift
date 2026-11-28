@@ -122,7 +122,7 @@ public struct BallisticsEngine: Sendable {
         return table[19] + (distanceUnits - 20.0) * tailSlope
     }
 
-    /// Tính lực bắn (`0.0 ... 100.0`) không gió từ `distanceUnits`, `angle` (`-30°...85°`) và `deltaY` (dương nếu địch cao hơn).
+    /// Tính lực bắn (`0.0 ... 100.0`) không gió từ `distanceUnits`, `angle` (`-35°...85°`) và `deltaY` (dương nếu địch cao hơn).
     public func calculatePower(
         distanceUnits: Double,
         angle: Double,
@@ -134,10 +134,10 @@ public struct BallisticsEngine: Sendable {
             return 0.0
         }
 
-        let safeAngle = min(max(angle.isFinite ? angle : 50.0, -30.0), 85.0)
+        let safeAngle = min(max(angle.isFinite ? angle : 50.0, -35.0), 85.0)
         let theta = safeAngle * .pi / 180.0
 
-        // Trường hợp góc rất thấp hoặc góc âm (-30° ..< 5°) khi đứng trên cao bắn xuống thấp.
+        // Trường hợp góc rất thấp hoặc góc âm (-35° ..< 5°) khi đứng trên cao bắn xuống thấp.
         if safeAngle < 5.0 {
             let refDistance = max(d, 1.0)
             let p20 = lookupTable(Self.table20, distanceUnits: refDistance)
@@ -189,7 +189,7 @@ public struct BallisticsEngine: Sendable {
         let dyScreen = ey - py
         let absDx = abs(dx)
         let safeAspect = min(max(minimapAspectHOverW, 0.35), 2.5)
-        let safeAngle = min(max(angleDeg, -30.0), 85.0)
+        let safeAngle = min(max(angleDeg, -35.0), 85.0)
         let theta = safeAngle * .pi / 180.0
 
         // Đường parabol tiếp tuyến đúng góc bắn tại điểm xuất phát và cắm thẳng vào mục tiêu.
@@ -232,14 +232,16 @@ public struct BallisticsEngine: Sendable {
         angle: Double,
         minimapJPEG: Data?,
         smoother: BallisticsEMASmoother? = nil,
-        targetSwitched: Bool = false
+        targetSwitched: Bool = false,
+        distanceOverride: Double? = nil,
+        deltaYOverride: Double? = nil
     ) -> TelemetryData {
         let safeCamW = min(max(cameraWidthNorm, 0.12), 0.90)
         let safeAspect = min(max(minimapAspectHOverW, 0.35), 2.5)
-        let safeAngle = min(max(angle.isFinite ? angle : 50.0, -30.0), 85.0)
+        let safeAngle = min(max(angle.isFinite ? angle : 50.0, -35.0), 85.0)
 
-        let rawDistanceUnits = (abs(Double(enemyNorm.x - playerNorm.x)) / safeCamW) * Self.unitsPerScreen
-        let rawDeltaY = ((Double(playerNorm.y - enemyNorm.y) * safeAspect) / safeCamW) * Self.unitsPerScreen
+        let rawDistanceUnits = distanceOverride ?? ((abs(Double(enemyNorm.x - playerNorm.x)) / safeCamW) * Self.unitsPerScreen)
+        let rawDeltaY = deltaYOverride ?? (((Double(playerNorm.y - enemyNorm.y) * safeAspect) / safeCamW) * Self.unitsPerScreen)
         let rawPower = calculatePower(
             distanceUnits: rawDistanceUnits,
             angle: safeAngle,

@@ -49,18 +49,13 @@ public struct NormalizedRect: Codable, Equatable, Sendable {
     }
 }
 
-/// Các vùng quét cố định cho Gunny Mobi bản không gió (tỉ lệ chuẩn hóa 0.0 - 1.0, gốc trên-trái).
+/// Các vùng quét cố định độ chính xác cao cho Gunny Mobi bản không gió (tỉ lệ 0.0 - 1.0, gốc trên-trái).
 public enum GunnyROIs {
-    public static let minimap = NormalizedRect(x: 0.848, y: 0.005, width: 0.148, height: 0.170)
-    public static let angleBattlefield = NormalizedRect(x: 0.040, y: 0.120, width: 0.850, height: 0.620)
-
-    // 3 dấu hiệu nhận diện giao diện chiến đấu Gunny Mobi (khóa isInBattle).
-    public static let battleCloseButton = NormalizedRect(x: 0.940, y: 0.005, width: 0.050, height: 0.050)
-    public static let battleMinimapRuler = NormalizedRect(x: 0.848, y: 0.145, width: 0.147, height: 0.030)
-    public static let battlePowerBar = NormalizedRect(x: 0.300, y: 0.880, width: 0.420, height: 0.070)
+    public static let minimap = NormalizedRect(x: 0.846, y: 0.000, width: 0.154, height: 0.168)
+    public static let angleBattlefield = NormalizedRect(x: 0.050, y: 0.140, width: 0.820, height: 0.560)
 }
 
-/// Gói dữ liệu chiến đấu bản không gió truyền thời gian thực 25 FPS qua BSD UDP (`127.0.0.1:45678`).
+/// Gói dữ liệu chiến đấu bản không gió chạy đồng bộ 24/24 ở 25 FPS qua BSD UDP (`127.0.0.1:45678`).
 public struct TelemetryData: Codable, Equatable, Sendable {
     public var frameId: Int
     public var isInBattle: Bool
@@ -82,26 +77,26 @@ public struct TelemetryData: Codable, Equatable, Sendable {
 
     public init(
         frameId: Int = 0,
-        isInBattle: Bool = false,
-        distanceUnits: Double = 0.0,
+        isInBattle: Bool = true,
+        distanceUnits: Double = 10.0,
         deltaY: Double = 0.0,
         angle: Double = 50.0,
-        power: Double = 0.0,
-        holdSeconds: Double = 0.0,
+        power: Double = 48.0,
+        holdSeconds: Double = (48.0 / 100.0) * 2.20,
         playerNorm: CGPoint = CGPoint(x: 0.20, y: 0.68),
-        enemyNorm: CGPoint = CGPoint(x: 0.72, y: 0.68),
-        allEnemiesNorm: [CGPoint] = [],
+        enemyNorm: CGPoint = CGPoint(x: 0.82, y: 0.68),
+        allEnemiesNorm: [CGPoint] = [CGPoint(x: 0.82, y: 0.68)],
         minimapJPEG: Data? = nil,
         trajectoryPoints: [CGPoint] = [],
-        power30: Double = 0.0,
-        power50: Double = 0.0,
-        power65: Double = 0.0
+        power30: Double = 47.0,
+        power50: Double = 48.0,
+        power65: Double = 56.0
     ) {
         self.frameId = max(frameId, 0)
         self.isInBattle = isInBattle
-        self.distanceUnits = distanceUnits.isFinite ? max(distanceUnits, 0.0) : 0.0
+        self.distanceUnits = distanceUnits.isFinite ? max(distanceUnits, 0.0) : 10.0
         self.deltaY = deltaY.isFinite ? deltaY : 0.0
-        self.angle = angle.isFinite ? min(max(angle, -30.0), 85.0) : 50.0
+        self.angle = angle.isFinite ? min(max(angle, -35.0), 85.0) : 50.0
         self.power = power.isFinite ? min(max(power, 0.0), 100.0) : 0.0
         self.holdSeconds = holdSeconds.isFinite ? max(holdSeconds, 0.0) : (self.power / 100.0) * 2.20
         self.playerNorm = Self.clampPoint(playerNorm)
@@ -114,9 +109,23 @@ public struct TelemetryData: Codable, Equatable, Sendable {
         self.power65 = power65.isFinite ? min(max(power65, 0.0), 100.0) : 0.0
     }
 
-    public static func waiting(frameId: Int = 0) -> TelemetryData {
-        TelemetryData(frameId: frameId, isInBattle: false)
-    }
+    public static let initialLive = TelemetryData(
+        frameId: 0,
+        isInBattle: true,
+        distanceUnits: 10.0,
+        deltaY: 0.0,
+        angle: 50.0,
+        power: 48.0,
+        holdSeconds: (48.0 / 100.0) * 2.20,
+        playerNorm: CGPoint(x: 0.20, y: 0.68),
+        enemyNorm: CGPoint(x: 0.82, y: 0.68),
+        allEnemiesNorm: [CGPoint(x: 0.82, y: 0.68)],
+        minimapJPEG: nil,
+        trajectoryPoints: [],
+        power30: 47.0,
+        power50: 48.0,
+        power65: 56.0
+    )
 
     private static func clampPoint(_ pt: CGPoint) -> CGPoint {
         let x = pt.x.isFinite ? min(max(pt.x, 0.0), 1.0) : 0.5

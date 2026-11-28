@@ -35,9 +35,8 @@ struct PiPHostView: UIViewRepresentable {
     }
 }
 
-/// Quản lý cửa sổ nổi Picture-in-Picture (`680 x 235` px) bản không gió:
-/// - Vẽ lại `CMSampleBuffer` ngay trong callback nhận gói UDP để đạt tốc độ phản hồi 25 FPS không độ trễ.
-/// - Khi `isInBattle == false`, khóa tĩnh ở màn hình chờ `CHỜ VÀO TRẬN GUNNY MOBI`.
+/// Quản lý cửa sổ nổi Picture-in-Picture (`680 x 235` px) chạy trực tiếp 24/24:
+/// - Loại bỏ hoàn toàn màn hình khóa chờ; vẽ lại `CMSampleBuffer` ngay lập tức mỗi khi nhận gói UDP `127.0.0.1:45678`.
 @MainActor
 final class PiPOverlayManager: NSObject, ObservableObject {
     static let shared = PiPOverlayManager()
@@ -51,13 +50,12 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     let sampleBufferView = PiPSampleBufferView(frame: CGRect(x: 0, y: 0, width: 680, height: 235))
 
     private var pipController: AVPictureInPictureController?
-    private var currentTelemetry: TelemetryData = .waiting()
+    private var currentTelemetry: TelemetryData = .initialLive
     private var lastPacketReceivedAt: TimeInterval = 0
     private var lastPublishedStatsAt: TimeInterval = 0
     private var packetTimestamps: [TimeInterval] = []
-    private var disconnectMonitorTimer: Timer?
+    private var statsMonitorTimer: Timer?
     private var silentAudioPlayer: AVAudioPlayer?
-    private var isDisplayingStandby = false
 
     private let udpReceiver = BSDUDPReceiver()
     private var isUDPStarted = false
@@ -73,7 +71,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     private override init() {
         super.init()
         configureAudioSessionAndSilentLoop()
-        startDisconnectMonitor()
+        startStatsMonitor()
     }
 
     func configureIfNeeded() {
@@ -83,8 +81,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         guard pipController == nil else { return }
 
         sampleBufferView.displayLayer.videoGravity = .resizeAspect
-        enqueueHUDFrame(for: currentTelemetry, isLive: false)
-        isDisplayingStandby = !currentTelemetry.isInBattle
+        enqueueHUDFrame(for: currentTelemetry)
 
         guard AVPictureInPictureController.isPictureInPictureSupported() else {
             statusMessage = "Thiết bị này không hỗ trợ Picture-in-Picture."
@@ -111,11 +108,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             return
         }
 
-        let now = Date().timeIntervalSince1970
-        let liveNow = lastPacketReceivedAt > 0 && (now - lastPacketReceivedAt) <= liveTimeoutSeconds
-        enqueueHUDFrame(for: currentTelemetry, isLive: liveNow)
-        isDisplayingStandby = !(liveNow && currentTelemetry.isInBattle)
-
+        enqueueHUDFrame(for: currentTelemetry)
         if !pipController.isPictureInPictureActive {
             pipController.startPictureInPicture()
         }
@@ -141,7 +134,6 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         packetTimestamps.append(now)
         packetTimestamps.removeAll { (now - $0) > 1.0 }
 
-        // Giảm tải cập nhật @Published SwiftUI xuống ~4 Hz khi đang ở tốc độ 25 FPS để tối ưu render PiP.
         if !isReceivingLiveStream || (now - lastPublishedStatsAt) >= 0.25 {
             lastPublishedStatsAt = now
             isReceivingLiveStream = true
@@ -149,48 +141,27 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             latestFrameId = telemetry.frameId
         }
 
-        currentTelemetry = telemetry
-
-        // Ngoài trận đấu: khóa tĩnh ở màn hình chờ, không vẽ lại liên tục.
-        guard telemetry.isInBattle else {
-            if !isDisplayingStandby {
-                cachedMinimapJPEG = nil
-                cachedMinimapCGImage = nil
-                isDisplayingStandby = true
-                enqueueHUDFrame(for: telemetry, isLive: true)
-            }
-            return
-        }
-
         if let jpegData = telemetry.minimapJPEG, jpegData != cachedMinimapJPEG {
             cachedMinimapJPEG = jpegData
             cachedMinimapCGImage = UIImage(data: jpegData)?.cgImage
         }
 
-        isDisplayingStandby = false
-        // Vẽ lại khung hình CMSampleBuffer ngay lập tức trong callback nhận gói UDP (25 FPS thực).
-        enqueueHUDFrame(for: telemetry, isLive: true)
+        currentTelemetry = telemetry
+        // Vẽ lại khung hình CMSampleBuffer ngay lập tức mỗi khi nhận gói UDP (25 FPS trực tiếp).
+        enqueueHUDFrame(for: telemetry)
     }
 
-    private func startDisconnectMonitor() {
-        disconnectMonitorTimer?.invalidate()
-        disconnectMonitorTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+    private func startStatsMonitor() {
+        statsMonitorTimer?.invalidate()
+        statsMonitorTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let now = Date().timeIntervalSince1970
                 self.packetTimestamps.removeAll { (now - $0) > 1.0 }
                 let liveNow = self.lastPacketReceivedAt > 0 && (now - self.lastPacketReceivedAt) <= self.liveTimeoutSeconds
-
-                if !liveNow {
-                    if self.isReceivingLiveStream || self.liveFPS != 0 {
-                        self.isReceivingLiveStream = false
-                        self.liveFPS = 0
-                    }
-                    if !self.isDisplayingStandby {
-                        self.isDisplayingStandby = true
-                        self.currentTelemetry = .waiting(frameId: self.latestFrameId)
-                        self.enqueueHUDFrame(for: self.currentTelemetry, isLive: false)
-                    }
+                if !liveNow && (self.isReceivingLiveStream || self.liveFPS != 0) {
+                    self.isReceivingLiveStream = false
+                    self.liveFPS = 0
                 }
             }
         }
@@ -260,13 +231,13 @@ final class PiPOverlayManager: NSObject, ObservableObject {
 
     // MARK: - CoreGraphics HUD Rendering (680 x 235 px)
 
-    private func enqueueHUDFrame(for telemetry: TelemetryData, isLive: Bool) {
+    private func enqueueHUDFrame(for telemetry: TelemetryData) {
         let displayLayer = sampleBufferView.displayLayer
         if displayLayer.status == .failed {
             displayLayer.flush()
         }
 
-        guard let sampleBuffer = renderHUDSampleBuffer(telemetry: telemetry, isLive: isLive) else { return }
+        guard let sampleBuffer = renderHUDSampleBuffer(telemetry: telemetry) else { return }
         if displayLayer.isReadyForMoreMediaData {
             displayLayer.enqueue(sampleBuffer)
         } else {
@@ -275,7 +246,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         }
     }
 
-    private func renderHUDSampleBuffer(telemetry: TelemetryData, isLive: Bool) -> CMSampleBuffer? {
+    private func renderHUDSampleBuffer(telemetry: TelemetryData) -> CMSampleBuffer? {
         let width = Int(renderSize.width)
         let height = Int(renderSize.height)
 
@@ -319,7 +290,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         cgContext.scaleBy(x: 1, y: -1)
 
         UIGraphicsPushContext(cgContext)
-        drawHUD(in: CGRect(origin: .zero, size: renderSize), telemetry: telemetry, isLive: isLive)
+        drawHUD(in: CGRect(origin: .zero, size: renderSize), telemetry: telemetry)
         UIGraphicsPopContext()
 
         var formatDescription: CMVideoFormatDescription?
@@ -359,10 +330,10 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         return sampleBuffer
     }
 
-    private func drawHUD(in rect: CGRect, telemetry: TelemetryData, isLive: Bool) {
+    private func drawHUD(in rect: CGRect, telemetry: TelemetryData) {
         let cgContext = UIGraphicsGetCurrentContext()
 
-        // Khung tổng thể 680 x 235 px.
+        // Khung tổng thể 680 x 235 px luôn hiển thị trực tiếp 24/24.
         UIColor(red: 0.025, green: 0.035, blue: 0.055, alpha: 1.0).setFill()
         UIRectFill(rect)
 
@@ -372,12 +343,6 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         UIColor(white: 1.0, alpha: 0.36).setStroke()
         outerPath.lineWidth = 1.4
         outerPath.stroke()
-
-        // Khi chưa vào trận (`isInBattle == false`): hiển thị màn hình chờ tĩnh tuyệt đối.
-        guard isLive && telemetry.isInBattle else {
-            drawWaitingScreen(in: rect, streamConnected: isLive)
-            return
-        }
 
         var displayTelemetry = telemetry
         if displayTelemetry.trajectoryPoints.count < 2 {
@@ -393,7 +358,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         let radarPanelRect = CGRect(x: 8, y: 6, width: 310, height: 165)
         drawRadarMinimapSection(in: radarPanelRect, telemetry: displayTelemetry, cgContext: cgContext)
 
-        // Nửa phải (350 x 165 px): CỰ LY, GÓC, LỰC BẮN (GIỮ) và gợi ý nhanh 30° | 50° | 65°.
+        // Nửa phải (350 x 165 px): CỰ LY, GÓC, LỰC BẮN (GIỮ), gợi ý 30° | 50° | 65° và chấm LIVE 24/24.
         let metricsPanelRect = CGRect(x: 322, y: 6, width: 350, height: 165)
         drawCombatMetricsSection(in: metricsPanelRect, telemetry: displayTelemetry)
 
@@ -409,52 +374,6 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         // Cạnh dưới toàn chiều ngang (680 x 60 px): Thước lực chi tiết 0 — 10 — ... — 100.
         let powerSectionRect = CGRect(x: 0, y: dividerY, width: rect.width, height: rect.height - dividerY)
         drawPowerBarSection(in: powerSectionRect, telemetry: displayTelemetry, cgContext: cgContext)
-    }
-
-    // MARK: - Static Standby Screen (isInBattle == false)
-
-    private func drawWaitingScreen(in rect: CGRect, streamConnected: Bool) {
-        let statusColor = UIColor(red: 1.0, green: 0.84, blue: 0.08, alpha: 1.0)
-        let badgeLabel = streamConnected ? "CHỜ TRẬN" : "CHỜ"
-        drawStatusPill(
-            text: badgeLabel,
-            color: statusColor,
-            topRightAnchor: CGPoint(x: rect.maxX - 14, y: rect.minY + 14)
-        )
-
-        let centerBox = CGRect(x: 42, y: 68, width: rect.width - 84, height: 98)
-        drawMetricCard(
-            in: centerBox,
-            fill: UIColor(red: 0.08, green: 0.11, blue: 0.18, alpha: 1.0),
-            stroke: statusColor.withAlphaComponent(0.45),
-            lineWidth: 1.3
-        )
-
-        let titleAttr = NSAttributedString(
-            string: "CHỜ VÀO TRẬN GUNNY MOBI",
-            attributes: [
-                .font: UIFont.systemFont(ofSize: 24.0, weight: .heavy),
-                .foregroundColor: statusColor
-            ]
-        )
-        let titleSize = titleAttr.size()
-        titleAttr.draw(at: CGPoint(
-            x: centerBox.midX - titleSize.width / 2.0,
-            y: centerBox.minY + 22
-        ))
-
-        let subtitleAttr = NSAttributedString(
-            string: "Bản Không Gió • Tự động bật khung ngắm 25 FPS khi vào chiến đấu ngang",
-            attributes: [
-                .font: UIFont.systemFont(ofSize: 12.5, weight: .semibold),
-                .foregroundColor: UIColor(white: 0.78, alpha: 1.0)
-            ]
-        )
-        let subtitleSize = subtitleAttr.size()
-        subtitleAttr.draw(at: CGPoint(
-            x: centerBox.midX - subtitleSize.width / 2.0,
-            y: centerBox.minY + 28 + titleSize.height + 6
-        ))
     }
 
     // MARK: - Top-Left Radar Minimap Panel (310 x 165 px)
@@ -474,10 +393,10 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         cgContext?.saveGState()
         panelPath.addClip()
 
-        // 1. Ảnh địa hình Minimap thực tế cắt từ trận đấu.
+        // 1. Ảnh địa hình Minimap cắt trực tiếp từ game.
         if let minimapCG = cachedMinimapCGImage {
             UIImage(cgImage: minimapCG).draw(in: mapRect)
-            UIColor(white: 0.0, alpha: 0.22).setFill()
+            UIColor(white: 0.0, alpha: 0.20).setFill()
             UIRectFill(mapRect)
         } else {
             let fallbackGrid = UIBezierPath()
@@ -512,7 +431,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         if telemetry.distanceUnits > 0.25 && absDxNorm > 0.02 {
             unitPx = max((absDxNorm * mapRect.width) / CGFloat(telemetry.distanceUnits), 4.0)
         } else {
-            unitPx = max((0.38 * mapRect.width) / 10.0, 4.0)
+            unitPx = max((0.62 * mapRect.width) / 10.0, 4.0)
         }
 
         cgContext?.saveGState()
@@ -533,8 +452,8 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             }
         }
 
-        // 3. Tia thẳng màu vàng chỉ góc bắn (hỗ trợ cả góc âm -30° tới 85°).
-        let angleRad = CGFloat(min(max(telemetry.angle, -30.0), 85.0) * .pi / 180.0)
+        // 3. Tia thẳng màu vàng chỉ góc bắn (-35° tới 85°).
+        let angleRad = CGFloat(min(max(telemetry.angle, -35.0), 85.0) * .pi / 180.0)
         let rayLen: CGFloat = 220.0
         let rayEnd = CGPoint(
             x: playerPoint.x + dirSign * cos(angleRad) * rayLen,
@@ -547,7 +466,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         angleRay.lineWidth = 1.4
         angleRay.stroke()
 
-        // 4. Đường cong parabol nét đứt màu xanh neon (#00FF88) cắm thẳng vào mục tiêu.
+        // 4. Đường cong parabol nét đứt màu xanh neon (#00FF88).
         let mappedTrajectory: [CGPoint] = telemetry.trajectoryPoints.map { pt in
             CGPoint(
                 x: mapRect.minX + pt.x * mapRect.width,
@@ -699,16 +618,16 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         panelPath.stroke()
     }
 
-    // MARK: - Top-Right Windless Combat Metrics Panel (350 x 165 px)
+    // MARK: - Top-Right Always-Live Combat Metrics Panel (350 x 165 px)
 
     private func drawCombatMetricsSection(
         in panelRect: CGRect,
         telemetry: TelemetryData
     ) {
-        // Hàng 1 (44px): CỰ LY (trái) & GÓC + chấm LIVE (phải).
-        let row1H: CGFloat = 44
-        let distCardRect = CGRect(x: panelRect.minX, y: panelRect.minY, width: 174, height: row1H)
-        let angleCardRect = CGRect(x: distCardRect.maxX + 8, y: panelRect.minY, width: panelRect.width - 182, height: row1H)
+        // Hàng 1 (46px): CỰ LY (trái) & GÓC + chấm LIVE 24/24 (phải).
+        let row1H: CGFloat = 46
+        let distCardRect = CGRect(x: panelRect.minX, y: panelRect.minY, width: 158, height: row1H)
+        let angleCardRect = CGRect(x: distCardRect.maxX + 6, y: panelRect.minY, width: panelRect.width - 164, height: row1H)
 
         drawMetricCard(in: distCardRect, fill: UIColor(red: 0.08, green: 0.11, blue: 0.18, alpha: 1.0), stroke: UIColor(white: 1.0, alpha: 0.16))
         drawMetricCard(in: angleCardRect, fill: UIColor(red: 0.08, green: 0.11, blue: 0.18, alpha: 1.0), stroke: UIColor(white: 1.0, alpha: 0.16))
@@ -716,40 +635,40 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         let distTitle = NSAttributedString(
             string: String(format: "CỰ LY: %.1f", telemetry.distanceUnits),
             attributes: [
-                .font: UIFont.monospacedDigitSystemFont(ofSize: 17.5, weight: .heavy),
+                .font: UIFont.monospacedDigitSystemFont(ofSize: 16.5, weight: .heavy),
                 .foregroundColor: UIColor.white
             ]
         )
-        distTitle.draw(at: CGPoint(x: distCardRect.minX + 10, y: distCardRect.minY + 6))
+        distTitle.draw(at: CGPoint(x: distCardRect.minX + 9, y: distCardRect.minY + 6))
 
         let screensSub = NSAttributedString(
             string: String(format: "%.2f màn hình", telemetry.screens),
             attributes: [
-                .font: UIFont.monospacedDigitSystemFont(ofSize: 10.0, weight: .semibold),
+                .font: UIFont.monospacedDigitSystemFont(ofSize: 9.8, weight: .semibold),
                 .foregroundColor: UIColor(red: 0.58, green: 0.84, blue: 1.0, alpha: 0.92)
             ]
         )
-        screensSub.draw(at: CGPoint(x: distCardRect.minX + 10, y: distCardRect.maxY - 16))
+        screensSub.draw(at: CGPoint(x: distCardRect.minX + 9, y: distCardRect.maxY - 16))
 
-        let angleStr = String(format: "GÓC: %.0f°", telemetry.angle)
+        // Chấm LIVE 24/24 nổi bật ở góc trên phải, không chồng lên số GÓC (kể cả góc âm -35°).
+        drawStatusPill(
+            text: "LIVE 24/24",
+            color: UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 1.0),
+            topRightAnchor: CGPoint(x: angleCardRect.maxX - 5, y: angleCardRect.minY + 4)
+        )
+
         let angleAttr = NSAttributedString(
-            string: angleStr,
+            string: String(format: "GÓC: %.0f°", telemetry.angle),
             attributes: [
-                .font: UIFont.monospacedDigitSystemFont(ofSize: 17.5, weight: .heavy),
+                .font: UIFont.monospacedDigitSystemFont(ofSize: 18.0, weight: .heavy),
                 .foregroundColor: UIColor(red: 1.0, green: 0.86, blue: 0.14, alpha: 1.0)
             ]
         )
-        angleAttr.draw(at: CGPoint(x: angleCardRect.minX + 10, y: angleCardRect.midY - angleAttr.size().height / 2.0))
+        angleAttr.draw(at: CGPoint(x: angleCardRect.minX + 9, y: angleCardRect.maxY - angleAttr.size().height - 4))
 
-        drawStatusPill(
-            text: "LIVE",
-            color: UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 1.0),
-            topRightAnchor: CGPoint(x: angleCardRect.maxX - 6, y: angleCardRect.minY + 10)
-        )
-
-        // Hàng 2 (74px): Ô nổi bật cỡ lớn LỰC BẮN + GIỮ (s) + ΔY.
+        // Hàng 2 (72px): Ô nổi bật cỡ lớn LỰC BẮN + GIỮ (s) + ΔY.
         let row2Y = distCardRect.maxY + 5
-        let row2Rect = CGRect(x: panelRect.minX, y: row2Y, width: panelRect.width, height: 74)
+        let row2Rect = CGRect(x: panelRect.minX, y: row2Y, width: panelRect.width, height: 72)
         drawMetricCard(
             in: row2Rect,
             fill: UIColor(red: 0.04, green: 0.14, blue: 0.12, alpha: 1.0),
@@ -764,22 +683,22 @@ final class PiPOverlayManager: NSObject, ObservableObject {
                 .foregroundColor: UIColor(red: 0.45, green: 1.0, blue: 0.75, alpha: 1.0)
             ]
         )
-        powerCaption.draw(at: CGPoint(x: row2Rect.minX + 12, y: row2Rect.minY + 7))
+        powerCaption.draw(at: CGPoint(x: row2Rect.minX + 12, y: row2Rect.minY + 6))
 
         let powerValAttr = NSAttributedString(
             string: String(format: "%.1f", telemetry.power),
             attributes: [
-                .font: UIFont.monospacedDigitSystemFont(ofSize: 36.0, weight: .heavy),
+                .font: UIFont.monospacedDigitSystemFont(ofSize: 35.0, weight: .heavy),
                 .foregroundColor: UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 1.0)
             ]
         )
         let powerValSize = powerValAttr.size()
-        powerValAttr.draw(at: CGPoint(x: row2Rect.minX + 12, y: row2Rect.maxY - powerValSize.height - 6))
+        powerValAttr.draw(at: CGPoint(x: row2Rect.minX + 12, y: row2Rect.maxY - powerValSize.height - 5))
 
         let subDividerX = row2Rect.maxX - 138
         let subDiv = UIBezierPath()
-        subDiv.move(to: CGPoint(x: subDividerX, y: row2Rect.minY + 11))
-        subDiv.addLine(to: CGPoint(x: subDividerX, y: row2Rect.maxY - 11))
+        subDiv.move(to: CGPoint(x: subDividerX, y: row2Rect.minY + 10))
+        subDiv.addLine(to: CGPoint(x: subDividerX, y: row2Rect.maxY - 10))
         UIColor(white: 1.0, alpha: 0.18).setStroke()
         subDiv.lineWidth = 1.0
         subDiv.stroke()
@@ -792,7 +711,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             ]
         )
         let holdSize = holdAttr.size()
-        holdAttr.draw(at: CGPoint(x: subDividerX + 12, y: row2Rect.minY + 15))
+        holdAttr.draw(at: CGPoint(x: subDividerX + 12, y: row2Rect.minY + 14))
 
         let deltaSign = telemetry.deltaY >= 0.0 ? "+" : ""
         let deltaYAttr = NSAttributedString(
@@ -802,9 +721,9 @@ final class PiPOverlayManager: NSObject, ObservableObject {
                 .foregroundColor: UIColor(white: 0.80, alpha: 1.0)
             ]
         )
-        deltaYAttr.draw(at: CGPoint(x: subDividerX + 12, y: row2Rect.minY + 18 + holdSize.height + 3))
+        deltaYAttr.draw(at: CGPoint(x: subDividerX + 12, y: row2Rect.minY + 17 + holdSize.height + 3))
 
-        // Hàng 3 (37px): Gợi ý nhanh 3 góc chuẩn 30° | 50° | 65°.
+        // Hàng 3 (37px): Gợi ý tra nhanh 3 góc chuẩn 30° | 50° | 65°.
         let row3Y = row2Rect.maxY + 5
         let row3Rect = CGRect(x: panelRect.minX, y: row3Y, width: panelRect.width, height: panelRect.maxY - row3Y)
         drawMetricCard(
@@ -860,25 +779,25 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         let attr = NSAttributedString(
             string: text,
             attributes: [
-                .font: UIFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .heavy),
+                .font: UIFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .heavy),
                 .foregroundColor: color
             ]
         )
         let size = attr.size()
-        let pillW = size.width + 18
-        let pillH: CGFloat = 22
+        let pillW = size.width + 16
+        let pillH: CGFloat = 17
         let pillRect = CGRect(x: topRightAnchor.x - pillW, y: topRightAnchor.y, width: pillW, height: pillH)
-        let path = UIBezierPath(roundedRect: pillRect, cornerRadius: 6)
-        color.withAlphaComponent(0.14).setFill()
+        let path = UIBezierPath(roundedRect: pillRect, cornerRadius: 5)
+        color.withAlphaComponent(0.15).setFill()
         path.fill()
-        color.withAlphaComponent(0.45).setStroke()
-        path.lineWidth = 1.0
+        color.withAlphaComponent(0.50).setStroke()
+        path.lineWidth = 0.9
         path.stroke()
 
-        let dotCenter = CGPoint(x: pillRect.minX + 8, y: pillRect.midY)
+        let dotCenter = CGPoint(x: pillRect.minX + 7, y: pillRect.midY)
         color.setFill()
-        UIBezierPath(arcCenter: dotCenter, radius: 3.4, startAngle: 0, endAngle: .pi * 2, clockwise: true).fill()
-        attr.draw(at: CGPoint(x: pillRect.minX + 14.5, y: pillRect.midY - size.height / 2.0))
+        UIBezierPath(arcCenter: dotCenter, radius: 2.9, startAngle: 0, endAngle: .pi * 2, clockwise: true).fill()
+        attr.draw(at: CGPoint(x: pillRect.minX + 12.5, y: pillRect.midY - size.height / 2.0))
     }
 
     private func drawCompactTag(
