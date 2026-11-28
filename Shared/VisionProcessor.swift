@@ -413,15 +413,27 @@ public final class AngleBitmapTemplateMatcher {
         var validColor = [UInt8](repeating: 0, count: total)
         var histogram = [Int](repeating: 0, count: 256)
 
+        // Giới hạn quét bên trong hình elip D-pad nội tiếp để loại hoàn toàn nền trời/đất sáng 4 góc ngoài.
+        let cxF = Double(w) * 0.5
+        let cyF = Double(h) * 0.5
+        let invRx2 = 1.0 / max((Double(w) * 0.43) * (Double(w) * 0.43), 1.0)
+        let invRy2 = 1.0 / max((Double(h) * 0.43) * (Double(h) * 0.43), 1.0)
+        var inCircleCount = 0
+
         for y in 0..<h {
             let gy = bounds.y0 + y
+            let dy = Double(y) - cyF
+            let dy2Term = dy * dy * invRy2
             let rowBase = y * w
             for x in 0..<w {
+                let dx = Double(x) - cxF
+                guard (dx * dx * invRx2 + dy2Term) <= 1.0 else { continue }
                 let gx = bounds.x0 + x
                 let (r, g, b) = buffer.readRGB(x: gx, y: gy)
                 let lum = (77 * r + 150 * g + 29 * b) >> 8
                 lumaBuf[rowBase + x] = lum
                 histogram[lum] += 1
+                inCircleCount += 1
                 // Chữ số góc màu trắng (R,G,B đều cao) hoặc xanh lơ sắc nét (G, B cao).
                 if (r >= 135 && g >= 135 && b >= 135) || (g >= 150 && b >= 165 && r <= b) {
                     validColor[rowBase + x] = 1
@@ -429,8 +441,12 @@ public final class AngleBitmapTemplateMatcher {
             }
         }
 
-        let loLuma = percentileFromHistogram(histogram, total: total, ratio: 0.25)
-        let hiLuma = percentileFromHistogram(histogram, total: total, ratio: 0.96)
+        guard inCircleCount >= 32 else {
+            return DPadAngleResult(angle: nil, isExplicitZero: false, confidence: 0.0)
+        }
+
+        let loLuma = percentileFromHistogram(histogram, total: inCircleCount, ratio: 0.25)
+        let hiLuma = percentileFromHistogram(histogram, total: inCircleCount, ratio: 0.992)
         guard hiLuma - loLuma >= 50, hiLuma >= 130 else {
             return DPadAngleResult(angle: nil, isExplicitZero: false, confidence: 0.0)
         }

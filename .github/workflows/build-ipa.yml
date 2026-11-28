@@ -20,10 +20,11 @@ jobs:
       - name: Run Automated Swift Tests (Zero-Vision Raw BGRA + UDP)
         run: |
           if grep -rnE "(import\s+Vision|import\s+CoreImage|\bCIContext\b|\bUIImage\b)" BroadcastExtension Shared; then
-            echo "ERROR: Forbidden Vision/CoreImage/UIImage API found in BroadcastExtension or Shared"
+            echo "::error::Forbidden Vision/CoreImage/UIImage API found in BroadcastExtension or Shared"
             exit 1
           fi
-          swiftc -O -parse-as-library \
+          set -o pipefail
+          if ! swiftc -O -parse-as-library \
             -framework CoreGraphics \
             -framework CoreVideo \
             -framework CoreText \
@@ -31,9 +32,19 @@ jobs:
             Shared/BallisticsEngine.swift \
             Shared/VisionProcessor.swift \
             Tests/GunnyCalcTests.swift \
-            -o GunnyCalcTestRunner
-          ./GunnyCalcTestRunner
-          rm -f GunnyCalcTestRunner
+            -o GunnyCalcTestRunner 2>&1 | tee test_compile.log; then
+            head -n 20 test_compile.log | while IFS= read -r line; do
+              echo "::error::swiftc: $line"
+            done
+            exit 1
+          fi
+          if ! ./GunnyCalcTestRunner 2>&1 | tee test_run.log; then
+            tail -n 20 test_run.log | while IFS= read -r line; do
+              echo "::error::test: $line"
+            done
+            exit 1
+          fi
+          rm -f GunnyCalcTestRunner test_compile.log test_run.log
 
       - name: Install XcodeGen and generate Xcode project
         run: |
