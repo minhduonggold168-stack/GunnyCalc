@@ -7,11 +7,11 @@ import Foundation
 import ImageIO
 import ReplayKit
 
-/// Handler nhận khung hình thụ động từ ReplayKit đạt độ trễ < 0.1s (< 20MB RAM).
-/// - Tắt hoàn toàn EMA (độ trễ = 0 khung hình), chạy 30 FPS (33ms) ngay khi màn hình xoay ngang (`width > height`).
-/// - Quét dải giữa Minimap (`x: 0.848, y: 0.045, w: 0.148, h: 0.095`) qua `ciRectFromTopLeft` theo chuẩn `20.0` đơn vị (`abs(enemyX - playerX) * 20.0`).
-/// - Chạy OCR đen trắng tương phản cao (`contrast = 1.8, saturation = 0.0`, `.accurate`, `["vi-VN", "en-US"]`) song song mỗi 50ms.
-/// - Gửi gói JSON siêu nhỏ (< 50 bytes) qua BSD UDP `127.0.0.1:45678` an toàn tuyệt đối (không `!`, không `fatalError`).
+/// Handler nhận khung hình thụ động từ ReplayKit (< 25MB RAM, độ trễ < 0.1s).
+/// - Thuật toán 1: Phân cụm không gian màu HSV + Connected-Component Labeling 8 hướng + tự đo khung camera trắng (`10.0` đơn vị).
+/// - Thuật toán 2: Trích xuất địa hình 32 cột & Terrain Raycast 25 điểm cảnh báo vướng núi (`isBlocked`, `suggestedAngle`).
+/// - Thuật toán 3: Theo dõi vệt nổ sau phát bắn & tự học `mapScaleMultiplier` (`learningRate = 0.15`, `0.85...1.15`).
+/// - Gửi gói JSON qua BSD UDP `127.0.0.1:45678` an toàn tuyệt đối (không `!`, không `fatalError`).
 final class SampleHandler: RPBroadcastSampleHandler {
     private let sharedCIContext = CIContext(options: [
         .useSoftwareRenderer: false,
@@ -20,6 +20,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private let grayColorSpace = CGColorSpaceCreateDeviceGray()
     private let visionProcessor = VisionProcessor()
     private let ballisticsEngine = BallisticsEngine()
+    private let calibrationEngine = AdaptiveCalibrationEngine()
     private let ipc = SharedIPC.shared
 
     private let stateLock = NSLock()
@@ -40,13 +41,26 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var frameCounter: Int = 0
 
     // Trạng thái tức thời (không làm mượt EMA).
-    private var lastPlayerX: Double = 0.20
-    private var lastDistanceUnits: Double = 10.0
+    private var lastPlayerPos = CGPoint(x: 0.20, y: 0.72)
+    private var lastEnemyPos = CGPoint(x: 0.70, y: 0.72)
+    private var lastCameraWidthNorm: Double = 0.50 // 10.0 đơn vị = 50% Minimap (20.0 đơn vị toàn bản đồ)
+    private var lastMinimapAspect: Double = 0.36
+    private var lastTerrainProfile: [Double] = []
+    private var lastRawDistanceUnits: Double = 10.0
     private var lastAngle: Int = 50
+
+    // Trạng thái theo dõi phát bắn cho Adaptive Online Calibration.
+    private var consecutiveNilOCR: Int = 0
+    private var isShotInFlight: Bool = false
+    private var shotStartedAt: TimeInterval = 0
+    private var preShotPlayerX: Double = 0.20
+    private var preShotTargetDistance: Double = 10.0
+    private var preShotCameraWidthNorm: Double = 0.50
+    private var preShotBaselineLuma: [UInt8] = []
 
     private let minimumFrameInterval: TimeInterval = 0.033 // 30 FPS (33ms)
     private let minimumOCRInterval: TimeInterval = 0.050   // 20 Hz (50ms)
-    private let maxGrayAngleWidth: CGFloat = 640.0
+    private let maxAngleCropWidth: CGFloat = 640.0
 
     deinit {
         stopHeartbeatTimer()
@@ -63,11 +77,19 @@ final class SampleHandler: RPBroadcastSampleHandler {
         isCurrentlyLandscape = false
         frameCounter = 1
         lastPacketSentTime = now
-        lastPlayerX = 0.20
-        lastDistanceUnits = 10.0
+        lastPlayerPos = CGPoint(x: 0.20, y: 0.72)
+        lastEnemyPos = CGPoint(x: 0.70, y: 0.72)
+        lastCameraWidthNorm = 0.50
+        lastMinimapAspect = 0.36
+        lastTerrainProfile = []
+        lastRawDistanceUnits = 10.0
         lastAngle = 50
-        let startupPower = ballisticsEngine.calculatePower(distanceUnits: lastDistanceUnits, angle: lastAngle)
-        let startupTelemetry = TelemetryData(frameId: 1, angle: lastAngle, power: startupPower)
+        consecutiveNilOCR = 0
+        isShotInFlight = false
+        preShotBaselineLuma = []
+        calibrationEngine.reset()
+
+        let startupTelemetry = buildTelemetryLocked(frameId: 1)
         stateLock.unlock()
 
         sendUDPPacket(startupTelemetry)
@@ -132,33 +154,68 @@ final class SampleHandler: RPBroadcastSampleHandler {
                 return
             }
 
-            // 1. Cắt trực tiếp dải giữa Minimap (dưới nút [X], trên thước vàng) ở độ phân giải gốc.
-            let stripPositions: MinimapStripPositions?
+            stateLock.lock()
+            let fallbackPlayer = lastPlayerPos
+            let fallbackEnemy = lastEnemyPos
+            stateLock.unlock()
+
+            // 1. Phân tích Minimap (HSV + 8-Neighbor CCL + khung camera trắng + địa hình 32 cột).
+            let analysis: MinimapAnalysisResult?
             if let nativeStrip = renderNativeMinimapStrip(from: ciImage) {
-                stripPositions = visionProcessor.detectMinimapStripPositions(from: nativeStrip)
+                analysis = visionProcessor.analyzeMinimap(
+                    from: nativeStrip,
+                    fallbackPlayerPos: fallbackPlayer,
+                    fallbackEnemyPos: fallbackEnemy
+                )
             } else {
-                stripPositions = nil
+                analysis = nil
             }
 
             stateLock.lock()
             isCurrentlyLandscape = true
 
-            if let strip = stripPositions {
-                if let px = strip.playerX {
-                    lastPlayerX = px
+            if let analysis {
+                lastMinimapAspect = analysis.minimapAspectHOverW
+                lastTerrainProfile = analysis.terrainProfile
+
+                // Khóa tự động chiều rộng khung camera trắng = 10.0 đơn vị cự ly theo tỷ lệ zoom từng bản đồ.
+                if let camW = analysis.cameraWidthNorm, camW >= 0.22, camW <= 0.88 {
+                    lastCameraWidthNorm = camW
                 }
-                if !strip.enemyXs.isEmpty {
-                    var nearestEnemyX = strip.enemyXs[0]
-                    var bestDelta = abs(nearestEnemyX - lastPlayerX)
-                    for ex in strip.enemyXs.dropFirst() {
-                        let d = abs(ex - lastPlayerX)
-                        if d < bestDelta {
-                            bestDelta = d
-                            nearestEnemyX = ex
-                        }
+
+                if let playerPos = analysis.playerPos {
+                    lastPlayerPos = playerPos
+                }
+
+                if let nearestEnemy = analysis.enemyPositions.first {
+                    lastEnemyPos = nearestEnemy
+                    let safeCamW = min(max(lastCameraWidthNorm, 0.20), 0.90)
+                    lastRawDistanceUnits = (abs(Double(nearestEnemy.x - lastPlayerPos.x)) / safeCamW) * BallisticsEngine.unitsPerScreen
+                }
+
+                // Thuật toán 3: Theo dõi vệt nổ trên Minimap khi đạn đang bay để tự học `mapScaleMultiplier`.
+                if isShotInFlight {
+                    if (now - shotStartedAt) > 5.0 {
+                        isShotInFlight = false
+                    } else if !preShotBaselineLuma.isEmpty,
+                              let impactX = visionProcessor.detectImpactFlashX(
+                                  baseline: preShotBaselineLuma,
+                                  current: analysis.lumaGrid64x24,
+                                  playerX: preShotPlayerX
+                              ) {
+                        let safeCamW = min(max(preShotCameraWidthNorm, 0.20), 0.90)
+                        let actualDistance = (abs(impactX - preShotPlayerX) / safeCamW) * BallisticsEngine.unitsPerScreen
+                        calibrationEngine.recordShotOutcome(
+                            targetDistance: preShotTargetDistance,
+                            actualDistance: actualDistance
+                        )
+                        isShotInFlight = false
                     }
-                    // Toàn bộ chiều rộng Minimap = 20.0 đơn vị cự ly (1 màn hình = 10.0 đơn vị).
-                    lastDistanceUnits = abs(nearestEnemyX - lastPlayerX) * BallisticsEngine.minimapTotalUnits
+                } else {
+                    preShotPlayerX = Double(lastPlayerPos.x)
+                    preShotTargetDistance = lastRawDistanceUnits
+                    preShotCameraWidthNorm = lastCameraWidthNorm
+                    preShotBaselineLuma = analysis.lumaGrid64x24
                 }
             }
 
@@ -170,14 +227,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
             frameCounter += 1
             let currentFrameId = frameCounter
-            let currentAngle = lastAngle
-            let currentDistance = lastDistanceUnits
             lastPacketSentTime = Date().timeIntervalSince1970
+            let telemetry = buildTelemetryLocked(frameId: currentFrameId)
             stateLock.unlock()
 
-            // Tính lực bắn tức thời (0 khung hình trễ) và bắn gói UDP < 60 byte ngay lập tức.
-            let power = ballisticsEngine.calculatePower(distanceUnits: currentDistance, angle: currentAngle)
-            let telemetry = TelemetryData(frameId: currentFrameId, angle: currentAngle, power: power)
             sendUDPPacket(telemetry)
 
             // 2. Chạy OCR đen trắng tương phản cao (.accurate) trên luồng song song mỗi 50ms.
@@ -205,36 +258,56 @@ final class SampleHandler: RPBroadcastSampleHandler {
                     self.stateLock.unlock()
                 }
 
-                guard let detectedAngle = self.visionProcessor.detectAngle(fromContrastImage: contrastAngleImage) else {
-                    return
-                }
+                let detectedAngle = self.visionProcessor.detectAngle(fromContrastImage: contrastAngleImage)
 
                 self.stateLock.lock()
-                let angleChanged = detectedAngle != self.lastAngle
-                self.lastAngle = detectedAngle
-                let currentDistance = self.lastDistanceUnits
-                let immediateFrameId: Int
-                if angleChanged {
-                    self.frameCounter += 1
-                    immediateFrameId = self.frameCounter
-                    self.lastPacketSentTime = Date().timeIntervalSince1970
+                if let detectedAngle {
+                    let angleChanged = detectedAngle != self.lastAngle
+                    self.lastAngle = detectedAngle
+                    self.consecutiveNilOCR = 0
+                    self.isShotInFlight = false
+
+                    if angleChanged {
+                        self.frameCounter += 1
+                        let immediateId = self.frameCounter
+                        self.lastPacketSentTime = Date().timeIntervalSince1970
+                        let immediateTelemetry = self.buildTelemetryLocked(frameId: immediateId)
+                        self.stateLock.unlock()
+                        self.sendUDPPacket(immediateTelemetry)
+                        return
+                    }
                 } else {
-                    immediateFrameId = self.frameCounter
+                    // Khi chữ góc biến mất liên tiếp >= 2 lần (~100ms), kích hoạt theo dõi điểm rơi/vụ nổ trên Minimap.
+                    self.consecutiveNilOCR += 1
+                    if self.consecutiveNilOCR >= 2 && !self.isShotInFlight && !self.preShotBaselineLuma.isEmpty {
+                        self.isShotInFlight = true
+                        self.shotStartedAt = Date().timeIntervalSince1970
+                    }
                 }
                 self.stateLock.unlock()
-
-                // Nếu góc vừa đổi, đẩy ngay gói UDP mới để đạt phản hồi < 50ms mà không cần chờ khung video kế tiếp.
-                if angleChanged {
-                    let immediatePower = self.ballisticsEngine.calculatePower(
-                        distanceUnits: currentDistance,
-                        angle: detectedAngle
-                    )
-                    self.sendUDPPacket(
-                        TelemetryData(frameId: immediateFrameId, angle: detectedAngle, power: immediatePower)
-                    )
-                }
             }
         }
+    }
+
+    // MARK: - Telemetry Assembly (Ballistics + Terrain Raycast + Online Calibration)
+
+    private func buildTelemetryLocked(frameId: Int) -> TelemetryData {
+        let calibratedDist = calibrationEngine.calibratedDistance(rawDistanceUnits: lastRawDistanceUnits)
+        let power = ballisticsEngine.calculatePower(distanceUnits: calibratedDist, angle: lastAngle)
+        let raycast = ballisticsEngine.checkTerrainObstruction(
+            playerPos: lastPlayerPos,
+            enemyPos: lastEnemyPos,
+            minimapAspectHOverW: lastMinimapAspect,
+            terrainProfile: lastTerrainProfile,
+            angle: lastAngle
+        )
+        return TelemetryData(
+            frameId: frameId,
+            angle: lastAngle,
+            power: power,
+            isBlocked: raycast.isBlocked,
+            suggestedAngle: raycast.suggestedAngle
+        )
     }
 
     // MARK: - Heartbeat Timer (0.5s when static landscape)
@@ -275,18 +348,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         frameCounter += 1
         let currentFrameId = frameCounter
-        let currentAngle = lastAngle
-        let currentDistance = lastDistanceUnits
         lastPacketSentTime = now
+        let telemetry = buildTelemetryLocked(frameId: currentFrameId)
         stateLock.unlock()
 
-        let power = ballisticsEngine.calculatePower(distanceUnits: currentDistance, angle: currentAngle)
-        let telemetry = TelemetryData(frameId: currentFrameId, angle: currentAngle, power: power)
         sendUDPPacket(telemetry)
         ipc.saveTelemetry(telemetry)
     }
 
-    // MARK: - Safe Darwin BSD UDP Sender (< 60 bytes JSON)
+    // MARK: - Safe Darwin BSD UDP Sender
 
     private func ensureUDPSocketLocked() -> (Int32, sockaddr_in)? {
         if udpSocketFD >= 0, let existingDest = udpDestination {
@@ -374,7 +444,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         udpLock.unlock()
     }
 
-    // MARK: - Orientation, Native Strip Crop & Grayscale Angle Crop
+    // MARK: - Orientation, Native Minimap Crop & High-Contrast Angle Crop
 
     private func extractVideoOrientation(from sampleBuffer: CMSampleBuffer) -> CGImagePropertyOrientation {
         if let attachment = CMGetAttachment(
@@ -422,8 +492,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
             .cropped(to: cropRect)
             .transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
 
-        if patch.extent.width > maxGrayAngleWidth, patch.extent.width > 0 {
-            let scale = maxGrayAngleWidth / patch.extent.width
+        if patch.extent.width > maxAngleCropWidth, patch.extent.width > 0 {
+            let scale = maxAngleCropWidth / patch.extent.width
             patch = patch.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
         }
 

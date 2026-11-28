@@ -24,7 +24,10 @@ enum GunnyCalcTestMain {
 
         run("testCoordinateFlip", testCoordinateFlip)
         run("testAngleParser", testAngleParser)
-        run("testMinimapAndBallistics", testMinimapAndBallistics)
+        run("testHSVClusteringOnRedBrickBackground", testHSVClusteringOnRedBrickBackground)
+        run("testTerrainRaycastCheck", testTerrainRaycastCheck)
+        run("testAdaptiveOnlineCalibration", testAdaptiveOnlineCalibration)
+        run("testMinimapAndBallisticsEndToEnd", testMinimapAndBallisticsEndToEnd)
         run("testUDPLatency", testUDPLatency)
 
         print("SUMMARY: \(passed)/\(passed + failed) tests PASSED")
@@ -55,13 +58,13 @@ enum GunnyCalcTestMain {
             imageWidth: imgW,
             imageHeight: imgH
         )
-        // Minimap Top-Left y=0.045, h=0.095 -> CoreImage Bottom-Left y=(1 - 0.14)*886 = 761.96 (upper half!)
+        // Minimap Top-Left y=0.042, h=0.114 -> CoreImage Bottom-Left y=(1 - 0.156)*886 = 747.78 (upper half!)
         try expect(
             minimapRect.origin.y > imgH * 0.5,
             "Expected minimap Y in upper half of CoreImage (> \(imgH * 0.5)), got \(minimapRect.origin.y)"
         )
         try expect(
-            abs(minimapRect.origin.x - 1628.0) <= 2.0 && abs(minimapRect.origin.y - 761.0) <= 2.0,
+            abs(minimapRect.origin.x - 1628.0) <= 2.0 && abs(minimapRect.origin.y - 747.0) <= 2.0,
             "Unexpected minimap origin: \(minimapRect.origin)"
         )
         try expect(
@@ -74,11 +77,7 @@ enum GunnyCalcTestMain {
             imageWidth: imgW,
             imageHeight: imgH
         )
-        // Angle Top-Left y=0.14, h=0.54 -> CoreImage Bottom-Left y=(1 - 0.68)*886 = 283.52
-        try expect(
-            abs(angleRect.origin.y - 283.0) <= 2.0,
-            "Unexpected angle rect Y: \(angleRect.origin.y)"
-        )
+        try expect(abs(angleRect.origin.y - 283.0) <= 2.0, "Unexpected angle rect Y: \(angleRect.origin.y)")
 
         return "minimapCI=\(minimapRect), angleCI=\(angleRect)"
     }
@@ -106,12 +105,224 @@ enum GunnyCalcTestMain {
             )
         }
 
-        return "verified \(cases.count) regex cases (65, 65, 65, 65, -18, bounds)"
+        return "verified \(cases.count) regex cases"
     }
 
-    // MARK: - 3. testMinimapAndBallistics
+    // MARK: - 3. testHSVClusteringOnRedBrickBackground
 
-    private static func testMinimapAndBallistics() throws -> String {
+    private static func testHSVClusteringOnRedBrickBackground() throws -> String {
+        let w = 284
+        let h = 101
+        let rgbSpace = CGColorSpaceCreateDeviceRGB()
+
+        guard let ctx = CGContext(
+            data: nil,
+            width: w,
+            height: h,
+            bitsPerComponent: 8,
+            bytesPerRow: w * 4,
+            space: rgbSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        ) else {
+            throw TestFailure(description: "Failed to allocate minimap CGContext")
+        }
+
+        // Phủ toàn bộ nền gạch đỏ (S=0.69 < 0.78), đất nâu (H=22°, S=0.65), dung nham cam (H=24°) để thử bộ lọc HSV.
+        ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [180.0 / 255.0, 70.0 / 255.0, 55.0 / 255.0, 1.0])!)
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+
+        ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [145.0 / 255.0, 85.0 / 255.0, 50.0 / 255.0, 1.0])!)
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h / 2))
+
+        ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [245.0 / 255.0, 110.0 / 255.0, 20.0 / 255.0, 1.0])!)
+        ctx.fill(CGRect(x: 30, y: 10, width: 100, height: 22))
+
+        // Vẽ khung camera trắng (S=0, V=1.0) rộng đúng 50% (10.0 đơn vị).
+        let camRect = CGRect(x: 20, y: 12, width: 142, height: 76)
+        ctx.setStrokeColor(CGColor(colorSpace: rgbSpace, components: [1.0, 1.0, 1.0, 1.0])!)
+        ctx.setLineWidth(2.0)
+        ctx.stroke(camRect)
+
+        // Người chơi xanh dương chuẩn HSV (H=220°, S=0.92, V=0.96) tại x = 3.5 / 20.0.
+        let blueX = (3.5 / 20.0) * Double(w)
+        ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [20.0 / 255.0, 95.0 / 255.0, 245.0 / 255.0, 1.0])!)
+        ctx.fill(CGRect(x: blueX - 4.0, y: 40.0, width: 8.0, height: 8.0))
+
+        // Mục tiêu đỏ chuẩn HSV (H=0°, S=0.91, V=0.96) tại x = 17.5 / 20.0.
+        let redX = (17.5 / 20.0) * Double(w)
+        ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [245.0 / 255.0, 22.0 / 255.0, 22.0 / 255.0, 1.0])!)
+        ctx.fill(CGRect(x: redX - 4.0, y: 40.0, width: 8.0, height: 8.0))
+
+        guard let minimapImage = ctx.makeImage() else {
+            throw TestFailure(description: "Failed to make brick-background minimap image")
+        }
+
+        let vision = VisionProcessor()
+        let t0 = CFAbsoluteTimeGetCurrent()
+        guard let result = vision.analyzeMinimap(from: minimapImage) else {
+            throw TestFailure(description: "analyzeMinimap returned nil")
+        }
+        let elapsedMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+
+        try expect(elapsedMs < 50.0, String(format: "HSV analysis took %.2fms (>= 50ms)", elapsedMs))
+        guard let player = result.playerPos else {
+            throw TestFailure(description: "Failed to detect blue player marker on brick background")
+        }
+        try expect(
+            result.enemyPositions.count == 1,
+            "Expected exactly 1 red enemy (zero brick/lava false positives), got \(result.enemyPositions.count)"
+        )
+        let enemy = result.enemyPositions[0]
+        try expect(abs(Double(player.x) - 3.5 / 20.0) <= 0.03, "Unexpected playerX: \(player.x)")
+        try expect(abs(Double(enemy.x) - 17.5 / 20.0) <= 0.03, "Unexpected enemyX: \(enemy.x)")
+
+        guard let camW = result.cameraWidthNorm else {
+            throw TestFailure(description: "Failed to detect white camera viewport width")
+        }
+        try expect(abs(camW - 0.50) <= 0.03, "Expected cameraWidthNorm ≈ 0.50, got \(camW)")
+
+        return String(format: "enemies=1 (0 brick false positives), camW=%.2f, latency=%.2fms (<50ms)", camW, elapsedMs)
+    }
+
+    // MARK: - 4. testTerrainRaycastCheck
+
+    private static func testTerrainRaycastCheck() throws -> String {
+        let w = 284
+        let h = 101
+        let rgbSpace = CGColorSpaceCreateDeviceRGB()
+
+        guard let ctx = CGContext(
+            data: nil,
+            width: w,
+            height: h,
+            bitsPerComponent: 8,
+            bytesPerRow: w * 4,
+            space: rgbSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        ) else {
+            throw TestFailure(description: "Failed to allocate terrain CGContext")
+        }
+
+        // Bầu trời tối.
+        ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [0.06, 0.08, 0.12, 1.0])!)
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+
+        // Mặt đất phẳng thấp (height = 20% từ đáy).
+        ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [0.48, 0.40, 0.30, 1.0])!)
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: 20))
+
+        // Vách núi cao dựng đứng chắn ở giữa (height = 82% từ đáy, từ x = 42% đến 58%).
+        ctx.fill(CGRect(x: Int(0.42 * Double(w)), y: 0, width: Int(0.16 * Double(w)), height: 83))
+
+        // Người chơi bên trái (x=0.20, y từ đáy=24px) và mục tiêu bên phải (x=0.80, y từ đáy=24px).
+        ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [20.0 / 255.0, 95.0 / 255.0, 245.0 / 255.0, 1.0])!)
+        ctx.fill(CGRect(x: 0.20 * Double(w) - 4.0, y: 20.0, width: 8.0, height: 8.0))
+        ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [245.0 / 255.0, 22.0 / 255.0, 22.0 / 255.0, 1.0])!)
+        ctx.fill(CGRect(x: 0.80 * Double(w) - 4.0, y: 20.0, width: 8.0, height: 8.0))
+
+        guard let mountainImage = ctx.makeImage() else {
+            throw TestFailure(description: "Failed to create mountain minimap image")
+        }
+
+        let vision = VisionProcessor()
+        let engine = BallisticsEngine()
+        let t0 = CFAbsoluteTimeGetCurrent()
+        guard let analysis = vision.analyzeMinimap(from: mountainImage),
+              let player = analysis.playerPos,
+              let enemy = analysis.enemyPositions.first else {
+            throw TestFailure(description: "Failed to analyze mountain minimap")
+        }
+
+        try expect(analysis.terrainProfile.count == 32, "Expected 32 terrain columns, got \(analysis.terrainProfile.count)")
+        let peakTerrain = analysis.terrainProfile.max() ?? 0.0
+        try expect(peakTerrain >= 0.75, "Expected mountain peak >= 0.75 in terrainProfile, got \(peakTerrain)")
+
+        // Tại góc thấp 20°, đạn chắc chắn đâm xuyên núi -> isBlocked == true và gợi ý góc nâng > 20°.
+        let lowAngleCheck = engine.checkTerrainObstruction(
+            playerPos: player,
+            enemyPos: enemy,
+            minimapAspectHOverW: analysis.minimapAspectHOverW,
+            terrainProfile: analysis.terrainProfile,
+            angle: 20
+        )
+        let elapsedMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+
+        try expect(lowAngleCheck.isBlocked, "Expected angle 20° to be BLOCKED by central mountain")
+        try expect(
+            lowAngleCheck.suggestedAngle > 20 && lowAngleCheck.suggestedAngle <= 85,
+            "Expected suggestedAngle in 21...85, got \(lowAngleCheck.suggestedAngle)"
+        )
+
+        // Kiểm tra lại tại góc gợi ý -> phải vượt qua núi (isBlocked == false).
+        let clearedCheck = engine.checkTerrainObstruction(
+            playerPos: player,
+            enemyPos: enemy,
+            minimapAspectHOverW: analysis.minimapAspectHOverW,
+            terrainProfile: analysis.terrainProfile,
+            angle: lowAngleCheck.suggestedAngle
+        )
+        try expect(!clearedCheck.isBlocked, "Expected suggestedAngle \(lowAngleCheck.suggestedAngle)° to clear mountain")
+
+        // Bản đồ phẳng hoàn toàn -> góc 20° không bị chặn.
+        let flatCheck = engine.checkTerrainObstruction(
+            playerPos: player,
+            enemyPos: enemy,
+            minimapAspectHOverW: analysis.minimapAspectHOverW,
+            terrainProfile: [Double](repeating: 0.15, count: 32),
+            angle: 20
+        )
+        try expect(!flatCheck.isBlocked, "Expected flat map at 20° to be unobstructed")
+        try expect(elapsedMs < 50.0, String(format: "Terrain raycast pipeline took %.2fms (>= 50ms)", elapsedMs))
+
+        return String(
+            format: "peak=%.2f, 20° blocked=true -> suggested=%d° (clears!), latency=%.2fms",
+            peakTerrain,
+            lowAngleCheck.suggestedAngle,
+            elapsedMs
+        )
+    }
+
+    // MARK: - 5. testAdaptiveOnlineCalibration
+
+    private static func testAdaptiveOnlineCalibration() throws -> String {
+        let cal = AdaptiveCalibrationEngine()
+        try expect(abs(cal.mapScaleMultiplier - 1.0) < 0.0001, "Initial multiplier must be 1.0")
+
+        // Lệch trong deadband <= 0.30 -> không đổi hệ số.
+        let unchanged = cal.recordShotOutcome(targetDistance: 14.0, actualDistance: 13.8)
+        try expect(abs(unchanged - 1.0) < 0.0001, "Error 0.2 <= 0.30 should not alter multiplier")
+
+        // Bắn hụt (actual 12.0 < target 14.0) -> tăng multiplier (> 1.0).
+        let afterShort = cal.recordShotOutcome(targetDistance: 14.0, actualDistance: 12.0)
+        try expect(afterShort > 1.01 && afterShort <= 1.15, "Short shot should increase multiplier, got \(afterShort)")
+
+        // Bắn lố nhiều lần -> giảm multiplier và luôn giữ trong biên [0.85, 1.15].
+        var mult = afterShort
+        for _ in 0..<20 {
+            mult = cal.recordShotOutcome(targetDistance: 10.0, actualDistance: 18.0)
+        }
+        try expect(mult >= 0.85 && mult <= 1.15, "Multiplier out of bounds [0.85, 1.15]: \(mult)")
+        try expect(abs(mult - 0.85) < 0.001, "Expected lower clamp at 0.85, got \(mult)")
+
+        // Kiểm tra phát hiện tâm vụ nổ trên lưới luma 64x24.
+        let baseline = [UInt8](repeating: 30, count: VisionProcessor.lumaGridWidth * VisionProcessor.lumaGridHeight)
+        var afterFlash = baseline
+        for gy in 10...14 {
+            for gx in 44...48 {
+                afterFlash[gy * VisionProcessor.lumaGridWidth + gx] = 245
+            }
+        }
+        guard let flashX = VisionProcessor().detectImpactFlashX(baseline: baseline, current: afterFlash, playerX: 0.20) else {
+            throw TestFailure(description: "Failed to detect explosion flash X on 64x24 grid")
+        }
+        try expect(abs(flashX - (46.0 / 64.0)) <= 0.04, "Unexpected flashX: \(flashX)")
+
+        return String(format: "short=%.4f, clampedLow=%.2f, flashX=%.2f", afterShort, mult, flashX)
+    }
+
+    // MARK: - 6. testMinimapAndBallisticsEndToEnd
+
+    private static func testMinimapAndBallisticsEndToEnd() throws -> String {
         let imgW = 1920
         let imgH = 886
         let rgbSpace = CGColorSpaceCreateDeviceRGB()
@@ -129,7 +340,6 @@ enum GunnyCalcTestMain {
             throw TestFailure(description: "Failed to allocate 1920x886 CGContext")
         }
 
-        // Nền chiến trường tối giả lập màn hình ngang 1920x886.
         ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [0.08, 0.11, 0.16, 1.0])!)
         ctx.fill(CGRect(x: 0, y: 0, width: imgW, height: imgH))
 
@@ -141,18 +351,26 @@ enum GunnyCalcTestMain {
         ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [0.05, 0.08, 0.12, 1.0])!)
         ctx.fill(minimapCI)
 
-        // Cụm xanh dương đậm người chơi tại x = 3.5 / 20.0 trong Minimap (B > 165, B-R > 75, B-G > 55).
-        let blueX = minimapCI.minX + (3.5 / 20.0) * minimapCI.width
-        let dotY = minimapCI.midY
-        ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [20.0 / 255.0, 90.0 / 255.0, 245.0 / 255.0, 1.0])!)
-        ctx.fill(CGRect(x: blueX - 5.0, y: dotY - 5.0, width: 10.0, height: 10.0))
+        // Khung camera trắng 50% (10.0 đơn vị).
+        ctx.setStrokeColor(CGColor(colorSpace: rgbSpace, components: [1.0, 1.0, 1.0, 1.0])!)
+        ctx.setLineWidth(2.0)
+        ctx.stroke(CGRect(
+            x: minimapCI.minX + 16.0,
+            y: minimapCI.minY + 12.0,
+            width: minimapCI.width * 0.50,
+            height: minimapCI.height - 24.0
+        ))
 
-        // Cụm đỏ mục tiêu tại x = 17.5 / 20.0 trong Minimap (R > 155, R-G > 55, R-B > 55).
+        // Người chơi xanh dương tại x = 3.5 / 20.0 và mục tiêu đỏ tại x = 17.5 / 20.0.
+        let blueX = minimapCI.minX + (3.5 / 20.0) * minimapCI.width
         let redX = minimapCI.minX + (17.5 / 20.0) * minimapCI.width
-        ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [240.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0, 1.0])!)
+        let dotY = minimapCI.midY
+        ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [20.0 / 255.0, 95.0 / 255.0, 245.0 / 255.0, 1.0])!)
+        ctx.fill(CGRect(x: blueX - 5.0, y: dotY - 5.0, width: 10.0, height: 10.0))
+        ctx.setFillColor(CGColor(colorSpace: rgbSpace, components: [245.0 / 255.0, 22.0 / 255.0, 22.0 / 255.0, 1.0])!)
         ctx.fill(CGRect(x: redX - 5.0, y: dotY - 5.0, width: 10.0, height: 10.0))
 
-        // Vẽ chữ "Góc 65°" sắc nét trong vùng chiến trường nửa trên.
+        // Vẽ chữ "Góc 65°" trong vùng chiến trường nửa trên.
         let angleCI = ciRectFromTopLeft(
             normRect: GunnyROIs.angleBattlefield,
             imageWidth: CGFloat(imgW),
@@ -177,25 +395,34 @@ enum GunnyCalcTestMain {
         let ciImage = CIImage(cgImage: fullCGImage)
         let ciContext = CIContext(options: nil)
         let vision = VisionProcessor()
+        let engine = BallisticsEngine()
 
-        // 1. Kiểm thử cắt Minimap bằng ciRectFromTopLeft & tính khoảng cách 14.0 đơn vị.
+        // Đo tốc độ vòng xử lý chính 30 FPS (Minimap HSV + White Box + Terrain Raycast + Ballistics).
+        let tStart = CFAbsoluteTimeGetCurrent()
         let stripPatch = ciImage
             .cropped(to: minimapCI)
             .transformed(by: CGAffineTransform(translationX: -minimapCI.origin.x, y: -minimapCI.origin.y))
         guard let stripCG = ciContext.createCGImage(stripPatch, from: CGRect(origin: .zero, size: minimapCI.size)),
-              let positions = vision.detectMinimapStripPositions(from: stripCG),
-              let playerX = positions.playerX,
-              let enemyX = positions.enemyXs.first else {
-            throw TestFailure(description: "Failed to detect blue player and red enemy in synthetic Minimap")
+              let analysis = vision.analyzeMinimap(from: stripCG),
+              let player = analysis.playerPos,
+              let enemy = analysis.enemyPositions.first else {
+            throw TestFailure(description: "Failed to analyze synthetic 1920x886 Minimap")
         }
 
-        let distanceUnits = abs(enemyX - playerX) * BallisticsEngine.minimapTotalUnits
-        try expect(
-            abs(distanceUnits - 14.0) <= 0.35,
-            "Expected distanceUnits ≈ 14.0, got \(distanceUnits) (playerX=\(playerX), enemyX=\(enemyX))"
+        let camW = analysis.cameraWidthNorm ?? 0.50
+        let distanceUnits = (abs(Double(enemy.x - player.x)) / camW) * BallisticsEngine.unitsPerScreen
+        let powerPreview = engine.calculatePower(distanceUnits: distanceUnits, angle: 65)
+        _ = engine.checkTerrainObstruction(
+            playerPos: player,
+            enemyPos: enemy,
+            minimapAspectHOverW: analysis.minimapAspectHOverW,
+            terrainProfile: analysis.terrainProfile,
+            angle: 65
         )
+        let mainLoopMs = (CFAbsoluteTimeGetCurrent() - tStart) * 1000.0
+        try expect(mainLoopMs < 50.0, String(format: "Main Minimap+Raycast+Ballistics latency %.2fms >= 50ms", mainLoopMs))
 
-        // 2. Kiểm thử cắt góc bằng ciRectFromTopLeft + CIColorControls (contrast 1.8, saturation 0.0) + Vision .accurate.
+        // OCR song song đọc "Góc 65°".
         var anglePatch = ciImage
             .cropped(to: angleCI)
             .transformed(by: CGAffineTransform(translationX: -angleCI.origin.x, y: -angleCI.origin.y))
@@ -213,30 +440,21 @@ enum GunnyCalcTestMain {
         let angleBounds = CGRect(x: 0, y: 0, width: floor(anglePatch.extent.width), height: floor(anglePatch.extent.height))
         guard let angleCG = ciContext.createCGImage(anglePatch, from: angleBounds, format: .L8, colorSpace: graySpace),
               let detectedAngle = vision.detectAngle(fromContrastImage: angleCG) else {
-            throw TestFailure(description: "Vision OCR failed to read 'Góc 65°' from synthetic battlefield image")
+            throw TestFailure(description: "Vision OCR failed to read 'Góc 65°'")
         }
 
         try expect(detectedAngle == 65, "Expected angle == 65, got \(detectedAngle)")
+        let power = engine.calculatePower(distanceUnits: distanceUnits, angle: detectedAngle)
+        try expect(abs(power - 67.0) <= 0.5, "Expected power == 67.0 (±0.5), got \(power) (preview=\(powerPreview))")
 
-        // 3. Kiểm thử bảng lực chuẩn NPH: d=14.0, angle=65° -> power == 67.0 (±0.5).
-        let power = BallisticsEngine().calculatePower(distanceUnits: distanceUnits, angle: detectedAngle)
-        try expect(
-            abs(power - 67.0) <= 0.5,
-            "Expected power == 67.0 (±0.5), got \(power) at distance=\(distanceUnits), angle=\(detectedAngle)"
-        )
-
-        return String(format: "distance=%.2f, angle=%d°, power=%.1f (target 67.0 ± 0.5)", distanceUnits, detectedAngle, power)
+        return String(format: "dist=%.2f, angle=%d°, power=%.1f, mainLoop=%.2fms (<50ms)", distanceUnits, detectedAngle, power, mainLoopMs)
     }
 
-    // MARK: - 4. testUDPLatency
+    // MARK: - 7. testUDPLatency
 
     private static func testUDPLatency() throws -> String {
-        let sample = TelemetryData(frameId: 42, angle: 65, power: 67.0)
+        let sample = TelemetryData(frameId: 42, angle: 30, power: 47.0, isBlocked: true, suggestedAngle: 58)
         let encoded = try JSONEncoder().encode(sample)
-        try expect(
-            encoded.count < 50,
-            "Expected TelemetryData JSON < 50 bytes, got \(encoded.count) bytes"
-        )
 
         let receiver = BSDUDPReceiver()
         let sender = BSDUDPSender()
@@ -257,7 +475,6 @@ enum GunnyCalcTestMain {
         }
         defer { receiver.stop() }
 
-        // Chờ luồng nhận vào trạng thái recvfrom.
         usleep(35_000)
 
         let sentAt = CFAbsoluteTimeGetCurrent()
@@ -275,6 +492,6 @@ enum GunnyCalcTestMain {
         let latencyMs = (finalReceivedAt - sentAt) * 1000.0
         try expect(latencyMs < 50.0, String(format: "UDP latency %.2fms exceeded 50ms limit", latencyMs))
 
-        return String(format: "payload=%d bytes (<50), roundTrip=%.2fms (<50ms)", encoded.count, latencyMs)
+        return String(format: "payload=%d bytes, roundTrip=%.2fms (<50ms)", encoded.count, latencyMs)
     }
 }

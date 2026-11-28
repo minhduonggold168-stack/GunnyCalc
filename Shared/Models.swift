@@ -13,26 +13,42 @@ public func ciRectFromTopLeft(normRect: CGRect, imageWidth: CGFloat, imageHeight
 
 /// 2 vùng quét cố định (tọa độ chuẩn hóa Top-Left `0.0 - 1.0`) cho Gunny Mobi bản không gió.
 public enum GunnyROIs {
-    /// Dải chiến trường trong Minimap (nằm hoàn toàn dưới nút đỏ [X] và phía trên dải số vàng -5..15 / 0..20).
-    public static let minimapStrip = CGRect(x: 0.848, y: 0.045, width: 0.148, height: 0.095)
+    /// Vùng cắt Minimap chuẩn cho phân cụm HSV, đo khung camera trắng và trích xuất địa hình 32 cột.
+    public static let minimapStrip = CGRect(x: 0.848, y: 0.042, width: 0.148, height: 0.114)
     /// Vùng chiến trường nửa trên chứa chữ `Góc XX°` cạnh nhân vật.
     public static let angleBattlefield = CGRect(x: 0.050, y: 0.140, width: 0.820, height: 0.540)
 }
 
-/// Gói dữ liệu siêu nhẹ (< 50 bytes JSON) truyền thời gian thực 30 FPS qua BSD UDP (`127.0.0.1:45678`).
+/// Gói dữ liệu siêu nhẹ truyền thời gian thực 30 FPS qua BSD UDP (`127.0.0.1:45678`).
 public struct TelemetryData: Codable, Equatable, Sendable {
     public var frameId: Int
     public var angle: Int
     public var power: Double
+    public var isBlocked: Bool
+    public var suggestedAngle: Int
 
-    public init(frameId: Int = 0, angle: Int = 50, power: Double = 48.0) {
+    public init(
+        frameId: Int = 0,
+        angle: Int = 50,
+        power: Double = 48.0,
+        isBlocked: Bool = false,
+        suggestedAngle: Int = 50
+    ) {
         self.frameId = max(frameId, 0)
         self.angle = min(max(angle, -35), 85)
         let clampedPower = power.isFinite ? min(max(power, 0.0), 100.0) : 0.0
         self.power = (clampedPower * 10.0).rounded() / 10.0
+        self.isBlocked = isBlocked
+        self.suggestedAngle = min(max(suggestedAngle, -35), 85)
     }
 
-    public static let initialLive = TelemetryData(frameId: 0, angle: 50, power: 48.0)
+    public static let initialLive = TelemetryData(
+        frameId: 0,
+        angle: 50,
+        power: 48.0,
+        isBlocked: false,
+        suggestedAngle: 50
+    )
 }
 
 // MARK: - Pure C BSD UDP Socket (127.0.0.1:45678 Loopback)

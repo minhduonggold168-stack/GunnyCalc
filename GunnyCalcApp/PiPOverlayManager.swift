@@ -326,43 +326,81 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     private func drawMinimalHUD(in rect: CGRect, telemetry: TelemetryData, cgContext: CGContext) {
         let neonGreen = UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 1.0)
         let brightYellow = UIColor(red: 1.0, green: 0.839, blue: 0.039, alpha: 1.0) // #FFD60A
+        let warningOrange = UIColor(red: 1.0, green: 0.584, blue: 0.0, alpha: 1.0)  // #FF9500
 
-        // Nền đen bán trong suốt (alpha = 0.85) + viền mảnh xanh lá #00FF88 trên thanh 320 x 72 px.
+        // Nền đen bán trong suốt (alpha = 0.85); viền cam #FF9500 khi vướng núi, xanh lá #00FF88 khi thông thoáng.
         cgContext.clear(rect)
         let outerPath = UIBezierPath(roundedRect: rect.insetBy(dx: 1.0, dy: 1.0), cornerRadius: 8)
         UIColor(white: 0.0, alpha: 0.85).setFill()
         outerPath.fill()
 
-        neonGreen.setStroke()
-        outerPath.lineWidth = 1.4
+        (telemetry.isBlocked ? warningOrange : neonGreen).setStroke()
+        outerPath.lineWidth = telemetry.isBlocked ? 2.0 : 1.4
         outerPath.stroke()
 
-        // MARK: Phần trên (50px): 2 cột ngang GÓC: [angle]° & LỰC: [power]
+        // MARK: Phần trên (50px): 2 cột ngang GÓC: [angle]° (+ cảnh báo vướng núi) & LỰC: [power]
         let topHeight: CGFloat = 50.0
-        let midX = rect.width / 2.0
+        let splitX: CGFloat = telemetry.isBlocked ? 174.0 : (rect.width / 2.0)
 
         let verticalSep = UIBezierPath()
-        verticalSep.move(to: CGPoint(x: midX, y: 8))
-        verticalSep.addLine(to: CGPoint(x: midX, y: topHeight - 8))
+        verticalSep.move(to: CGPoint(x: splitX, y: 8))
+        verticalSep.addLine(to: CGPoint(x: splitX, y: topHeight - 8))
         UIColor(white: 1.0, alpha: 0.18).setStroke()
         verticalSep.lineWidth = 1.0
         verticalSep.stroke()
 
-        // Cột trái: GÓC: [angle]° (vàng #FFD60A 26pt đậm, tự co nhẹ chỉ khi vượt độ rộng cột)
-        drawFittedMetric(
-            text: "GÓC: \(telemetry.angle)°",
-            color: brightYellow,
-            baseSize: 26.0,
-            in: CGRect(x: 4, y: 0, width: midX - 8, height: topHeight)
-        )
+        if telemetry.isBlocked {
+            // Cột trái (khi vướng địa hình): chỉ số GÓC phía trên + nhãn cảnh báo cam bên dưới.
+            drawFittedMetric(
+                text: "GÓC: \(telemetry.angle)°",
+                color: brightYellow,
+                baseSize: 22.0,
+                minSize: 16.0,
+                in: CGRect(x: 4, y: 2, width: splitX - 8, height: 28)
+            )
 
-        // Cột phải: LỰC: [power] (xanh neon #00FF88 26pt đậm, 1 chữ số thập phân)
-        drawFittedMetric(
-            text: String(format: "LỰC: %.1f", telemetry.power),
-            color: neonGreen,
-            baseSize: 26.0,
-            in: CGRect(x: midX + 4, y: 0, width: midX - 8, height: topHeight)
-        )
+            let pillRect = CGRect(x: 6, y: 31, width: splitX - 12, height: 16)
+            let pillPath = UIBezierPath(roundedRect: pillRect, cornerRadius: 4)
+            warningOrange.withAlphaComponent(0.24).setFill()
+            pillPath.fill()
+            warningOrange.setStroke()
+            pillPath.lineWidth = 0.9
+            pillPath.stroke()
+
+            drawFittedMetric(
+                text: "⚠️ VƯỚNG NÚI (NÂNG \(telemetry.suggestedAngle)°)",
+                color: UIColor(red: 1.0, green: 0.82, blue: 0.35, alpha: 1.0),
+                baseSize: 8.8,
+                minSize: 6.5,
+                in: pillRect.insetBy(dx: 3, dy: 0)
+            )
+
+            drawFittedMetric(
+                text: String(format: "LỰC: %.1f", telemetry.power),
+                color: neonGreen,
+                baseSize: 25.0,
+                minSize: 18.0,
+                in: CGRect(x: splitX + 4, y: 0, width: rect.width - splitX - 8, height: topHeight)
+            )
+        } else {
+            // Cột trái: GÓC: [angle]° (vàng #FFD60A 26pt đậm)
+            drawFittedMetric(
+                text: "GÓC: \(telemetry.angle)°",
+                color: brightYellow,
+                baseSize: 26.0,
+                minSize: 18.0,
+                in: CGRect(x: 4, y: 0, width: splitX - 8, height: topHeight)
+            )
+
+            // Cột phải: LỰC: [power] (xanh neon #00FF88 26pt đậm, 1 chữ số thập phân)
+            drawFittedMetric(
+                text: String(format: "LỰC: %.1f", telemetry.power),
+                color: neonGreen,
+                baseSize: 26.0,
+                minSize: 18.0,
+                in: CGRect(x: splitX + 4, y: 0, width: rect.width - splitX - 8, height: topHeight)
+            )
+        }
 
         // Đường ngăn ngang giữa phần trên (50px) và thanh thước lực (22px).
         let horizontalSep = UIBezierPath()
@@ -469,7 +507,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         whiteCore.stroke()
     }
 
-    private func drawFittedMetric(text: String, color: UIColor, baseSize: CGFloat, in rect: CGRect) {
+    private func drawFittedMetric(text: String, color: UIColor, baseSize: CGFloat, minSize: CGFloat, in rect: CGRect) {
         var fontSize = baseSize
         var attr = NSAttributedString(
             string: text,
@@ -479,8 +517,8 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             ]
         )
         var size = attr.size()
-        while size.width > rect.width && fontSize > 18.0 {
-            fontSize -= 1.0
+        while size.width > rect.width && fontSize > minSize {
+            fontSize -= 0.5
             attr = NSAttributedString(
                 string: text,
                 attributes: [
