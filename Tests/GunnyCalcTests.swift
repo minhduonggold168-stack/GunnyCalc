@@ -185,7 +185,7 @@ enum GunnyCalcTestMain {
             let dpW = Double(GunnyROIs.dpadAngle.size.width) * Double(w)
             let dpH = Double(GunnyROIs.dpadAngle.size.height) * Double(h)
             // Vòng tròn nền tối D-pad.
-            let dpCGRect = CGRect(x: dpX + 4, y: CGFloat(h) - dpY - dpH + 4, width: dpW - 8, height: dpH - 8)
+            let dpCGRect = CGRect(x: dpX + 4.0, y: Double(h) - dpY - dpH + 4.0, width: dpW - 8.0, height: dpH - 8.0)
             ctx.setFillColor(makeColor((18, 26, 38)))
             ctx.fillEllipse(in: dpCGRect)
 
@@ -216,7 +216,7 @@ enum GunnyCalcTestMain {
                     let dist = Double(step) * 26.0
                     let dx = px + cos(rad) * dist
                     let dy = py - sin(rad) * dist
-                    let dotRect = CGRect(x: dx - 4.0, y: CGFloat(h) - dy - 4.0, width: 8.0, height: 8.0)
+                    let dotRect = CGRect(x: dx - 4.0, y: Double(h) - dy - 4.0, width: 8.0, height: 8.0)
                     ctx.setFillColor(makeColor((250, 228, 32)))
                     ctx.fillEllipse(in: dotRect)
                 }

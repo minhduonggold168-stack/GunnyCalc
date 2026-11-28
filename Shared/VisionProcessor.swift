@@ -250,7 +250,6 @@ public final class AngleBitmapTemplateMatcher {
     }
 
     private let digitTemplates: [CompiledTemplate] // 0...9 + mẫu phụ '1' chân đế (11 mẫu = 8.4 KB)
-    private let minusTemplate: CompiledTemplate
 
     public init() {
         let patterns: [(Int, [String])] = [
@@ -344,17 +343,7 @@ public final class AngleBitmapTemplateMatcher {
             ])
         ]
 
-        let minusPattern: [String] = [
-            "................", "................", "................", "................",
-            "................", "................", "................", "................",
-            "................", "################", "################", "################",
-            "################", "################", "################", "................",
-            "................", "................", "................", "................",
-            "................", "................", "................", "................"
-        ]
-
         self.digitTemplates = patterns.map { Self.compile(digitValue: $0.0, rows: $0.1) }
-        self.minusTemplate = Self.compile(digitValue: -1, rows: minusPattern)
     }
 
     private static func compile(digitValue: Int, rows: [String]) -> CompiledTemplate {
@@ -568,8 +557,8 @@ public final class AngleBitmapTemplateMatcher {
                 && g.width >= Int(Double(g.height) * 1.35)
                 && Double(g.height) <= Double(maxDigitH) * 0.42
                 && abs(g.midY - avgMidY) <= Double(maxDigitH) * 0.35 {
-                let normMinus = resampleToGrid(box: g, binary: binary, width: w, preserveNarrowAspect: false)
-                if similarityScore(input: normMinus, template: minusTemplate) >= 0.45 {
+                let fillRatio = Double(g.count) / Double(max(g.width * g.height, 1))
+                if fillRatio >= 0.55 {
                     isNegative = true
                     break
                 }
