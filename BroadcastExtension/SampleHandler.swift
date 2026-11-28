@@ -7,16 +7,18 @@ import Foundation
 import ImageIO
 import ReplayKit
 
-/// Handler nhận khung hình thụ động từ ReplayKit đạt độ trễ < 0.1s (< 20MB RAM).
-/// - Quét Minimap (`0.848, 0.042, 0.148, 0.114`) và thước vàng (`0.848, 0.148, 0.148, 0.015`) ở 30 FPS (33ms) khi xoay ngang.
-/// - Tự động đo chiều rộng khung camera sáng `screenWidthNorm` = `10.0` đơn vị cho mọi bản đồ (dự phòng thước vàng 5 đơn vị × 2).
-/// - Tính cự ly `(abs(enemyX - playerX) / screenWidthNorm) * 10.0`, chênh cao `deltaYUnits` và lực chuẩn NPH (không EMA).
-/// - Gửi gói JSON qua BSD UDP `127.0.0.1:45678` an toàn tuyệt đối (không `!`, không `fatalError`).
+/// Handler nhận khung hình thụ động từ ReplayKit theo kiến trúc hợp nhất 3 tầng (Multi-Cue Fusion, < 25MB RAM, < 35ms):
+/// - Chạy 24/24 ở tốc độ 30 FPS (mỗi 33ms) khi màn hình xoay ngang (`width > height`), dùng 1 `CIContext` duy nhất trong `autoreleasepool`.
+/// - Tầng 1 (Ưu tiên cao nhất): Quét thanh máu xanh người chơi và thanh máu đỏ địch trên màn hình chính (`< 10` đơn vị).
+/// - Tầng 2: Cắt Minimap (`0.848, 0.042, 0.148, 0.106`), tìm tâm X + đáy chân `groundY` và dò viền đứng khung camera `10.0` đơn vị (`0.42...0.86`).
+/// - Tầng 3: Đối chiếu vạch chia `5.0` đơn vị trên thước vàng đáy Minimap (`0.848, 0.148, 0.148, 0.015`, mặc định dự phòng `0.62`).
+/// - Đọc góc bắn `-35° ... 85°` song song 50ms và truyền tức thời qua BSD UDP `127.0.0.1:45678` (an toàn tuyệt đối, không force-unwrap).
 final class SampleHandler: RPBroadcastSampleHandler {
     private let sharedCIContext = CIContext(options: [
         .useSoftwareRenderer: false,
         .cacheIntermediates: false
     ])
+    private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
     private let grayColorSpace = CGColorSpaceCreateDeviceGray()
     private let visionProcessor = VisionProcessor()
     private let ballisticsEngine = BallisticsEngine()
@@ -41,7 +43,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     // Trạng thái tức thời (không làm mượt EMA).
     private var lastPlayerPos = CGPoint(x: 0.25, y: 0.65)
-    private var lastScreenWidthNorm: Double = 0.50
+    private var lastEnemyPos: CGPoint?
+    private var lastScreenWidthNorm: Double = VisionProcessor.defaultScreenWidthNorm // 0.62
     private var lastDistanceUnits: Double = 10.0
     private var lastDeltaYUnits: Double = 0.0
     private var lastAngle: Int = 50
@@ -66,7 +69,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
         frameCounter = 1
         lastPacketSentTime = now
         lastPlayerPos = CGPoint(x: 0.25, y: 0.65)
-        lastScreenWidthNorm = 0.50
+        lastEnemyPos = nil
+        lastScreenWidthNorm = VisionProcessor.defaultScreenWidthNorm
         lastDistanceUnits = 10.0
         lastDeltaYUnits = 0.0
         lastAngle = 50
@@ -137,27 +141,44 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
             stateLock.lock()
             let fallbackPlayer = lastPlayerPos
+            let previousEnemy = lastEnemyPos
             stateLock.unlock()
 
-            // 1. Cắt Minimap + dải thước vàng đáy Minimap ở độ phân giải gốc qua ciRectFromTopLeft.
-            let analysis: MinimapAnalysisResult?
-            if let minimapCrop = renderNativeROI(GunnyROIs.minimapStrip, from: ciImage) {
-                let yellowRulerCrop = renderNativeROI(GunnyROIs.minimapYellowRuler, from: ciImage)
-                analysis = visionProcessor.analyzeMinimap(
-                    minimapCrop: minimapCrop,
-                    yellowRulerCrop: yellowRulerCrop,
-                    fallbackPlayerPos: fallbackPlayer
-                )
+            // Tầng 1 (Ưu tiên cao nhất): Quét thanh máu người chơi & địch trực tiếp trên màn hình chính (< 10 đơn vị).
+            let tier1Result: MainScreenHealthBarResult?
+            if let battlefieldCrop = renderBattlefieldForTier1(from: ciImage) {
+                tier1Result = visionProcessor.detectMainScreenHealthBars(battlefieldCrop: battlefieldCrop)
             } else {
-                analysis = nil
+                tier1Result = nil
+            }
+
+            // Tầng 2 + Tầng 3: Khi địch ngoài màn hình chính hoặc bị che thanh máu -> đo Minimap theo viền camera + thước vàng.
+            let minimapAnalysis: MinimapAnalysisResult?
+            if tier1Result == nil {
+                if let minimapCrop = renderNativeROI(GunnyROIs.minimapStrip, from: ciImage) {
+                    let yellowRulerCrop = renderNativeROI(GunnyROIs.minimapYellowRuler, from: ciImage)
+                    minimapAnalysis = visionProcessor.analyzeMinimap(
+                        minimapCrop: minimapCrop,
+                        yellowRulerCrop: yellowRulerCrop,
+                        fallbackPlayerPos: fallbackPlayer,
+                        previousEnemyPos: previousEnemy
+                    )
+                } else {
+                    minimapAnalysis = nil
+                }
+            } else {
+                minimapAnalysis = nil
             }
 
             stateLock.lock()
             isCurrentlyLandscape = true
 
-            if let analysis {
+            if let tier1 = tier1Result {
+                lastDistanceUnits = tier1.distanceUnits
+                lastDeltaYUnits = tier1.deltaYUnits
+            } else if let analysis = minimapAnalysis {
                 if let measuredWidth = analysis.screenWidthNorm,
-                   measuredWidth >= 0.35 && measuredWidth <= 0.85 {
+                   measuredWidth >= 0.42 && measuredWidth <= 0.86 {
                     lastScreenWidthNorm = measuredWidth
                 }
 
@@ -166,9 +187,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
                 }
 
                 if let enemyPos = analysis.enemyPos {
-                    let safeScreenW = min(max(lastScreenWidthNorm, 0.35), 0.85)
+                    lastEnemyPos = enemyPos
+                    let safeScreenW = min(max(lastScreenWidthNorm, 0.42), 0.86)
                     lastDistanceUnits = (abs(Double(enemyPos.x - lastPlayerPos.x)) / safeScreenW) * BallisticsEngine.unitsPerScreen
-                    lastDeltaYUnits = (Double(lastPlayerPos.y - enemyPos.y) / safeScreenW) * BallisticsEngine.unitsPerScreen
+                    lastDeltaYUnits = (Double(lastPlayerPos.y - enemyPos.y) / (safeScreenW * 0.55)) * BallisticsEngine.unitsPerScreen
                 }
             }
 
@@ -186,7 +208,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
             sendUDPPacket(telemetry)
 
-            // 2. Chạy OCR đen trắng tương phản cao (.accurate) trên luồng song song mỗi 50ms.
+            // Chạy OCR đen trắng tương phản cao (.accurate) trên luồng song song mỗi 50ms (-35° ... 85°).
             if shouldDispatchOCR {
                 if let contrastAngleCrop = renderContrastAngleCrop(from: ciImage) {
                     dispatchAngleOCR(contrastAngleImage: contrastAngleCrop)
@@ -380,7 +402,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         udpLock.unlock()
     }
 
-    // MARK: - Orientation, Native ROI Crop & High-Contrast Angle Crop
+    // MARK: - Orientation, Tier-1 Nearest-Sampled Crop, Native ROI Crop & High-Contrast Angle Crop
 
     private func extractVideoOrientation(from sampleBuffer: CMSampleBuffer) -> CGImagePropertyOrientation {
         if let attachment = CMGetAttachment(
@@ -391,6 +413,36 @@ final class SampleHandler: RPBroadcastSampleHandler {
             return CGImagePropertyOrientation(rawValue: attachment.uint32Value) ?? .up
         }
         return .up
+    }
+
+    /// Cắt vùng chiến trường chính Tầng 1 (`0.05, 0.18, 0.90, 0.65`) với giảm 0.5x chiều ngang (nearest-neighbor để không lem màu thanh máu)
+    /// và giữ nguyên độ phân giải dọc 100% để bảo toàn chính xác thanh máu mảnh (`h: 0.006...0.016`).
+    private func renderBattlefieldForTier1(from ciImage: CIImage) -> CGImage? {
+        let cropRect = ciRectFromTopLeft(
+            normRect: GunnyROIs.mainBattlefield,
+            imageWidth: ciImage.extent.width,
+            imageHeight: ciImage.extent.height
+        ).intersection(ciImage.extent)
+        guard cropRect.width >= 32, cropRect.height >= 16 else { return nil }
+
+        var patch = ciImage
+            .cropped(to: cropRect)
+            .transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
+
+        if patch.extent.width > 960.0 {
+            patch = patch
+                .samplingNearest()
+                .transformed(by: CGAffineTransform(scaleX: 0.5, y: 1.0))
+        }
+
+        let bounds = CGRect(
+            x: 0,
+            y: 0,
+            width: floor(patch.extent.width),
+            height: floor(patch.extent.height)
+        )
+        guard bounds.width >= 32, bounds.height >= 16 else { return nil }
+        return sharedCIContext.createCGImage(patch, from: bounds, format: .RGBA8, colorSpace: rgbColorSpace)
     }
 
     private func renderNativeROI(_ normRect: CGRect, from ciImage: CIImage) -> CGImage? {
@@ -412,7 +464,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             height: floor(patch.extent.height)
         )
         guard bounds.width >= 8, bounds.height >= 2 else { return nil }
-        return sharedCIContext.createCGImage(patch, from: bounds)
+        return sharedCIContext.createCGImage(patch, from: bounds, format: .RGBA8, colorSpace: rgbColorSpace)
     }
 
     /// Cắt vùng chữ góc bằng `ciRectFromTopLeft` và chuyển sang đen trắng tương phản cao (`contrast = 1.8`, `saturation = 0.0`).

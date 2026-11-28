@@ -1,8 +1,9 @@
 import Foundation
 
-/// Bộ tính lực bắn chuẩn NPH Gunny Mobi bản không gió (không EMA, không Terrain Raycast).
+/// Bộ tính lực bắn chuẩn NPH Gunny Mobi bản không gió (Multi-Cue Fusion, không EMA).
 /// - Nội suy tuyến tính chính xác tới `0.1` đơn vị cự ly và theo góc bắn (`-35° ... 85°`) từ 5 bảng chuẩn chính thức NPH (`20°`, `30°`, `50°`, `65°`, `80°`).
-/// - Bù trừ nhẹ theo độ chênh cao địa hình: `finalPower = basePower + deltaYUnits * 0.6` (`0...100`).
+/// - Bù trừ chênh cao địa hình chuẩn vật lý: với `angle > 10°`, `ratio = 1.0 - (deltaYUnits / (max(distanceUnits, 0.5) * tan(angle)))`,
+///   nếu `ratio > 0.15` thì `finalPower = P_flat / sqrt(ratio)`, ngược lại `100.0` (giới hạn `0...100`).
 public struct BallisticsEngine: Sendable {
     public static let unitsPerScreen: Double = 10.0
 
@@ -40,7 +41,7 @@ public struct BallisticsEngine: Sendable {
         return min(table[19] + (distanceUnits - 20.0) * tailSlope, 100.0)
     }
 
-    /// Tính lực bắn chuẩn NPH (`0.0 ... 100.0`, làm tròn 1 chữ số thập phân) kèm bù trừ chênh cao `deltaYUnits * 0.6`.
+    /// Tính lực bắn chuẩn NPH (`0.0 ... 100.0`, làm tròn 1 chữ số thập phân) kèm bù trừ chênh cao địa hình `P_flat / sqrt(ratio)`.
     public func calculatePower(
         distanceUnits: Double,
         angle: Int,
@@ -84,8 +85,20 @@ public struct BallisticsEngine: Sendable {
             basePower = lookupTable(Self.table20, distanceUnits: d)
         }
 
-        let safeDeltaY = deltaYUnits.isFinite ? min(max(deltaYUnits, -10.0), 10.0) : 0.0
-        let finalPower = basePower + safeDeltaY * 0.6
+        let safeDeltaY = deltaYUnits.isFinite ? min(max(deltaYUnits, -15.0), 15.0) : 0.0
+        let finalPower: Double
+        if safeAngle > 10.0 {
+            let tanAngle = tan(safeAngle * .pi / 180.0)
+            let ratio = 1.0 - (safeDeltaY / (max(d, 0.5) * tanAngle))
+            if ratio > 0.15 {
+                finalPower = basePower / sqrt(ratio)
+            } else {
+                finalPower = 100.0
+            }
+        } else {
+            finalPower = basePower
+        }
+
         let clamped = finalPower.isFinite ? min(max(finalPower, 0.0), 100.0) : 0.0
         return (clamped * 10.0).rounded() / 10.0
     }

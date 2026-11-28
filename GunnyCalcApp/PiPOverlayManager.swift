@@ -35,10 +35,10 @@ struct PiPHostView: UIViewRepresentable {
     }
 }
 
-/// Quản lý thanh ngang Picture-in-Picture siêu mảnh (`320 x 72` px, giảm >50% diện tích):
-/// - Phần trên (`50px`): 2 cột lớn `GÓC: [angle]°` (vàng #FFD60A) và `LỰC: [power]` (xanh neon #00FF88).
-/// - Phần dưới (`22px`): thanh thước lực `0 — 20 — 40 — 60 — 80 — 100` kèm kim chỉ thị đỏ rực.
-/// - Đẩy `CMSampleBuffer` ngay lập tức trong callback nhận UDP (`127.0.0.1:45678`) để đạt độ trễ < 0.1s.
+/// Quản lý thanh ngang Picture-in-Picture siêu mảnh (`420 x 64` px, độ trễ < 0.1s):
+/// - Phần trên (`44px`): Trái `GÓC: [angle]°` (vàng #FFD60A 24pt đậm) | Phải `CL [distanceUnits]  |  LỰC: [power]` (xanh neon #00FF88 24pt đậm).
+/// - Phần dưới (`20px`): thanh thước lực `0 — 20 — 40 — 60 — 80 — 100` kèm kim đỏ rực tại vị trí `power`.
+/// - Đẩy `CMSampleBuffer` ngay lập tức trong callback nhận UDP (`127.0.0.1:45678`).
 @MainActor
 final class PiPOverlayManager: NSObject, ObservableObject {
     static let shared = PiPOverlayManager()
@@ -49,7 +49,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     @Published private(set) var latestFrameId: Int = 0
     @Published private(set) var statusMessage: String?
 
-    let sampleBufferView = PiPSampleBufferView(frame: CGRect(x: 0, y: 0, width: 320, height: 72))
+    let sampleBufferView = PiPSampleBufferView(frame: CGRect(x: 0, y: 0, width: 420, height: 64))
 
     private var pipController: AVPictureInPictureController?
     private var currentTelemetry: TelemetryData = .initialLive
@@ -62,7 +62,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     private let udpReceiver = BSDUDPReceiver()
     private var isUDPStarted = false
 
-    private let renderSize = CGSize(width: 320, height: 72)
+    private let renderSize = CGSize(width: 420, height: 64)
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
     private let liveTimeoutSeconds: TimeInterval = 1.5
 
@@ -222,7 +222,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         return data
     }
 
-    // MARK: - Compact CoreGraphics HUD Rendering (340 x 115 px)
+    // MARK: - Ultra-Slim CoreGraphics HUD Rendering (420 x 64 px)
 
     private func enqueueHUDFrame(for telemetry: TelemetryData) {
         let displayLayer = sampleBufferView.displayLayer
@@ -324,64 +324,50 @@ final class PiPOverlayManager: NSObject, ObservableObject {
     }
 
     private func drawMinimalHUD(in rect: CGRect, telemetry: TelemetryData, cgContext: CGContext) {
-        let neonGreen = UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 1.0)
+        let neonGreen = UIColor(red: 0.0, green: 1.0, blue: 0.533, alpha: 1.0) // #00FF88
         let brightYellow = UIColor(red: 1.0, green: 0.839, blue: 0.039, alpha: 1.0) // #FFD60A
-        let lightGray = UIColor(white: 0.78, alpha: 1.0)
 
-        // Nền đen bán trong suốt (alpha = 0.85) + viền mảnh xanh lá #00FF88 cố định 320 x 72 px.
+        // Nền đen bán trong suốt (alpha = 0.85) + viền xanh lá mảnh #00FF88 cố định 420 x 64 px.
         cgContext.clear(rect)
         let outerPath = UIBezierPath(roundedRect: rect.insetBy(dx: 1.0, dy: 1.0), cornerRadius: 8)
         UIColor(white: 0.0, alpha: 0.85).setFill()
         outerPath.fill()
 
         neonGreen.setStroke()
-        outerPath.lineWidth = 1.4
+        outerPath.lineWidth = 1.3
         outerPath.stroke()
 
-        // MARK: Phần trên (50px): Cột trái GÓC: [angle]° | Cột phải LỰC • CL [distanceUnits] + số [power]
-        let topHeight: CGFloat = 50.0
-        let midX = rect.width / 2.0
+        // MARK: Phần trên (44px): Trái `GÓC: [angle]°` | Phải `CL [distanceUnits]  |  LỰC: [power]`
+        let topHeight: CGFloat = 44.0
+        let dividerX: CGFloat = 148.0
 
         let verticalSep = UIBezierPath()
-        verticalSep.move(to: CGPoint(x: midX, y: 8))
-        verticalSep.addLine(to: CGPoint(x: midX, y: topHeight - 8))
-        UIColor(white: 1.0, alpha: 0.18).setStroke()
+        verticalSep.move(to: CGPoint(x: dividerX, y: 7))
+        verticalSep.addLine(to: CGPoint(x: dividerX, y: topHeight - 7))
+        UIColor(white: 1.0, alpha: 0.20).setStroke()
         verticalSep.lineWidth = 1.0
         verticalSep.stroke()
 
-        // Cột trái: GÓC: [angle]° (vàng #FFD60A 26pt đậm)
+        // Trái: GÓC: [angle]° (vàng #FFD60A 24pt đậm)
         drawFittedMetric(
             text: "GÓC: \(telemetry.angle)°",
             color: brightYellow,
-            baseSize: 26.0,
-            minSize: 18.0,
-            in: CGRect(x: 4, y: 0, width: midX - 8, height: topHeight)
+            baseSize: 24.0,
+            minSize: 16.0,
+            in: CGRect(x: 6, y: 0, width: dividerX - 12, height: topHeight)
         )
 
-        // Cột phải: Nhãn nhỏ "LỰC • CL [distanceUnits]" phía trên + số lớn "[power]" (xanh neon #00FF88 26pt đậm)
-        let captionText = String(format: "LỰC • CL %.1f", telemetry.distanceUnits)
-        let captionAttr = NSAttributedString(
-            string: captionText,
-            attributes: [
-                .font: UIFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .bold),
-                .foregroundColor: lightGray
-            ]
-        )
-        let captionSize = captionAttr.size()
-        captionAttr.draw(at: CGPoint(
-            x: midX + (midX - captionSize.width) / 2.0,
-            y: 3.0
-        ))
-
+        // Phải: CL [distanceUnits]  |  LỰC: [power] (xanh neon #00FF88 24pt đậm)
+        let rightMetric = String(format: "CL %.1f  |  LỰC: %.1f", telemetry.distanceUnits, telemetry.power)
         drawFittedMetric(
-            text: String(format: "%.1f", telemetry.power),
+            text: rightMetric,
             color: neonGreen,
-            baseSize: 26.0,
-            minSize: 20.0,
-            in: CGRect(x: midX + 4, y: 14, width: midX - 8, height: topHeight - 15)
+            baseSize: 24.0,
+            minSize: 15.0,
+            in: CGRect(x: dividerX + 6, y: 0, width: rect.width - dividerX - 12, height: topHeight)
         )
 
-        // Đường ngăn ngang giữa phần trên (50px) và thanh thước lực (22px).
+        // Đường ngăn ngang giữa phần trên (44px) và thanh thước lực (20px).
         let horizontalSep = UIBezierPath()
         horizontalSep.move(to: CGPoint(x: 6, y: topHeight))
         horizontalSep.addLine(to: CGPoint(x: rect.width - 6, y: topHeight))
@@ -389,13 +375,13 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         horizontalSep.lineWidth = 0.9
         horizontalSep.stroke()
 
-        // MARK: Phần dưới (22px): Thanh thước lực 0 — 20 — 40 — 60 — 80 — 100 toàn chiều ngang 320px
+        // MARK: Phần dưới (20px): Thước lực 0 — 20 — 40 — 60 — 80 — 100 kèm kim đỏ rực tại `power`
         let barMarginX: CGFloat = 8.0
         let barRect = CGRect(
             x: barMarginX,
-            y: topHeight + 2.5,
+            y: topHeight + 2.0,
             width: rect.width - barMarginX * 2.0,
-            height: 7.5
+            height: 7.0
         )
 
         let clampedPower = CGFloat(min(max(telemetry.power, 0.0), 100.0))
@@ -433,7 +419,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
         trackPath.stroke()
 
         let tickAttrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.monospacedDigitSystemFont(ofSize: 8.2, weight: .bold),
+            .font: UIFont.monospacedDigitSystemFont(ofSize: 8.0, weight: .bold),
             .foregroundColor: UIColor(white: 0.86, alpha: 1.0)
         ]
 
@@ -443,7 +429,7 @@ final class PiPOverlayManager: NSObject, ObservableObject {
             let tick = UIBezierPath()
             if isMajor {
                 tick.move(to: CGPoint(x: tx, y: barRect.minY))
-                tick.addLine(to: CGPoint(x: tx, y: barRect.maxY + 1.5))
+                tick.addLine(to: CGPoint(x: tx, y: barRect.maxY + 1.2))
                 UIColor(white: 1.0, alpha: 0.82).setStroke()
                 tick.lineWidth = 1.0
                 tick.stroke()
@@ -458,9 +444,9 @@ final class PiPOverlayManager: NSObject, ObservableObject {
                 } else {
                     labelX = tx - labelSize.width / 2.0
                 }
-                label.draw(at: CGPoint(x: labelX, y: barRect.maxY + 1.0))
+                label.draw(at: CGPoint(x: labelX, y: barRect.maxY + 0.5))
             } else {
-                tick.move(to: CGPoint(x: tx, y: barRect.maxY - 3.0))
+                tick.move(to: CGPoint(x: tx, y: barRect.maxY - 2.8))
                 tick.addLine(to: CGPoint(x: tx, y: barRect.maxY))
                 UIColor(white: 1.0, alpha: 0.32).setStroke()
                 tick.lineWidth = 0.7
@@ -470,16 +456,16 @@ final class PiPOverlayManager: NSObject, ObservableObject {
 
         // Kim chỉ thị màu đỏ rực tại vị trí `power`.
         let redNeedle = UIBezierPath()
-        redNeedle.move(to: CGPoint(x: markerX, y: barRect.minY - 1.8))
-        redNeedle.addLine(to: CGPoint(x: markerX, y: barRect.maxY + 1.8))
+        redNeedle.move(to: CGPoint(x: markerX, y: barRect.minY - 1.5))
+        redNeedle.addLine(to: CGPoint(x: markerX, y: barRect.maxY + 1.5))
         redNeedle.lineCapStyle = .round
         UIColor(red: 1.0, green: 0.14, blue: 0.12, alpha: 1.0).setStroke()
-        redNeedle.lineWidth = 3.4
+        redNeedle.lineWidth = 3.2
         redNeedle.stroke()
 
         let whiteCore = UIBezierPath()
-        whiteCore.move(to: CGPoint(x: markerX, y: barRect.minY - 1.0))
-        whiteCore.addLine(to: CGPoint(x: markerX, y: barRect.maxY + 1.0))
+        whiteCore.move(to: CGPoint(x: markerX, y: barRect.minY - 0.8))
+        whiteCore.addLine(to: CGPoint(x: markerX, y: barRect.maxY + 0.8))
         whiteCore.lineCapStyle = .round
         UIColor.white.setStroke()
         whiteCore.lineWidth = 1.2

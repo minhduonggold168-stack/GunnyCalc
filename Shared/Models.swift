@@ -11,13 +11,15 @@ public func ciRectFromTopLeft(normRect: CGRect, imageWidth: CGFloat, imageHeight
     return CGRect(x: x, y: y, width: w, height: h).integral
 }
 
-/// Các vùng quét cố định (tọa độ chuẩn hóa Top-Left `0.0 - 1.0`) cho Gunny Mobi bản không gió.
+/// Các vùng quét cố định (tọa độ chuẩn hóa Top-Left `0.0 - 1.0`) cho kiến trúc hợp nhất 3 tầng (Multi-Cue Fusion).
 public enum GunnyROIs {
-    /// Vùng chiến trường Minimap (tìm người chơi xanh, mục tiêu đỏ và vùng camera sáng 10.0 đơn vị).
-    public static let minimapStrip = CGRect(x: 0.848, y: 0.042, width: 0.148, height: 0.114)
-    /// Dải thước vàng đáy Minimap (dự phòng đo khoảng cách 5.0 đơn vị giữa 2 vạch chia).
+    /// Tầng 1: Vùng chiến trường chính tìm thanh máu xanh người chơi và thanh máu đỏ địch (< 10 đơn vị).
+    public static let mainBattlefield = CGRect(x: 0.050, y: 0.180, width: 0.900, height: 0.650)
+    /// Tầng 2: Vùng Minimap tìm chấm xanh người chơi, chấm đỏ mục tiêu và viền đứng khung camera 10.0 đơn vị.
+    public static let minimapStrip = CGRect(x: 0.848, y: 0.042, width: 0.148, height: 0.106)
+    /// Tầng 3: Dải thước vàng đáy Minimap đo khoảng cách 5.0 đơn vị giữa 2 vạch chia dọc tối màu.
     public static let minimapYellowRuler = CGRect(x: 0.848, y: 0.148, width: 0.148, height: 0.015)
-    /// Vùng chiến trường nửa trên chứa chữ `Góc XX°` cạnh nhân vật.
+    /// Vùng chiến trường chứa chữ `Góc XX°` cạnh nhân vật (`-35° ... 85°`).
     public static let angleBattlefield = CGRect(x: 0.050, y: 0.140, width: 0.820, height: 0.540)
 }
 
