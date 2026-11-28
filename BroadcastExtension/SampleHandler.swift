@@ -7,24 +7,20 @@ import Foundation
 import ImageIO
 import ReplayKit
 
-/// Handler nhận khung hình thụ động từ ReplayKit ở tốc độ 8 FPS (< 25MB RAM).
-/// - Dùng duy nhất 1 `sharedCIContext`, bọc `processSampleBuffer` trong `autoreleasepool`.
-/// - Khóa chống nhảy Gió/Góc, gom cụm mục tiêu có trễ chống nhảy (hysteresis) và làm mượt EMA (`alpha = 0.35`).
-/// - Gửi gói `TelemetryData` qua `Darwin.socket` (BSD UDP `127.0.0.1:45678`) an toàn tuyệt đối (không `!`, không `fatalError`).
+/// Handler nhận khung hình thụ động từ ReplayKit cho Gunny Mobi bản không gió (< 25MB RAM).
+/// - Chỉ kích hoạt khi màn hình nằm ngang (`width > height`) và đủ 3 dấu hiệu giao diện chiến đấu (`isInBattle`).
+/// - Quét Minimap trực tiếp từ `CVPixelBuffer` ở tốc độ 25 FPS (40ms) bằng 1 `sharedCIContext` trong `autoreleasepool`.
+/// - Đọc góc bắn (`-30° ... 85°`) trên luồng OCR riêng mỗi 100ms, không chặn luồng 25 FPS.
+/// - Gửi gói JSON qua BSD UDP `127.0.0.1:45678` an toàn tuyệt đối (không `!`, không `fatalError`).
 final class SampleHandler: RPBroadcastSampleHandler {
-    private struct SnapshotState {
-        let playerX: Double
-        let playerY: Double
-        let enemyX: Double
-        let enemyY: Double
-        let enemies: [NormalizedPoint]
-        let lockedEnemyIndex: Int
-        let cameraRect: NormalizedRect?
+    private struct BattleSnapshot {
+        let isInBattle: Bool
+        let playerNorm: CGPoint
+        let enemyNorm: CGPoint
+        let allEnemiesNorm: [CGPoint]
         let cameraWidthNorm: Double
         let minimapAspectHOverW: Double
         let angle: Double
-        let wind: Double
-        let windDir: Int
         let minimapJPEG: Data?
     }
 
@@ -40,6 +36,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private let stateLock = NSLock()
     private let udpLock = NSLock()
     private let heartbeatQueue = DispatchQueue(label: "com.gunny.pipcalc.broadcast.heartbeat", qos: .utility)
+    private let angleOCRQueue = DispatchQueue(label: "com.gunny.pipcalc.broadcast.angleOCR", qos: .userInitiated)
 
     private var heartbeatTimer: DispatchSourceTimer?
     private var udpSocketFD: Int32 = -1
@@ -47,37 +44,34 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     private var lastProcessedTime: TimeInterval = 0
     private var lastPacketSentTime: TimeInterval = 0
+    private var lastOCRStartedAt: TimeInterval = 0
     private var isProcessingFrame = false
+    private var isOCRBusy = false
     private var frameCounter: Int = 0
 
-    // Bộ đệm trạng thái hợp lệ gần nhất & thông số khóa chống nhảy.
-    private var lastPlayerX: Double = 0.20
-    private var lastPlayerY: Double = 0.68
-    private var lastEnemyX: Double = 0.72
-    private var lastEnemyY: Double = 0.68
-    private var lastEnemies: [NormalizedPoint] = [NormalizedPoint(x: 0.72, y: 0.68)]
-    private var lockedEnemyIndex: Int = 0
+    // Trạng thái khóa chiến đấu (`isInBattle`) & bộ đệm chống nhảy.
+    private var isInBattle: Bool = false
+    private var missingUICount: Int = 0
+    private var missingUnitsCount: Int = 0
+
+    private var lastPlayerNorm = CGPoint(x: 0.20, y: 0.68)
+    private var lastEnemyNorm = CGPoint(x: 0.72, y: 0.68)
+    private var lastAllEnemiesNorm: [CGPoint] = []
     private var hasLockedEnemy: Bool = false
     private var lostTrackCount: Int = 0
     private var switchCandidateCount: Int = 0
 
-    private var lastCameraRect: NormalizedRect? = NormalizedRect(x: 0.10, y: 0.24, width: 0.40, height: 0.56)
     private var lastCameraWidthNorm: Double = 0.40
     private var lastMinimapAspect: Double = 0.72
     private var lastMinimapJPEG: Data?
 
-    private var lastAngle: Double = 56.0
+    private var lastAngle: Double = 50.0
+    private var hasConfirmedAngle: Bool = false
     private var pendingAngle: Double?
     private var pendingAngleCount: Int = 0
 
-    private var lastWind: Double = 0.0
-    private var lastWindDir: Int = 1
-    private var pendingWindValue: Double?
-    private var pendingWindDir: Int = 1
-    private var pendingWindCount: Int = 0
-
-    private let minimumFrameInterval: TimeInterval = 0.125 // 8 FPS
-    private let maxScaledWidth: CGFloat = 960.0
+    private let minimumFrameInterval: TimeInterval = 0.040 // 25 FPS (40ms)
+    private let minimumOCRInterval: TimeInterval = 0.100   // 10 FPS (100ms)
 
     deinit {
         stopHeartbeatTimer()
@@ -88,29 +82,23 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let now = Date().timeIntervalSince1970
         stateLock.lock()
         lastProcessedTime = 0
+        lastOCRStartedAt = 0
         isProcessingFrame = false
+        isOCRBusy = false
         frameCounter = 1
         lastPacketSentTime = now
-        hasLockedEnemy = false
-        lostTrackCount = 0
-        switchCandidateCount = 0
-        pendingAngle = nil
-        pendingAngleCount = 0
-        pendingWindValue = nil
-        pendingWindCount = 0
-        emaSmoother.reset()
-        let initialSnapshot = currentSnapshotLocked()
+        resetBattleStateLocked()
         stateLock.unlock()
 
-        let startupTelemetry = buildTelemetry(frameId: 1, from: initialSnapshot, targetSwitched: true)
-        sendUDPPacket(startupTelemetry)
-        ipc.saveTelemetry(startupTelemetry)
+        let startupWaiting = TelemetryData.waiting(frameId: 1)
+        sendUDPPacket(startupWaiting)
+        ipc.saveTelemetry(startupWaiting)
 
         startHeartbeatTimer()
     }
 
     override func broadcastPaused() {
-        // Giữ heartbeat 0.5s để PiP biết phiên truyền phát vẫn tồn tại khi hệ thống tạm ngưng video.
+        // Giữ heartbeat 0.5s để PiP duy trì kết nối khi hệ thống tạm ngưng video.
     }
 
     override func broadcastResumed() {
@@ -148,73 +136,219 @@ final class SampleHandler: RPBroadcastSampleHandler {
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
             let orientation = extractVideoOrientation(from: sampleBuffer)
-            guard let landscapeImage = makeLandscapeDownscaledCGImage(
-                from: pixelBuffer,
-                orientation: orientation
-            ) else {
+            var ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
+            let origin = ciImage.extent.origin
+            if origin != .zero {
+                ciImage = ciImage.transformed(by: CGAffineTransform(translationX: -origin.x, y: -origin.y))
+            }
+
+            let extent = ciImage.extent
+            guard extent.width > 0, extent.height > 0 else { return }
+
+            // Khóa ngang tuyệt đối: màn hình dọc (Home Screen / ứng dụng khác) => isInBattle = false ngay lập tức.
+            guard extent.width > extent.height else {
+                emitWaitingPacket()
                 return
             }
 
-            // 1. Phân tích Minimap: người chơi xanh dương, cụm mục tiêu đỏ, khung camera trắng 10 đơn vị & ảnh JPEG.
-            let minimap = visionProcessor.analyzeMinimap(
-                from: landscapeImage,
-                normalizedRect: GunnyROIs.minimap
-            )
+            // Kiểm tra Dấu hiệu 1 (Nút đóng đỏ [X] + thước vàng đáy Minimap) & Dấu hiệu 2 (Thanh thước lực cạnh dưới).
+            let sign1Close = renderCroppedROI(GunnyROIs.battleCloseButton, from: ciImage, maxWidth: 48)
+                .map { visionProcessor.detectRedCloseButton(in: $0) } ?? false
+            let sign1Ruler = sign1Close
+                ? (renderCroppedROI(GunnyROIs.battleMinimapRuler, from: ciImage, maxWidth: 120)
+                    .map { visionProcessor.detectGoldenMinimapRuler(in: $0) } ?? false)
+                : false
+            let sign1 = sign1Close && sign1Ruler
 
-            // 2. Quét ô Gió kèm kiểm tra viền khung mũi tên chống đọc nhầm đồng hồ lượt.
-            let windObs = visionProcessor.detectWind(
-                from: landscapeImage,
-                normalizedRect: GunnyROIs.wind
-            )
-
-            // 3. Đọc kép Góc bắn (chiến trường có ký hiệu `°` + tâm D-pad góc dưới trái), chỉ nhận 10° - 85°.
-            let angleObs = visionProcessor.detectDualAngle(from: landscapeImage)
+            let sign2 = sign1
+                ? (renderCroppedROI(GunnyROIs.battlePowerBar, from: ciImage, maxWidth: 160)
+                    .map { visionProcessor.detectBottomPowerBar(in: $0) } ?? false)
+                : false
 
             stateLock.lock()
-            var targetSwitched = false
+            let wasInBattle = isInBattle
+            stateLock.unlock()
 
+            // Nếu đang ở ngoài trận và không có đủ dấu hiệu UI chiến đấu, bỏ qua quét Minimap để tiết kiệm CPU/RAM.
+            if !wasInBattle && !(sign1 && sign2) {
+                emitWaitingPacket()
+                return
+            }
+
+            // Quét trực tiếp vùng Minimap (25 FPS) từ CVPixelBuffer qua 1 CIContext duy nhất.
+            let minimap: MinimapAnalysis?
+            if let minimapCrop = renderCroppedROI(GunnyROIs.minimap, from: ciImage, maxWidth: 180) {
+                minimap = visionProcessor.analyzeMinimapCrop(minimapCrop, includeJPEG: true)
+            } else {
+                minimap = nil
+            }
+
+            let sign3 = (minimap?.playerPos != nil) && !(minimap?.enemies.isEmpty ?? true)
+
+            stateLock.lock()
+            let battleActive = updateBattleStateLocked(sign1And2: sign1 && sign2, sign3: sign3)
+            guard battleActive else {
+                frameCounter += 1
+                let waitingId = frameCounter
+                lastPacketSentTime = Date().timeIntervalSince1970
+                stateLock.unlock()
+
+                let waiting = TelemetryData.waiting(frameId: waitingId)
+                sendUDPPacket(waiting)
+                ipc.saveTelemetry(waiting)
+                return
+            }
+
+            var targetSwitched = false
             if let minimap {
                 lastMinimapAspect = minimap.minimapAspectHOverW
                 if let jpeg = minimap.minimapJPEG {
                     lastMinimapJPEG = jpeg
                 }
                 if let camRect = minimap.cameraRect, camRect.width >= 0.20, camRect.width <= 0.72 {
-                    lastCameraRect = camRect
                     lastCameraWidthNorm = 0.25 * camRect.width + 0.75 * lastCameraWidthNorm
                 }
                 if let playerPos = minimap.playerPos {
-                    lastPlayerX = playerPos.x
-                    lastPlayerY = playerPos.y
+                    lastPlayerNorm = playerPos
                 }
                 if !minimap.enemies.isEmpty {
                     targetSwitched = updateLockedEnemyLocked(detectedEnemies: minimap.enemies)
                 }
             }
 
-            updateWindLocked(observation: windObs)
-            updateAngleLocked(observation: angleObs)
+            let shouldDispatchOCR = !isOCRBusy && (now - lastOCRStartedAt) >= minimumOCRInterval
+            if shouldDispatchOCR {
+                isOCRBusy = true
+                lastOCRStartedAt = now
+            }
 
             frameCounter += 1
             let currentFrameId = frameCounter
             lastPacketSentTime = Date().timeIntervalSince1970
             let snapshot = currentSnapshotLocked()
-            let telemetry = buildTelemetry(frameId: currentFrameId, from: snapshot, targetSwitched: targetSwitched)
+            let telemetry = buildTelemetryLocked(frameId: currentFrameId, from: snapshot, targetSwitched: targetSwitched)
             stateLock.unlock()
 
+            // Gửi gói UDP 25 FPS ngay lập tức trước khi chạy OCR góc bất đồng bộ.
             sendUDPPacket(telemetry)
             ipc.saveTelemetry(telemetry)
+
+            // Luồng OCR đọc góc bắn riêng mỗi 100ms trên vùng chiến trường (không chặn 25 FPS).
+            if shouldDispatchOCR {
+                if let angleCrop = renderCroppedROI(GunnyROIs.angleBattlefield, from: ciImage, maxWidth: 640) {
+                    dispatchAngleOCR(croppedAngleImage: angleCrop)
+                } else {
+                    stateLock.lock()
+                    isOCRBusy = false
+                    stateLock.unlock()
+                }
+            }
         }
     }
 
-    // MARK: - Anti-Jitter Locks & Hysteresis Target Tracking (Locked)
+    // MARK: - Asynchronous Angle OCR (100ms)
 
-    private func updateLockedEnemyLocked(detectedEnemies: [NormalizedPoint]) -> Bool {
-        lastEnemies = detectedEnemies
+    private func dispatchAngleOCR(croppedAngleImage: CGImage) {
+        angleOCRQueue.async { [weak self] in
+            autoreleasepool {
+                guard let self else { return }
+                defer {
+                    self.stateLock.lock()
+                    self.isOCRBusy = false
+                    self.stateLock.unlock()
+                }
+
+                let detected = self.visionProcessor.detectBattlefieldAngle(fromCroppedImage: croppedAngleImage)
+                guard let detected else { return }
+
+                self.stateLock.lock()
+                self.updateAngleLocked(detectedAngle: detected)
+                self.stateLock.unlock()
+            }
+        }
+    }
+
+    private func updateAngleLocked(detectedAngle: Double) {
+        guard detectedAngle >= -30.0 && detectedAngle <= 85.0 else { return }
+
+        if !hasConfirmedAngle || abs(detectedAngle - lastAngle) <= 20.0 {
+            lastAngle = detectedAngle
+            hasConfirmedAngle = true
+            pendingAngle = nil
+            pendingAngleCount = 0
+            return
+        }
+
+        // Tránh nhảy vọt do 1 khung hình hiệu ứng đè chữ: yêu cầu 2 lần đọc liên tiếp khớp ±2°.
+        if let pending = pendingAngle, abs(detectedAngle - pending) <= 2.0 {
+            pendingAngleCount += 1
+            if pendingAngleCount >= 2 {
+                lastAngle = detectedAngle
+                hasConfirmedAngle = true
+                pendingAngle = nil
+                pendingAngleCount = 0
+            }
+        } else {
+            pendingAngle = detectedAngle
+            pendingAngleCount = 1
+        }
+    }
+
+    // MARK: - Battle Lock & Hysteresis Target Tracking (Locked)
+
+    private func updateBattleStateLocked(sign1And2: Bool, sign3: Bool) -> Bool {
+        if sign1And2 && sign3 {
+            isInBattle = true
+            missingUICount = 0
+            missingUnitsCount = 0
+            return true
+        }
+
+        guard isInBattle else {
+            return false
+        }
+
+        if !sign1And2 {
+            missingUICount += 1
+            if missingUICount >= 2 {
+                resetBattleStateLocked()
+                return false
+            }
+            return true
+        }
+
+        // Giao diện chiến đấu (dấu hiệu 1 & 2) vẫn còn, chỉ chấm Minimap bị hiệu ứng che thoáng qua.
+        missingUICount = 0
+        missingUnitsCount += 1
+        if missingUnitsCount >= 12 {
+            resetBattleStateLocked()
+            return false
+        }
+        return true
+    }
+
+    private func resetBattleStateLocked() {
+        isInBattle = false
+        missingUICount = 0
+        missingUnitsCount = 0
+        hasLockedEnemy = false
+        lostTrackCount = 0
+        switchCandidateCount = 0
+        lastAllEnemiesNorm = []
+        lastMinimapJPEG = nil
+        hasConfirmedAngle = false
+        pendingAngle = nil
+        pendingAngleCount = 0
+        emaSmoother.reset()
+    }
+
+    private func updateLockedEnemyLocked(detectedEnemies: [CGPoint]) -> Bool {
+        lastAllEnemiesNorm = detectedEnemies
 
         var nearestIdx = 0
         var minPlayerDist = Double.greatestFiniteMagnitude
         for (idx, pt) in detectedEnemies.enumerated() {
-            let d = hypot(pt.x - lastPlayerX, pt.y - lastPlayerY)
+            let d = hypot(Double(pt.x - lastPlayerNorm.x), Double(pt.y - lastPlayerNorm.y))
             if d < minPlayerDist {
                 minPlayerDist = d
                 nearestIdx = idx
@@ -223,20 +357,17 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         if !hasLockedEnemy {
             hasLockedEnemy = true
-            lockedEnemyIndex = nearestIdx
-            lastEnemyX = detectedEnemies[nearestIdx].x
-            lastEnemyY = detectedEnemies[nearestIdx].y
+            lastEnemyNorm = detectedEnemies[nearestIdx]
             lostTrackCount = 0
             switchCandidateCount = 0
             return true
         }
 
-        // Tìm mục tiêu khớp với vị trí đang khóa trong bán kính dung sai 0.070.
         let trackRadius = 0.070
         var trackedIdx: Int?
         var minTrackDelta = Double.greatestFiniteMagnitude
         for (idx, pt) in detectedEnemies.enumerated() {
-            let delta = hypot(pt.x - lastEnemyX, pt.y - lastEnemyY)
+            let delta = hypot(Double(pt.x - lastEnemyNorm.x), Double(pt.y - lastEnemyNorm.y))
             if delta <= trackRadius && delta < minTrackDelta {
                 minTrackDelta = delta
                 trackedIdx = idx
@@ -245,15 +376,16 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         if let tracked = trackedIdx {
             lostTrackCount = 0
-            let trackedDistToPlayer = hypot(detectedEnemies[tracked].x - lastPlayerX, detectedEnemies[tracked].y - lastPlayerY)
+            let trackedDist = hypot(
+                Double(detectedEnemies[tracked].x - lastPlayerNorm.x),
+                Double(detectedEnemies[tracked].y - lastPlayerNorm.y)
+            )
 
-            // Chỉ chuyển khóa sang mục tiêu mới nếu gần hơn hẳn ít nhất 0.045 trong 3 khung hình liên tiếp.
-            if nearestIdx != tracked && minPlayerDist < (trackedDistToPlayer - 0.045) {
+            // Khóa mục tiêu gần nhất có độ trễ chống nhảy (hysteresis 3 khung hình).
+            if nearestIdx != tracked && minPlayerDist < (trackedDist - 0.045) {
                 switchCandidateCount += 1
                 if switchCandidateCount >= 3 {
-                    lockedEnemyIndex = nearestIdx
-                    lastEnemyX = detectedEnemies[nearestIdx].x
-                    lastEnemyY = detectedEnemies[nearestIdx].y
+                    lastEnemyNorm = detectedEnemies[nearestIdx]
                     switchCandidateCount = 0
                     return true
                 }
@@ -261,19 +393,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
                 switchCandidateCount = 0
             }
 
-            lockedEnemyIndex = tracked
-            lastEnemyX = detectedEnemies[tracked].x
-            lastEnemyY = detectedEnemies[tracked].y
+            lastEnemyNorm = detectedEnemies[tracked]
             return false
         }
 
-        // Nếu chấm đỏ bị hiệu ứng che 1-2 khung hình, giữ nguyên mục tiêu cũ trước khi chuyển sang nearestIdx.
         switchCandidateCount = 0
         lostTrackCount += 1
         if lostTrackCount >= 3 {
-            lockedEnemyIndex = nearestIdx
-            lastEnemyX = detectedEnemies[nearestIdx].x
-            lastEnemyY = detectedEnemies[nearestIdx].y
+            lastEnemyNorm = detectedEnemies[nearestIdx]
             lostTrackCount = 0
             return true
         }
@@ -281,135 +408,50 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return false
     }
 
-    private func updateWindLocked(observation: WindObservation) {
-        if !observation.hasWindFrame {
-            lastWind = 0.0
-            lastWindDir = 1
-            pendingWindValue = nil
-            pendingWindCount = 0
-            return
-        }
+    private func emitWaitingPacket() {
+        stateLock.lock()
+        resetBattleStateLocked()
+        frameCounter += 1
+        let waitingId = frameCounter
+        lastPacketSentTime = Date().timeIntervalSince1970
+        stateLock.unlock()
 
-        guard let detectedWind = observation.value else {
-            return
-        }
-
-        let resolvedDir = detectedWind < 0.05 ? 1 : observation.direction
-        let isSmallDelta = abs(detectedWind - lastWind) <= 0.6
-        let isSameDir = (detectedWind < 0.05) || (lastWind < 0.05) || (resolvedDir == lastWindDir)
-
-        if (isSmallDelta && isSameDir) || frameCounter <= 2 {
-            lastWind = detectedWind
-            lastWindDir = resolvedDir
-            pendingWindValue = nil
-            pendingWindCount = 0
-            return
-        }
-
-        if let pending = pendingWindValue,
-           abs(detectedWind - pending) <= 0.4,
-           resolvedDir == pendingWindDir {
-            pendingWindCount += 1
-            if pendingWindCount >= 2 {
-                lastWind = detectedWind
-                lastWindDir = resolvedDir
-                pendingWindValue = nil
-                pendingWindCount = 0
-            }
-        } else {
-            pendingWindValue = detectedWind
-            pendingWindDir = resolvedDir
-            pendingWindCount = 1
-        }
-    }
-
-    private func updateAngleLocked(observation: AngleObservation) {
-        let candidate: Double?
-        let highConfidence: Bool
-
-        switch (observation.battlefieldAngle, observation.dpadAngle) {
-        case let (b?, d?):
-            if abs(b - d) <= 2.0 {
-                candidate = ((b + d) * 0.5).rounded()
-                highConfidence = true
-            } else if abs(b - lastAngle) <= abs(d - lastAngle) {
-                candidate = b
-                highConfidence = false
-            } else {
-                candidate = d
-                highConfidence = false
-            }
-        case let (b?, nil):
-            candidate = b
-            highConfidence = false
-        case let (nil, d?):
-            candidate = d
-            highConfidence = false
-        case (nil, nil):
-            pendingAngleCount = 0
-            return
-        }
-
-        guard let cand = candidate, cand >= 10.0 && cand <= 85.0 else {
-            return
-        }
-
-        let delta = abs(cand - lastAngle)
-        if (highConfidence && delta <= 25.0) || delta <= 15.0 || frameCounter <= 2 {
-            lastAngle = cand
-            pendingAngle = nil
-            pendingAngleCount = 0
-            return
-        }
-
-        if let pending = pendingAngle, abs(cand - pending) <= 2.0 {
-            pendingAngleCount += 1
-            if pendingAngleCount >= 2 {
-                lastAngle = cand
-                pendingAngle = nil
-                pendingAngleCount = 0
-            }
-        } else {
-            pendingAngle = cand
-            pendingAngleCount = 1
-        }
+        let waiting = TelemetryData.waiting(frameId: waitingId)
+        sendUDPPacket(waiting)
+        ipc.saveTelemetry(waiting)
     }
 
     // MARK: - Snapshot & Heartbeat Timer (0.5s)
 
-    private func currentSnapshotLocked() -> SnapshotState {
-        SnapshotState(
-            playerX: lastPlayerX,
-            playerY: lastPlayerY,
-            enemyX: lastEnemyX,
-            enemyY: lastEnemyY,
-            enemies: lastEnemies,
-            lockedEnemyIndex: lockedEnemyIndex,
-            cameraRect: lastCameraRect,
+    private func currentSnapshotLocked() -> BattleSnapshot {
+        BattleSnapshot(
+            isInBattle: isInBattle,
+            playerNorm: lastPlayerNorm,
+            enemyNorm: lastEnemyNorm,
+            allEnemiesNorm: lastAllEnemiesNorm,
             cameraWidthNorm: lastCameraWidthNorm,
             minimapAspectHOverW: lastMinimapAspect,
             angle: lastAngle,
-            wind: lastWind,
-            windDir: lastWindDir,
             minimapJPEG: lastMinimapJPEG
         )
     }
 
-    private func buildTelemetry(frameId: Int, from snapshot: SnapshotState, targetSwitched: Bool) -> TelemetryData {
-        ballisticsEngine.buildTelemetry(
+    private func buildTelemetryLocked(
+        frameId: Int,
+        from snapshot: BattleSnapshot,
+        targetSwitched: Bool
+    ) -> TelemetryData {
+        guard snapshot.isInBattle else {
+            return TelemetryData.waiting(frameId: frameId)
+        }
+        return ballisticsEngine.buildBattleTelemetry(
             frameId: frameId,
-            playerX: snapshot.playerX,
-            playerY: snapshot.playerY,
-            enemyX: snapshot.enemyX,
-            enemyY: snapshot.enemyY,
-            enemies: snapshot.enemies,
-            lockedEnemyIndex: snapshot.lockedEnemyIndex,
-            cameraRect: snapshot.cameraRect,
+            playerNorm: snapshot.playerNorm,
+            enemyNorm: snapshot.enemyNorm,
+            allEnemiesNorm: snapshot.allEnemiesNorm,
             cameraWidthNorm: snapshot.cameraWidthNorm,
             minimapAspectHOverW: snapshot.minimapAspectHOverW,
             angle: snapshot.angle,
-            windMagnitude: snapshot.wind,
-            windDir: snapshot.windDir,
             minimapJPEG: snapshot.minimapJPEG,
             smoother: emaSmoother,
             targetSwitched: targetSwitched
@@ -454,7 +496,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let currentFrameId = frameCounter
         lastPacketSentTime = now
         let snapshot = currentSnapshotLocked()
-        let telemetry = buildTelemetry(frameId: currentFrameId, from: snapshot, targetSwitched: false)
+        let telemetry = buildTelemetryLocked(frameId: currentFrameId, from: snapshot, targetSwitched: false)
         stateLock.unlock()
 
         sendUDPPacket(telemetry)
@@ -565,7 +607,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         udpLock.unlock()
     }
 
-    // MARK: - Orientation & 960px Landscape Downscale
+    // MARK: - Orientation & Direct CIImage ROI Cropping
 
     private func extractVideoOrientation(from sampleBuffer: CMSampleBuffer) -> CGImagePropertyOrientation {
         if let attachment = CMGetAttachment(
@@ -578,38 +620,30 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return .up
     }
 
-    private func makeLandscapeDownscaledCGImage(
-        from pixelBuffer: CVPixelBuffer,
-        orientation: CGImagePropertyOrientation
+    private func renderCroppedROI(
+        _ roi: NormalizedRect,
+        from ciImage: CIImage,
+        maxWidth: CGFloat
     ) -> CGImage? {
-        var ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
+        let cropRect = roi.ciRect(width: ciImage.extent.width, height: ciImage.extent.height)
+        guard cropRect.width >= 4, cropRect.height >= 4 else { return nil }
 
-        // Luôn xoay sang đúng chiều ngang (width > height) trước khi cắt các vùng Gunny Mobi.
-        if ciImage.extent.height > ciImage.extent.width {
-            ciImage = ciImage.oriented(.left)
+        var patch = ciImage
+            .cropped(to: cropRect)
+            .transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
+
+        if patch.extent.width > maxWidth, patch.extent.width > 0 {
+            let scale = maxWidth / patch.extent.width
+            patch = patch.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
         }
 
-        let origin = ciImage.extent.origin
-        if origin != .zero {
-            ciImage = ciImage.transformed(by: CGAffineTransform(translationX: -origin.x, y: -origin.y))
-        }
-
-        let currentWidth = ciImage.extent.width
-        guard currentWidth > 0, ciImage.extent.height > 0 else { return nil }
-
-        if currentWidth > maxScaledWidth {
-            let scale = maxScaledWidth / currentWidth
-            ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        }
-
-        let renderBounds = CGRect(
+        let bounds = CGRect(
             x: 0,
             y: 0,
-            width: floor(ciImage.extent.width),
-            height: floor(ciImage.extent.height)
+            width: floor(patch.extent.width),
+            height: floor(patch.extent.height)
         )
-        guard renderBounds.width >= 16, renderBounds.height >= 16 else { return nil }
-
-        return sharedCIContext.createCGImage(ciImage, from: renderBounds)
+        guard bounds.width >= 4, bounds.height >= 4 else { return nil }
+        return sharedCIContext.createCGImage(patch, from: bounds)
     }
 }

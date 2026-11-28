@@ -4,56 +4,173 @@ import ImageIO
 import UniformTypeIdentifiers
 import Vision
 
-/// Kết quả phân tích Minimap gồm tọa độ người chơi, danh sách mục tiêu độc lập, khung camera trắng và ảnh JPEG cắt trực tiếp.
+/// Kết quả phân tích Minimap bản không gió: tọa độ người chơi, cụm mục tiêu độc lập, khung camera trắng và ảnh JPEG.
 public struct MinimapAnalysis: Equatable, Sendable {
-    public let playerPos: NormalizedPoint?
-    public let enemies: [NormalizedPoint]
+    public let playerPos: CGPoint?
+    public let enemies: [CGPoint]
     public let cameraRect: NormalizedRect?
     public let minimapAspectHOverW: Double
     public let minimapJPEG: Data?
 }
 
-/// Kết quả đọc ô Gió sau bước kiểm tra viền khung mũi tên gió.
-public struct WindObservation: Equatable, Sendable {
-    public let value: Double?
-    public let direction: Int
-    public let hasWindFrame: Bool
-}
-
-/// Kết quả đọc kép Góc bắn từ cả vùng chiến trường (`°`) và cụm phím D-pad góc dưới trái.
-public struct AngleObservation: Equatable, Sendable {
-    public let battlefieldAngle: Double?
-    public let dpadAngle: Double?
-}
-
-/// Bộ xử lý thị giác máy tính (< 25MB RAM) dùng thuần CoreGraphics, ImageIO và Vision (.fast).
+/// Bộ xử lý thị giác tốc độ cao (< 20MB RAM) dùng thuần CoreGraphics, ImageIO và Vision (.fast).
+/// - Không quét vùng gió hay đồng hồ đếm ngược lượt ở giữa trên cùng.
 public final class VisionProcessor {
-    private static let maxMinimapSampleDimension = 180
-    private static let maxWindSampleDimension = 220
+    private static let maxMinimapSampleDimension = 160
     private static let maxBattlefieldAngleDimension = 560
-    private static let maxDPadSampleDimension = 220
     private static let minimapJPEGWidth = 160
     private static let minimapJPEGHeight = 100
-    private static let allowedNumericChars = CharacterSet(charactersIn: "0123456789-+.")
+
+    private static let gocRawRegex = try? NSRegularExpression(
+        pattern: #"g[oóôòỏõọốồổỗộớờởỡợ]c\s*[:=]?\s*(-?\d{1,2})\s*[°º]?"#,
+        options: [.caseInsensitive]
+    )
+    private static let gocFoldedRegex = try? NSRegularExpression(
+        pattern: #"goc\s*[:=]?\s*(-?\d{1,2})\s*[°º]?"#,
+        options: [.caseInsensitive]
+    )
+    private static let degreeOnlyRegex = try? NSRegularExpression(
+        pattern: #"(-?\d{1,2})\s*[°º]"#,
+        options: []
+    )
 
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
     private let grayColorSpace = CGColorSpaceCreateDeviceGray()
 
     public init() {}
 
-    // MARK: - 1. Minimap Clustering, Camera Viewport & JPEG Compression
+    // MARK: - 1. Battle UI Verification (3 Combat Signs)
 
-    public func analyzeMinimap(
-        from cgImage: CGImage,
-        normalizedRect: NormalizedRect = GunnyROIs.minimap
-    ) -> MinimapAnalysis? {
-        let roiPixel = normalizedRect.pixelRect(width: cgImage.width, height: cgImage.height)
-        let cropW = Int(roiPixel.width)
-        let cropH = Int(roiPixel.height)
-        guard cropW >= 8, cropH >= 8,
-              let cropped = cgImage.cropping(to: roiPixel) else {
-            return nil
+    /// Dấu hiệu 1a: Nút đóng màu đỏ `[X]` ở góc trên bên phải (`x: 0.94...0.99, y: 0.005...0.055`).
+    public func detectRedCloseButton(in cropped: CGImage) -> Bool {
+        let (outW, outH) = clampedSize(width: cropped.width, height: cropped.height, maxDimension: 48)
+        guard outW >= 4, outH >= 4,
+              let context = makeRGBAContext(width: outW, height: outH),
+              let ptr = context.data?.assumingMemoryBound(to: UInt8.self) else {
+            return false
         }
+
+        context.interpolationQuality = .low
+        context.draw(cropped, in: CGRect(x: 0, y: 0, width: outW, height: outH))
+
+        let bytesPerRow = context.bytesPerRow
+        let total = max(outW * outH, 1)
+        var redHits = 0
+        var brightCrossHits = 0
+
+        for y in 0..<outH {
+            let row = ptr.advanced(by: y * bytesPerRow)
+            for x in 0..<outW {
+                let px = x * 4
+                let r = row[px]
+                let g = row[px + 1]
+                let b = row[px + 2]
+                let hsv = rgbToHSV(r: r, g: g, b: b)
+
+                if (hsv.h <= 22.0 || hsv.h >= 338.0) && hsv.s >= 0.40 && hsv.v >= 0.32 {
+                    redHits += 1
+                } else if r >= 185 && g >= 185 && b >= 185 && hsv.s <= 0.25 {
+                    brightCrossHits += 1
+                }
+            }
+        }
+
+        let redRatio = Double(redHits) / Double(total)
+        let crossRatio = Double(brightCrossHits) / Double(total)
+        return redRatio >= 0.12 && crossRatio >= 0.02
+    }
+
+    /// Dấu hiệu 1b: Thước chia màu vàng `0 - 5 - 10` ở đáy Minimap (`x: 0.848...0.995, y: 0.145...0.175`).
+    public func detectGoldenMinimapRuler(in cropped: CGImage) -> Bool {
+        let (outW, outH) = clampedSize(width: cropped.width, height: cropped.height, maxDimension: 120)
+        guard outW >= 8, outH >= 4,
+              let context = makeRGBAContext(width: outW, height: outH),
+              let ptr = context.data?.assumingMemoryBound(to: UInt8.self) else {
+            return false
+        }
+
+        context.interpolationQuality = .low
+        context.draw(cropped, in: CGRect(x: 0, y: 0, width: outW, height: outH))
+
+        let bytesPerRow = context.bytesPerRow
+        let total = max(outW * outH, 1)
+        var goldHits = 0
+
+        for y in 0..<outH {
+            let row = ptr.advanced(by: y * bytesPerRow)
+            for x in 0..<outW {
+                let px = x * 4
+                let hsv = rgbToHSV(r: row[px], g: row[px + 1], b: row[px + 2])
+                if hsv.h >= 24.0 && hsv.h <= 66.0 && hsv.s >= 0.30 && hsv.v >= 0.40 {
+                    goldHits += 1
+                }
+            }
+        }
+
+        let goldRatio = Double(goldHits) / Double(total)
+        return goldRatio >= 0.035
+    }
+
+    /// Dấu hiệu 2: Thanh thước lực `10 20 30 ... 100` ở cạnh dưới màn hình (`x: 0.30...0.72, y: 0.88...0.95`).
+    public func detectBottomPowerBar(in cropped: CGImage) -> Bool {
+        let (outW, outH) = clampedSize(width: cropped.width, height: cropped.height, maxDimension: 160)
+        guard outW >= 24, outH >= 6,
+              let context = makeGrayscaleContext(width: outW, height: outH),
+              let ptr = context.data?.assumingMemoryBound(to: UInt8.self) else {
+            return false
+        }
+
+        context.interpolationQuality = .low
+        context.draw(cropped, in: CGRect(x: 0, y: 0, width: outW, height: outH))
+
+        let bytesPerRow = context.bytesPerRow
+        let bucketCount = 8
+        var bucketContrastHits = [Int](repeating: 0, count: bucketCount)
+        var bucketBrightHits = [Int](repeating: 0, count: bucketCount)
+        var strongBorderRows = 0
+
+        for y in 0..<(outH - 1) {
+            let row = ptr.advanced(by: y * bytesPerRow)
+            let nextRow = ptr.advanced(by: (y + 1) * bytesPerRow)
+            var rowVertEdges = 0
+
+            for x in 0..<(outW - 1) {
+                let lum = Int(row[x])
+                let rightLum = Int(row[x + 1])
+                let downLum = Int(nextRow[x])
+                let bucket = min((x * bucketCount) / outW, bucketCount - 1)
+
+                if abs(lum - downLum) >= 34 {
+                    rowVertEdges += 1
+                    bucketContrastHits[bucket] += 1
+                } else if abs(lum - rightLum) >= 34 {
+                    bucketContrastHits[bucket] += 1
+                }
+
+                if lum >= 160 {
+                    bucketBrightHits[bucket] += 1
+                }
+            }
+
+            if Double(rowVertEdges) / Double(max(outW - 1, 1)) >= 0.20 {
+                strongBorderRows += 1
+            }
+        }
+
+        let activeContrastBuckets = bucketContrastHits.filter { $0 >= 6 }.count
+        let activeBrightBuckets = bucketBrightHits.filter { $0 >= 3 }.count
+        return strongBorderRows >= 2 && activeContrastBuckets >= 5 && activeBrightBuckets >= 4
+    }
+
+    // MARK: - 2. Direct-Crop Minimap Analysis (25 FPS Fast Path)
+
+    public func analyzeMinimapCrop(
+        _ cropped: CGImage,
+        includeJPEG: Bool = true
+    ) -> MinimapAnalysis? {
+        let cropW = cropped.width
+        let cropH = cropped.height
+        guard cropW >= 8, cropH >= 8 else { return nil }
 
         let minimapAspectHOverW = Double(cropH) / Double(cropW)
         let (outW, outH) = clampedSize(width: cropW, height: cropH, maxDimension: Self.maxMinimapSampleDimension)
@@ -80,7 +197,6 @@ public final class VisionProcessor {
                 let b = rowPtr[px + 2]
                 let idx = y * outW + x
 
-                // Khung chữ nhật camera trắng bên trong Minimap (loại bỏ sát viền 2px ngoài cùng).
                 if x >= 2 && x < (outW - 2) && y >= 2 && y < (outH - 2) {
                     let maxRGB = max(r, max(g, b))
                     let minRGB = min(r, min(g, b))
@@ -90,13 +206,9 @@ public final class VisionProcessor {
                 }
 
                 let hsv = rgbToHSV(r: r, g: g, b: b)
-
-                // Cụm xanh dương kèm dấu tam giác chỉ người chơi.
                 if hsv.h >= 195.0 && hsv.h <= 248.0 && hsv.s >= 0.45 && hsv.v >= 0.38 {
                     blueMask[idx] = true
-                }
-                // Cụm đỏ chỉ kẻ địch.
-                else if (hsv.h <= 18.0 || hsv.h >= 342.0) && hsv.s >= 0.48 && hsv.v >= 0.38 {
+                } else if (hsv.h <= 18.0 || hsv.h >= 342.0) && hsv.s >= 0.48 && hsv.v >= 0.38 {
                     redMask[idx] = true
                 }
             }
@@ -110,14 +222,14 @@ public final class VisionProcessor {
             playerPos: playerPos
         )
         let cameraRect = detectCameraRectangle(whiteMask: whiteMask, width: outW, height: outH)
-        let minimapJPEG = encodeMinimapJPEG(from: cropped)
+        let jpegData = includeJPEG ? encodeMinimapJPEG(from: cropped) : nil
 
         return MinimapAnalysis(
             playerPos: playerPos,
             enemies: enemies,
             cameraRect: cameraRect,
             minimapAspectHOverW: minimapAspectHOverW,
-            minimapJPEG: minimapJPEG
+            minimapJPEG: jpegData
         )
     }
 
@@ -216,7 +328,7 @@ public final class VisionProcessor {
         return clusters
     }
 
-    private func detectPlayerCluster(mask: [Bool], width: Int, height: Int) -> NormalizedPoint? {
+    private func detectPlayerCluster(mask: [Bool], width: Int, height: Int) -> CGPoint? {
         let clusters = extractClusters(
             from: mask,
             width: width,
@@ -227,7 +339,6 @@ public final class VisionProcessor {
         )
         guard !clusters.isEmpty else { return nil }
 
-        // Ưu tiên cụm xanh dương nhỏ gọn có dấu tam giác định hướng dọc phía trên chấm.
         var bestCluster = clusters[0]
         var bestScore = -1.0
         for cluster in clusters {
@@ -239,7 +350,7 @@ public final class VisionProcessor {
             }
         }
 
-        return NormalizedPoint(
+        return CGPoint(
             x: bestCluster.centerX / Double(width),
             y: bestCluster.centerY / Double(height)
         )
@@ -249,8 +360,8 @@ public final class VisionProcessor {
         mask: [Bool],
         width: Int,
         height: Int,
-        playerPos: NormalizedPoint?
-    ) -> [NormalizedPoint] {
+        playerPos: CGPoint?
+    ) -> [CGPoint] {
         let rawClusters = extractClusters(
             from: mask,
             width: width,
@@ -261,7 +372,6 @@ public final class VisionProcessor {
         )
         guard !rawClusters.isEmpty else { return [] }
 
-        // Gom các mảnh chấm đỏ cùng 1 mục tiêu lại theo ngưỡng khoảng cách, tách biệt hoàn toàn từng mục tiêu độc lập.
         let mergeDistPx = max(5.0, Double(width) * 0.045)
         var merged = rawClusters
         var didMerge = true
@@ -290,12 +400,13 @@ public final class VisionProcessor {
         }
 
         var normalized = merged.map {
-            NormalizedPoint(x: $0.centerX / Double(width), y: $0.centerY / Double(height))
+            CGPoint(x: $0.centerX / Double(width), y: $0.centerY / Double(height))
         }
 
         if let playerPos {
             normalized.sort {
-                hypot($0.x - playerPos.x, $0.y - playerPos.y) < hypot($1.x - playerPos.x, $1.y - playerPos.y)
+                hypot(Double($0.x - playerPos.x), Double($0.y - playerPos.y))
+                    < hypot(Double($1.x - playerPos.x), Double($1.y - playerPos.y))
             }
         } else {
             normalized.sort { $0.x < $1.x }
@@ -459,302 +570,79 @@ public final class VisionProcessor {
         return mutableData as Data
     }
 
-    // MARK: - 2. Wind Arrow Frame Lock + OCR + Direction
+    // MARK: - 3. Battlefield Angle OCR (-30° ... 85°, hỗ trợ góc âm "Góc -18°")
 
-    public func detectWind(
-        from cgImage: CGImage,
-        normalizedRect: NormalizedRect = GunnyROIs.wind
-    ) -> WindObservation {
-        let roiPixel = normalizedRect.pixelRect(width: cgImage.width, height: cgImage.height)
-        let cropW = Int(roiPixel.width)
-        let cropH = Int(roiPixel.height)
-        guard cropW >= 8, cropH >= 4,
-              let cropped = cgImage.cropping(to: roiPixel) else {
-            return WindObservation(value: nil, direction: 1, hasWindFrame: false)
-        }
-
-        let scale = cropH < 44 ? 2 : 1
-        let (outW, outH) = clampedSize(width: cropW * scale, height: cropH * scale, maxDimension: Self.maxWindSampleDimension)
-        guard let rgbaContext = makeRGBAContext(width: outW, height: outH),
-              let rgbaPtr = rgbaContext.data?.assumingMemoryBound(to: UInt8.self) else {
-            return WindObservation(value: nil, direction: 1, hasWindFrame: false)
-        }
-
-        rgbaContext.interpolationQuality = .medium
-        rgbaContext.draw(cropped, in: CGRect(x: 0, y: 0, width: outW, height: outH))
-
-        let rgbaBytesPerRow = rgbaContext.bytesPerRow
-        var lumBuffer = [UInt8](repeating: 0, count: outW * outH)
-        var frameColorHits = 0
-        var innerPixels = 0
-
-        let x0 = max(1, Int(Double(outW) * 0.08))
-        let x1 = min(outW - 2, Int(Double(outW) * 0.92))
-        let y0 = max(1, Int(Double(outH) * 0.12))
-        let y1 = min(outH - 2, Int(Double(outH) * 0.88))
-
-        let midX = outW / 2
-        var leftBright = 0
-        var rightBright = 0
-
-        for y in 0..<outH {
-            let row = rgbaPtr.advanced(by: y * rgbaBytesPerRow)
-            for x in 0..<outW {
-                let px = x * 4
-                let r = row[px]
-                let g = row[px + 1]
-                let b = row[px + 2]
-                let lumInt = (Int(r) * 77 + Int(g) * 150 + Int(b) * 29) >> 8
-                let lum = UInt8(min(max(lumInt, 0), 255))
-                lumBuffer[y * outW + x] = lum
-
-                if lum >= 175 {
-                    if x < midX {
-                        leftBright += 1
-                    } else {
-                        rightBright += 1
-                    }
-                }
-
-                if x >= x0 && x <= x1 && y >= y0 && y <= y1 {
-                    innerPixels += 1
-                    let hsv = rgbToHSV(r: r, g: g, b: b)
-                    if (hsv.v >= 0.55 && hsv.s >= 0.26) || (hsv.v >= 0.84 && hsv.s <= 0.24) {
-                        frameColorHits += 1
-                    }
-                }
-            }
-        }
-
-        var borderEdgeHits = 0
-        if x1 > x0 && y1 > y0 {
-            for y in y0...y1 {
-                for x in x0...x1 {
-                    let cur = Int(lumBuffer[y * outW + x])
-                    let right = Int(lumBuffer[y * outW + (x + 1)])
-                    let down = Int(lumBuffer[(y + 1) * outW + x])
-                    if abs(cur - right) >= 42 || abs(cur - down) >= 42 {
-                        borderEdgeHits += 1
-                    }
-                }
-            }
-        }
-
-        let safeInner = max(innerPixels, 1)
-        let borderEdgeDensity = Double(borderEdgeHits) / Double(safeInner)
-        let frameColorDensity = Double(frameColorHits) / Double(safeInner)
-
-        // Khóa chống đọc nhầm đồng hồ lượt: không thấy đặc trưng viền khung mũi tên gió => Gió = 0.0, bỏ qua OCR.
-        guard borderEdgeDensity >= 0.055 && frameColorDensity >= 0.075 else {
-            return WindObservation(value: 0.0, direction: 1, hasWindFrame: false)
-        }
-
-        let direction = leftBright > rightBright ? -1 : 1
-
-        guard let grayContext = makeGrayscaleContext(width: outW, height: outH),
-              let grayPtr = grayContext.data?.assumingMemoryBound(to: UInt8.self) else {
-            return WindObservation(value: nil, direction: direction, hasWindFrame: true)
-        }
-
-        let grayBytesPerRow = grayContext.bytesPerRow
-        for y in 0..<outH {
-            let dstRow = grayPtr.advanced(by: y * grayBytesPerRow)
-            for x in 0..<outW {
-                dstRow[x] = lumBuffer[y * outW + x]
-            }
-        }
-
-        enhanceContrastInPlace(grayBuffer: grayPtr, width: outW, height: outH, bytesPerRow: grayBytesPerRow)
-        guard let enhancedImage = grayContext.makeImage() else {
-            return WindObservation(value: nil, direction: direction, hasWindFrame: true)
-        }
-
-        let candidates = performFastTextRecognition(on: enhancedImage, minimumTextHeight: 0.15)
-        guard let parsed = Self.parseFilteredNumber(from: candidates.joined(separator: " ")) else {
-            return WindObservation(value: nil, direction: direction, hasWindFrame: true)
-        }
-
-        let magnitude = abs(parsed)
-        guard magnitude <= 5.5 else {
-            return WindObservation(value: nil, direction: direction, hasWindFrame: true)
-        }
-
-        let clampedWind = min(max(magnitude, 0.0), 5.0)
-        if clampedWind < 0.05 {
-            return WindObservation(value: 0.0, direction: 1, hasWindFrame: true)
-        }
-        return WindObservation(value: clampedWind, direction: direction, hasWindFrame: true)
-    }
-
-    // MARK: - 3. Dual-Region Angle OCR (Battlefield + D-Pad Center, 10°...85°)
-
-    public func detectDualAngle(from cgImage: CGImage) -> AngleObservation {
-        let battlefield = detectBattlefieldAngle(from: cgImage, normalizedRect: GunnyROIs.angleBattlefield)
-        let dpad = detectDPadAngle(from: cgImage, normalizedRect: GunnyROIs.angleDPad)
-        return AngleObservation(battlefieldAngle: battlefield, dpadAngle: dpad)
-    }
-
-    public func detectBattlefieldAngle(
-        from cgImage: CGImage,
-        normalizedRect: NormalizedRect = GunnyROIs.angleBattlefield
-    ) -> Double? {
-        let roiPixel = normalizedRect.pixelRect(width: cgImage.width, height: cgImage.height)
-        let cropW = Int(roiPixel.width)
-        let cropH = Int(roiPixel.height)
-        guard cropW >= 8, cropH >= 8,
-              let cropped = cgImage.cropping(to: roiPixel) else {
-            return nil
-        }
+    /// Đọc chuỗi `G[oóô]c\s*(-?\d{1,2})\s*°?` từ vùng chiến trường (`x: 0.04, y: 0.12, w: 0.85, h: 0.62`), bỏ qua cụm D-pad góc dưới trái.
+    public func detectBattlefieldAngle(fromCroppedImage cropped: CGImage) -> Double? {
+        let cropW = cropped.width
+        let cropH = cropped.height
+        guard cropW >= 16, cropH >= 16 else { return nil }
 
         let (outW, outH) = clampedSize(width: cropW, height: cropH, maxDimension: Self.maxBattlefieldAngleDimension)
         guard let enhancedImage = makeContrastGrayImage(from: cropped, width: outW, height: outH) else {
             return nil
         }
 
-        let candidates = performFastTextRecognition(on: enhancedImage, minimumTextHeight: 0.03)
-        return Self.extractPriorityAngle(from: candidates)
-    }
+        let observations = performFastTextObservations(on: enhancedImage, minimumTextHeight: 0.025)
+        guard !observations.isEmpty else { return nil }
 
-    public func detectDPadAngle(
-        from cgImage: CGImage,
-        normalizedRect: NormalizedRect = GunnyROIs.angleDPad
-    ) -> Double? {
-        let roiPixel = normalizedRect.pixelRect(width: cgImage.width, height: cgImage.height)
-        let cropW = Int(roiPixel.width)
-        let cropH = Int(roiPixel.height)
-        guard cropW >= 6, cropH >= 6,
-              let cropped = cgImage.cropping(to: roiPixel) else {
-            return nil
-        }
-
-        let (outW, outH) = clampedSize(width: cropW * 2, height: cropH * 2, maxDimension: Self.maxDPadSampleDimension)
-        guard let enhancedImage = makeContrastGrayImage(from: cropped, width: outW, height: outH) else {
-            return nil
-        }
-
-        let candidates = performFastTextRecognition(on: enhancedImage, minimumTextHeight: 0.16)
-        if let priority = Self.extractPriorityAngle(from: candidates) {
-            return priority
-        }
-        return Self.extractCleanDPadNumber(from: candidates)
-    }
-
-    // MARK: - Text Parsing Helpers
-
-    public static func extractPriorityAngle(from candidates: [String]) -> Double? {
-        for raw in candidates {
-            if let matched = parseAngleNearGocKeyword(raw), matched >= 10.0 && matched <= 85.0 {
+        // Ưu tiên 1: Khớp chính xác chuỗi "Góc -18°" / "Góc 56°" / "Gôc 45" (-30°...85°).
+        for obs in observations {
+            guard let text = obs.topCandidates(1).first?.string else { continue }
+            if let matched = Self.matchGocRegex(in: text) {
                 return matched
             }
         }
-        for raw in candidates {
-            if let matched = parseAngleBeforeDegreeSymbol(raw), matched >= 10.0 && matched <= 85.0 {
-                return matched
-            }
-        }
-        return nil
-    }
 
-    private static func extractCleanDPadNumber(from candidates: [String]) -> Double? {
-        for raw in candidates {
-            let trimmed = raw
-                .replacingOccurrences(of: "°", with: "")
-                .replacingOccurrences(of: "º", with: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-
-            guard !trimmed.isEmpty, trimmed.count <= 4 else { continue }
-            guard !trimmed.contains("/"), !trimmed.contains("%"), !trimmed.contains(":"), !trimmed.contains(",") else {
+        // Ưu tiên 2: Nếu chữ "Góc" bị hiệu ứng che khuất nhưng còn ký hiệu độ `°`, bỏ qua góc dưới trái và bỏ qua số 0 đơn lẻ.
+        for obs in observations {
+            // Bỏ qua vùng sát góc dưới trái để tuyệt đối tránh cụm D-pad.
+            if obs.boundingBox.minX < 0.18 && obs.boundingBox.minY < 0.15 {
                 continue
             }
-
-            if let value = Double(trimmed), value >= 10.0 && value <= 85.0 {
-                return value.rounded()
+            guard let text = obs.topCandidates(1).first?.string else { continue }
+            if let matched = Self.matchDegreeFallback(in: text), matched != 0.0 {
+                return matched
             }
         }
+
         return nil
     }
 
-    private static func parseAngleNearGocKeyword(_ text: String) -> Double? {
-        let folded = text.folding(options: .diacriticInsensitive, locale: Locale(identifier: "en_US_POSIX"))
-            .lowercased()
-        guard let range = folded.range(of: "goc") else { return nil }
-
-        let tail = String(folded[range.upperBound...])
-        var token = ""
-        var started = false
-        for ch in tail {
-            if !started {
-                if ch == "-" || (ch.isASCII && ch.isNumber) {
-                    started = true
-                    token.append(ch)
-                } else if ch == "°" || ch == "º" {
-                    break
-                }
-            } else {
-                if (ch.isASCII && ch.isNumber) || ch == "." {
-                    token.append(ch)
-                } else {
-                    break
-                }
-            }
+    public static func matchGocRegex(in rawText: String) -> Double? {
+        if let regex = gocRawRegex,
+           let val = extractFirstNumericGroup(using: regex, in: rawText),
+           val >= -30.0 && val <= 85.0 {
+            return val
         }
-        guard let value = Double(token), value >= 10.0 && value <= 85.0 else { return nil }
-        return value
-    }
 
-    private static func parseAngleBeforeDegreeSymbol(_ text: String) -> Double? {
-        let chars = Array(text)
-        for (idx, ch) in chars.enumerated() where ch == "°" || ch == "º" {
-            var digits = ""
-            var i = idx - 1
-            while i >= 0 && chars[i] == " " {
-                i -= 1
-            }
-            while i >= 0 {
-                let c = chars[i]
-                if (c.isASCII && c.isNumber) || c == "." {
-                    digits.insert(c, at: digits.startIndex)
-                } else if c == "-" {
-                    digits.insert(c, at: digits.startIndex)
-                    break
-                } else {
-                    break
-                }
-                i -= 1
-            }
-            if let value = Double(digits), value >= 10.0 && value <= 85.0 {
-                return value
-            }
+        let folded = rawText.folding(options: .diacriticInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+        if let regex = gocFoldedRegex,
+           let val = extractFirstNumericGroup(using: regex, in: folded),
+           val >= -30.0 && val <= 85.0 {
+            return val
         }
+
         return nil
     }
 
-    private static func parseFilteredNumber(from rawText: String) -> Double? {
-        var filtered = ""
-        filtered.reserveCapacity(rawText.count)
-        for scalar in rawText.unicodeScalars where allowedNumericChars.contains(scalar) {
-            filtered.unicodeScalars.append(scalar)
+    private static func matchDegreeFallback(in rawText: String) -> Double? {
+        guard let regex = degreeOnlyRegex,
+              let val = extractFirstNumericGroup(using: regex, in: rawText),
+              val >= -30.0 && val <= 85.0 else {
+            return nil
         }
-        guard !filtered.isEmpty else { return nil }
+        return val
+    }
 
-        var token = ""
-        var hasDecimal = false
-        for ch in filtered {
-            if (ch == "-" || ch == "+") && token.isEmpty {
-                token.append(ch)
-            } else if ch == "." && !hasDecimal {
-                hasDecimal = true
-                if token.isEmpty || token == "-" || token == "+" {
-                    token.append("0")
-                }
-                token.append(ch)
-            } else if ch.isASCII && ch.isNumber {
-                token.append(ch)
-            } else if !token.isEmpty {
-                break
-            }
+    private static func extractFirstNumericGroup(using regex: NSRegularExpression, in text: String) -> Double? {
+        let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: fullRange),
+              match.numberOfRanges >= 2,
+              let groupRange = Range(match.range(at: 1), in: text) else {
+            return nil
         }
-        return Double(token)
+        return Double(text[groupRange])
     }
 
     // MARK: - CoreGraphics & Vision Helpers
@@ -771,7 +659,7 @@ public final class VisionProcessor {
         return grayContext.makeImage()
     }
 
-    private func performFastTextRecognition(on image: CGImage, minimumTextHeight: Float) -> [String] {
+    private func performFastTextObservations(on image: CGImage, minimumTextHeight: Float) -> [VNRecognizedTextObservation] {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .fast
         request.usesLanguageCorrection = false
@@ -783,8 +671,7 @@ public final class VisionProcessor {
         } catch {
             return []
         }
-        guard let observations = request.results else { return [] }
-        return observations.compactMap { $0.topCandidates(1).first?.string }
+        return request.results ?? []
     }
 
     private func makeRGBAContext(width: Int, height: Int) -> CGContext? {

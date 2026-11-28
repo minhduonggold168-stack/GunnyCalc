@@ -32,128 +32,97 @@ public struct NormalizedRect: Codable, Equatable, Sendable {
         return raw.intersection(bounds)
     }
 
+    /// Chuyển đổi sang tọa độ CoreImage (gốc dưới-trái) cho ảnh đã dịch về gốc `(0, 0)`.
+    public func ciRect(width imageWidth: CGFloat, height imageHeight: CGFloat) -> CGRect {
+        guard imageWidth > 0, imageHeight > 0 else { return .zero }
+        let rectX = floor(CGFloat(x) * imageWidth)
+        let rectW = max(1.0, floor(CGFloat(width) * imageWidth))
+        let rectH = max(1.0, floor(CGFloat(height) * imageHeight))
+        let rectY = floor((1.0 - CGFloat(y + height)) * imageHeight)
+        let raw = CGRect(x: rectX, y: rectY, width: rectW, height: rectH)
+        return raw.intersection(CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight))
+    }
+
     private static func clamp01(_ value: Double) -> Double {
         guard value.isFinite else { return 0.0 }
         return min(max(value, 0.0), 1.0)
     }
 }
 
-/// Tọa độ điểm chuẩn hóa (0.0 - 1.0) bên trong Minimap (gốc trên-trái).
-public struct NormalizedPoint: Codable, Equatable, Sendable {
-    public var x: Double
-    public var y: Double
-
-    public init(x: Double, y: Double) {
-        self.x = x.isFinite ? min(max(x, 0.0), 1.0) : 0.5
-        self.y = y.isFinite ? min(max(y, 0.0), 1.0) : 0.5
-    }
-}
-
-/// Các vùng quét chuẩn hóa cố định của Gunny Mobi (tỉ lệ 0.0 - 1.0).
+/// Các vùng quét cố định cho Gunny Mobi bản không gió (tỉ lệ chuẩn hóa 0.0 - 1.0, gốc trên-trái).
 public enum GunnyROIs {
     public static let minimap = NormalizedRect(x: 0.848, y: 0.005, width: 0.148, height: 0.170)
-    public static let wind = NormalizedRect(x: 0.420, y: 0.005, width: 0.160, height: 0.062)
-    public static let angleBattlefield = NormalizedRect(x: 0.080, y: 0.120, width: 0.760, height: 0.580)
-    public static let angleDPad = NormalizedRect(x: 0.075, y: 0.745, width: 0.080, height: 0.130)
-    public static let angle = angleBattlefield
+    public static let angleBattlefield = NormalizedRect(x: 0.040, y: 0.120, width: 0.850, height: 0.620)
+
+    // 3 dấu hiệu nhận diện giao diện chiến đấu Gunny Mobi (khóa isInBattle).
+    public static let battleCloseButton = NormalizedRect(x: 0.940, y: 0.005, width: 0.050, height: 0.050)
+    public static let battleMinimapRuler = NormalizedRect(x: 0.848, y: 0.145, width: 0.147, height: 0.030)
+    public static let battlePowerBar = NormalizedRect(x: 0.300, y: 0.880, width: 0.420, height: 0.070)
 }
 
-/// Điểm tọa độ chuẩn hóa `0.0 - 1.0` dọc đường cong parabol quỹ đạo đạn trong khung Minimap.
-public struct TrajectoryPoint: Codable, Equatable, Sendable {
-    public let x: Double
-    public let y: Double
-
-    public init(x: Double, y: Double) {
-        self.x = x
-        self.y = y
-    }
-}
-
-/// Gói dữ liệu chiến đấu truyền thời gian thực qua BSD UDP loopback (`127.0.0.1:45678`).
+/// Gói dữ liệu chiến đấu bản không gió truyền thời gian thực 25 FPS qua BSD UDP (`127.0.0.1:45678`).
 public struct TelemetryData: Codable, Equatable, Sendable {
     public var frameId: Int
-    public var playerX: Double
-    public var playerY: Double
-    public var enemyX: Double
-    public var enemyY: Double
-    public var enemies: [NormalizedPoint]
-    public var lockedEnemyIndex: Int
-    public var cameraRect: NormalizedRect?
-    public var cameraWidthNorm: Double
+    public var isInBattle: Bool
     public var distanceUnits: Double
-    public var deltaYUnits: Double
+    public var deltaY: Double
     public var angle: Double
-    public var wind: Double
-    public var windDir: Int
     public var power: Double
-    public var trajectoryPoints: [TrajectoryPoint]
+    public var holdSeconds: Double
+    public var playerNorm: CGPoint
+    public var enemyNorm: CGPoint
+    public var allEnemiesNorm: [CGPoint]
     public var minimapJPEG: Data?
+    public var trajectoryPoints: [CGPoint]
+    public var power30: Double
+    public var power50: Double
+    public var power65: Double
 
-    public var dx: Double { enemyX - playerX }
-    public var dy: Double { playerY - enemyY }
     public var screens: Double { distanceUnits / 10.0 }
-    public var holdSeconds: Double { (min(max(power, 0.0), 100.0) / 100.0) * 2.20 }
 
     public init(
         frameId: Int = 0,
-        playerX: Double = 0.20,
-        playerY: Double = 0.68,
-        enemyX: Double = 0.72,
-        enemyY: Double = 0.68,
-        enemies: [NormalizedPoint] = [],
-        lockedEnemyIndex: Int = 0,
-        cameraRect: NormalizedRect? = nil,
-        cameraWidthNorm: Double = 0.38,
-        distanceUnits: Double = 13.0,
-        deltaYUnits: Double = 0.0,
-        angle: Double = 56.0,
-        wind: Double = 0.0,
-        windDir: Int = 1,
-        power: Double = 62.0,
-        trajectoryPoints: [TrajectoryPoint] = [],
-        minimapJPEG: Data? = nil
+        isInBattle: Bool = false,
+        distanceUnits: Double = 0.0,
+        deltaY: Double = 0.0,
+        angle: Double = 50.0,
+        power: Double = 0.0,
+        holdSeconds: Double = 0.0,
+        playerNorm: CGPoint = CGPoint(x: 0.20, y: 0.68),
+        enemyNorm: CGPoint = CGPoint(x: 0.72, y: 0.68),
+        allEnemiesNorm: [CGPoint] = [],
+        minimapJPEG: Data? = nil,
+        trajectoryPoints: [CGPoint] = [],
+        power30: Double = 0.0,
+        power50: Double = 0.0,
+        power65: Double = 0.0
     ) {
         self.frameId = max(frameId, 0)
-        self.playerX = playerX.isFinite ? min(max(playerX, 0.0), 1.0) : 0.20
-        self.playerY = playerY.isFinite ? min(max(playerY, 0.0), 1.0) : 0.68
-        self.enemyX = enemyX.isFinite ? min(max(enemyX, 0.0), 1.0) : 0.72
-        self.enemyY = enemyY.isFinite ? min(max(enemyY, 0.0), 1.0) : 0.68
-        self.enemies = enemies
-        self.lockedEnemyIndex = max(lockedEnemyIndex, 0)
-        self.cameraRect = cameraRect
-        self.cameraWidthNorm = cameraWidthNorm.isFinite ? min(max(cameraWidthNorm, 0.08), 0.95) : 0.38
+        self.isInBattle = isInBattle
         self.distanceUnits = distanceUnits.isFinite ? max(distanceUnits, 0.0) : 0.0
-        self.deltaYUnits = deltaYUnits.isFinite ? deltaYUnits : 0.0
-        self.angle = angle.isFinite ? min(max(angle, 10.0), 85.0) : 56.0
-        self.wind = wind.isFinite ? min(max(abs(wind), 0.0), 5.0) : 0.0
-        self.windDir = windDir < 0 ? -1 : 1
+        self.deltaY = deltaY.isFinite ? deltaY : 0.0
+        self.angle = angle.isFinite ? min(max(angle, -30.0), 85.0) : 50.0
         self.power = power.isFinite ? min(max(power, 0.0), 100.0) : 0.0
-        self.trajectoryPoints = trajectoryPoints
+        self.holdSeconds = holdSeconds.isFinite ? max(holdSeconds, 0.0) : (self.power / 100.0) * 2.20
+        self.playerNorm = Self.clampPoint(playerNorm)
+        self.enemyNorm = Self.clampPoint(enemyNorm)
+        self.allEnemiesNorm = allEnemiesNorm.map { Self.clampPoint($0) }
         self.minimapJPEG = minimapJPEG
+        self.trajectoryPoints = trajectoryPoints.map { Self.clampPoint($0) }
+        self.power30 = power30.isFinite ? min(max(power30, 0.0), 100.0) : 0.0
+        self.power50 = power50.isFinite ? min(max(power50, 0.0), 100.0) : 0.0
+        self.power65 = power65.isFinite ? min(max(power65, 0.0), 100.0) : 0.0
     }
 
-    public static let placeholder = TelemetryData(
-        frameId: 0,
-        playerX: 0.20,
-        playerY: 0.68,
-        enemyX: 0.72,
-        enemyY: 0.68,
-        enemies: [
-            NormalizedPoint(x: 0.72, y: 0.68),
-            NormalizedPoint(x: 0.84, y: 0.54)
-        ],
-        lockedEnemyIndex: 0,
-        cameraRect: NormalizedRect(x: 0.10, y: 0.24, width: 0.40, height: 0.56),
-        cameraWidthNorm: 0.40,
-        distanceUnits: 13.0,
-        deltaYUnits: 0.0,
-        angle: 56.0,
-        wind: 0.0,
-        windDir: 1,
-        power: 62.0,
-        trajectoryPoints: [],
-        minimapJPEG: nil
-    )
+    public static func waiting(frameId: Int = 0) -> TelemetryData {
+        TelemetryData(frameId: frameId, isInBattle: false)
+    }
+
+    private static func clampPoint(_ pt: CGPoint) -> CGPoint {
+        let x = pt.x.isFinite ? min(max(pt.x, 0.0), 1.0) : 0.5
+        let y = pt.y.isFinite ? min(max(pt.y, 0.0), 1.0) : 0.5
+        return CGPoint(x: x, y: y)
+    }
 }
 
 // MARK: - Pure C BSD UDP Socket (127.0.0.1:45678 Loopback)
@@ -271,7 +240,7 @@ public final class BSDUDPReceiver: @unchecked Sendable {
         var rcvBuf: Int32 = 65536
         _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvBuf, socklen_t(MemoryLayout<Int32>.size))
 
-        var timeout = timeval(tv_sec: 0, tv_usec: 400_000)
+        var timeout = timeval(tv_sec: 0, tv_usec: 300_000)
         _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 
         var addr = sockaddr_in()

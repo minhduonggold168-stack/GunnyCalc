@@ -29,7 +29,7 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>GunnyCalc sử dụng mạng cục bộ (127.0.0.1) để nhận dữ liệu góc, gió và vị trí thời gian thực từ tiến trình quay màn hình ReplayKit.</string>
+	<string>GunnyCalc sử dụng mạng cục bộ (127.0.0.1) để nhận tọa độ bản đồ và góc bắn thời gian thực từ tiến trình quay màn hình ReplayKit.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>GunnyCalc cần quyền truy cập Thư viện ảnh để chọn ảnh chụp màn hình game phục vụ căn chỉnh vùng nhận diện (ROI).</string>
 	<key>UIApplicationSceneManifest</key>
