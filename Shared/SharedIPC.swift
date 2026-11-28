@@ -20,7 +20,9 @@ public final class SharedIPC: @unchecked Sendable {
     public func saveTelemetry(_ telemetry: TelemetryData) {
         lock.lock()
         defer { lock.unlock() }
-        guard let defaults, let data = try? encoder.encode(telemetry) else { return }
+        var lightweight = telemetry
+        lightweight.minimapJPEG = nil
+        guard let defaults, let data = try? encoder.encode(lightweight) else { return }
         defaults.set(data, forKey: telemetryKey)
     }
 

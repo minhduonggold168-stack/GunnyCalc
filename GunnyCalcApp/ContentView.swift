@@ -10,9 +10,9 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            // Giữ AVSampleBufferDisplayLayer gắn trong cây view hoạt động để PiP chạy nền ổn định.
+            // Giữ AVSampleBufferDisplayLayer gắn trong cây view hoạt động để PiP chạy nền ổn định (tỉ lệ 680x235).
             PiPHostView(manager: pipManager)
-                .frame(width: 240, height: 80)
+                .frame(width: 272, height: 94)
                 .opacity(0.01)
                 .allowsHitTesting(false)
 
@@ -219,29 +219,8 @@ struct BroadcastPickerButton: UIViewRepresentable {
         bridge.pickerView = uiView.picker
     }
 
-    /// Tự động đối chiếu `<Bundle.main.bundleIdentifier>.BroadcastExtension` với `.appex` được nhúng;
-    /// trả về `nil` nếu Sideloadly đã đổi ID khác để iOS 18 luôn hiển thị danh sách chọn truyền phát.
-    static func resolvePreferredExtension() -> String? {
-        guard let mainBundleID = Bundle.main.bundleIdentifier, !mainBundleID.isEmpty else {
-            return nil
-        }
-        let candidateID = "\(mainBundleID).BroadcastExtension"
-
-        guard let plugInsURL = Bundle.main.builtInPlugInsURL,
-              let pluginURLs = try? FileManager.default.contentsOfDirectory(
-                  at: plugInsURL,
-                  includingPropertiesForKeys: nil,
-                  options: .skipsHiddenFiles
-              )
-        else {
-            return nil
-        }
-
-        let installedAppexIDs = pluginURLs
-            .filter { $0.pathExtension == "appex" }
-            .compactMap { Bundle(url: $0)?.bundleIdentifier }
-
-        return installedAppexIDs.contains(candidateID) ? candidateID : nil
+    static func resolvePreferredExtension() -> String {
+        "\(Bundle.main.bundleIdentifier ?? "com.gunny.pipcalc").BroadcastExtension"
     }
 }
 

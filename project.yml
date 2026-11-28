@@ -86,13 +86,13 @@ targets:
     info:
       path: BroadcastExtension/Info.plist
       properties:
-        CFBundleDisplayName: GunnyCalc Broadcast
+        CFBundleDisplayName: GunnyCalc
         CFBundleName: $(PRODUCT_NAME)
         CFBundleShortVersionString: "1.0.0"
         CFBundleVersion: "1"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.broadcast-services-upload
-          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).SampleHandler
+          NSExtensionPrincipalClass: BroadcastExtension.SampleHandler
           RPBroadcastProcessMode: RPBroadcastProcessModeSampleBuffer
     settings:
       base:

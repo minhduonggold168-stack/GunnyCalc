@@ -1,152 +1,387 @@
 import Foundation
 
-/// Bộ tính toán lực bắn 2D (0...100) và sinh 30 điểm quỹ đạo parabol từ tọa độ người chơi tới mục tiêu.
+/// Kết quả sau làm mượt EMA giúp chỉ số chiến đấu đứng yên sắc nét, không rung giật.
+public struct SmoothedBallistics: Equatable, Sendable {
+    public let playerX: Double
+    public let playerY: Double
+    public let enemyX: Double
+    public let enemyY: Double
+    public let distanceUnits: Double
+    public let deltaYUnits: Double
+    public let power: Double
+}
+
+/// Bộ lọc trung bình trượt hàm mũ (EMA, mặc định `alpha = 0.35`) cho tọa độ và lực bắn.
+public final class BallisticsEMASmoother {
+    public let alpha: Double
+
+    private var isInitialized = false
+    private var playerX = 0.20
+    private var playerY = 0.68
+    private var enemyX = 0.72
+    private var enemyY = 0.68
+    private var distanceUnits = 13.0
+    private var deltaYUnits = 0.0
+    private var power = 62.0
+
+    public init(alpha: Double = 0.35) {
+        self.alpha = min(max(alpha, 0.05), 1.0)
+    }
+
+    public func reset() {
+        isInitialized = false
+    }
+
+    public func smooth(
+        playerX rawPX: Double,
+        playerY rawPY: Double,
+        enemyX rawEX: Double,
+        enemyY rawEY: Double,
+        distanceUnits rawDistance: Double,
+        deltaYUnits rawDeltaY: Double,
+        power rawPower: Double,
+        targetSwitched: Bool
+    ) -> SmoothedBallistics {
+        let wasInitialized = isInitialized
+        let enemyJump = hypot(rawEX - enemyX, rawEY - enemyY)
+
+        if !wasInitialized || targetSwitched || enemyJump > 0.15 {
+            isInitialized = true
+            playerX = !wasInitialized ? rawPX : blend(prev: playerX, raw: rawPX)
+            playerY = !wasInitialized ? rawPY : blend(prev: playerY, raw: rawPY)
+            enemyX = rawEX
+            enemyY = rawEY
+            distanceUnits = rawDistance
+            deltaYUnits = rawDeltaY
+            power = rawPower
+        } else {
+            playerX = blend(prev: playerX, raw: rawPX)
+            playerY = blend(prev: playerY, raw: rawPY)
+            enemyX = blend(prev: enemyX, raw: rawEX)
+            enemyY = blend(prev: enemyY, raw: rawEY)
+            distanceUnits = blend(prev: distanceUnits, raw: rawDistance)
+            deltaYUnits = blend(prev: deltaYUnits, raw: rawDeltaY)
+            power = blend(prev: power, raw: rawPower)
+        }
+
+        return SmoothedBallistics(
+            playerX: playerX,
+            playerY: playerY,
+            enemyX: enemyX,
+            enemyY: enemyY,
+            distanceUnits: distanceUnits,
+            deltaYUnits: deltaYUnits,
+            power: power
+        )
+    }
+
+    private func blend(prev: Double, raw: Double) -> Double {
+        guard raw.isFinite else { return prev }
+        return alpha * raw + (1.0 - alpha) * prev
+    }
+}
+
+/// Bộ tính toán đạn đạo Gunny Mobi chuẩn hóa theo thước Minimap:
+/// - 1 màn hình (chiều rộng khung camera trắng) = `10.0` đơn vị.
+/// - Tầm bắn tối đa tại góc `45°`, lực `100.0`, gió `0.0` = `33.5` đơn vị.
+/// - Điểm neo chuẩn thực tế: cự ly `13.0`, góc `56°`, gió `0.0` -> lực `62.0`.
 public struct BallisticsEngine: Sendable {
-    private static let horizontalRangeScale = 400.0
-    private static let verticalElevationScale = 220.0
-    private static let gravity = 15.0
-    private static let windAccelerationScale = 1.2
+    public static let unitsPerScreen: Double = 10.0
+    public static let maxRangeAt45FullPower: Double = 33.5
+
+    // Hằng số vật lý lực cản không khí tuyến tính hiệu chỉnh chuẩn Gunny Mobi.
+    private static let gravity: Double = 211.942810
+    private static let dragGamma: Double = 0.878324
+    private static let windAccelPerUnit: Double = 6.2127
 
     public init() {}
 
-    /// Tính lực bắn `power` (0.0 ... 100.0) theo `(dx = enemyX - playerX, dy = playerY - enemyY)`, góc bắn và gió có hướng (`wind * windDir`).
+    /// Tính lực bắn `0.0 ... 100.0` theo cự ly (`distanceUnits`), chênh cao (`deltaYUnits`, dương khi địch cao hơn), góc (`10°...85°`) và gió theo hướng bắn (`directedWind = signedWind * shotSign`).
     public func calculatePower(
-        dx: Double,
-        dy: Double,
+        distanceUnits: Double,
+        deltaYUnits: Double,
         angle: Double,
-        signedWind: Double
+        directedWind: Double
     ) -> Double {
-        let distance = abs(dx) * Self.horizontalRangeScale
-        let elevation = dy * Self.verticalElevationScale
-
-        guard distance > 0.0001 || abs(elevation) > 0.0001 else {
+        let safeDistance = max(distanceUnits, 0.0)
+        guard safeDistance > 0.05 || abs(deltaYUnits) > 0.05 else {
             return 0.0
         }
 
-        let safeAngle = min(max(angle, 1.0), 89.0)
-        let theta = safeAngle * .pi / 180.0
-        let sinTheta = sin(theta)
-        let cosTheta = cos(theta)
+        let safeAngle = min(max(angle, 10.0), 85.0)
+        let safeWind = min(max(directedWind, -5.0), 5.0)
 
-        // Quy đổi chiều gió theo hướng bắn (+ thuận gió, - ngược gió).
-        let shotSign = dx >= 0.0 ? 1.0 : -1.0
-        let directedWind = signedWind * shotSign
-        let windAcceleration = directedWind * Self.windAccelerationScale
+        var loPower = 0.0
+        var foundBracket = false
+        var hiPower = 100.0
 
-        let numerator = 2.0 * (distance * sinTheta - elevation * cosTheta)
-        let denominator = Self.gravity * cosTheta + windAcceleration * sinTheta
+        for step in 1...25 {
+            let candidateP = Double(step) * 4.0
+            if let impact = simulateImpact(
+                power: candidateP,
+                angleDeg: safeAngle,
+                directedWind: safeWind,
+                deltaYUnits: deltaYUnits
+            ), impact.range >= safeDistance {
+                loPower = Double(step - 1) * 4.0
+                hiPower = candidateP
+                foundBracket = true
+                break
+            }
+        }
 
-        guard denominator > 0.0001 else {
+        guard foundBracket else {
             return 100.0
         }
-        guard numerator > 0.0 else {
-            return 0.0
+
+        for _ in 0..<32 {
+            let mid = 0.5 * (loPower + hiPower)
+            if let impact = simulateImpact(
+                power: mid,
+                angleDeg: safeAngle,
+                directedWind: safeWind,
+                deltaYUnits: deltaYUnits
+            ), impact.range >= safeDistance {
+                hiPower = mid
+            } else {
+                loPower = mid
+            }
         }
 
-        let tSquared = numerator / denominator
-        let flightTime = sqrt(tSquared)
-        guard flightTime > 0.0001 else {
-            return 0.0
-        }
-
-        let initialVelocity = (distance - 0.5 * windAcceleration * tSquared) / (flightTime * cosTheta)
-        guard initialVelocity.isFinite else {
-            return 0.0
-        }
-
-        return min(max(initialVelocity, 0.0), 100.0)
+        let solved = 0.5 * (loPower + hiPower)
+        return solved.isFinite ? min(max(solved, 0.0), 100.0) : 0.0
     }
 
-    /// Sinh 30 điểm quỹ đạo parabol chuẩn hóa `0.0 - 1.0` nối chính xác từ `(playerX, playerY)` tới `(enemyX, enemyY)`.
-    public func generateTrajectoryPoints(
+    /// Sinh 30 điểm quỹ đạo parabol thực tế trong hệ tọa độ Minimap (`0.0 - 1.0`) nối từ người chơi tới mục tiêu.
+    public func generateMinimapTrajectoryPoints(
         playerX: Double,
         playerY: Double,
         enemyX: Double,
         enemyY: Double,
+        cameraWidthNorm: Double,
+        minimapAspectHOverW: Double,
         angleDeg: Double,
         signedWind: Double,
         power: Double
     ) -> [TrajectoryPoint] {
         let stepCount = 30
-        let px = min(max(playerX, 0.06), 0.94)
-        let ex = min(max(enemyX, 0.06), 0.94)
-
-        // Ánh xạ tọa độ đứng vào nửa dưới khung ngắm để dành khoảng trống phía trên cho đỉnh parabol.
-        let py = 0.42 + min(max(playerY, 0.0), 1.0) * 0.48
-        let ey = 0.42 + min(max(enemyY, 0.0), 1.0) * 0.48
-
-        let dx = ex - px
-        let dyUp = py - ey
+        let safeCamW = min(max(cameraWidthNorm, 0.08), 0.95)
+        let safeAspect = min(max(minimapAspectHOverW, 0.35), 2.5)
         let safeAngle = min(max(angleDeg, 10.0), 85.0)
-        let theta = safeAngle * .pi / 180.0
+        let safePower = min(max(power, 1.0), 100.0)
 
-        // Độ cao vồng parabol tỉ lệ với góc bắn và lực bắn, giữ đỉnh luôn >= 0.06 trong khung vẽ.
-        let desiredRise = max(abs(dx) * tan(theta) * 0.24, 0.14) + (power / 100.0) * 0.08
-        let highestEndpoint = min(py, ey)
-        let maxSafeRise = max(highestEndpoint - 0.07, 0.05)
-        let archRise = min(desiredRise, maxSafeRise)
+        let shotSign = enemyX >= playerX ? 1.0 : -1.0
+        let directedWind = min(max(signedWind * shotSign, -5.0), 5.0)
+        let deltaYUnits = ((playerY - enemyY) * safeAspect / safeCamW) * Self.unitsPerScreen
 
-        // Độ uốn ngang theo gió có hướng.
-        let windBend = -0.025 * signedWind * max(abs(dx), 0.15)
+        let flightTime: Double
+        if let impact = simulateImpact(
+            power: safePower,
+            angleDeg: safeAngle,
+            directedWind: directedWind,
+            deltaYUnits: deltaYUnits
+        ) {
+            flightTime = max(impact.flightTime, 0.12)
+        } else {
+            let theta = safeAngle * .pi / 180.0
+            let estimatedT = (2.0 * safePower * sin(theta)) / Self.gravity
+            flightTime = max(estimatedT, 0.25)
+        }
+
+        let endPhys = positionAt(
+            time: flightTime,
+            power: safePower,
+            angleDeg: safeAngle,
+            directedWind: directedWind
+        )
+        let endNormX = playerX + shotSign * (endPhys.x / Self.unitsPerScreen) * safeCamW
+        let endNormY = playerY - (endPhys.y / Self.unitsPerScreen) * safeCamW / safeAspect
+        let residualX = enemyX - endNormX
+        let residualY = enemyY - endNormY
 
         var points: [TrajectoryPoint] = []
         points.reserveCapacity(stepCount)
 
         for i in 0..<stepCount {
             let u = Double(i) / Double(stepCount - 1)
-            let arcFactor = 4.0 * u * (1.0 - u)
-            let x = min(max(px + dx * u + windBend * arcFactor, 0.03), 0.97)
-            let y = min(max(py - dyUp * u - archRise * arcFactor, 0.05), 0.95)
-            points.append(TrajectoryPoint(x: x, y: y))
+            let t = u * flightTime
+            let pos = positionAt(
+                time: t,
+                power: safePower,
+                angleDeg: safeAngle,
+                directedWind: directedWind
+            )
+            let rawX = playerX + shotSign * (pos.x / Self.unitsPerScreen) * safeCamW + u * residualX
+            let rawY = playerY - (pos.y / Self.unitsPerScreen) * safeCamW / safeAspect + u * residualY
+            points.append(
+                TrajectoryPoint(
+                    x: min(max(rawX, 0.01), 0.99),
+                    y: min(max(rawY, 0.02), 0.98)
+                )
+            )
         }
 
         return points
     }
 
-    /// Tính hoàn chỉnh `power` và 30 điểm parabol thành `TelemetryData`.
+    /// Tính hoàn chỉnh cự ly (`distanceUnits`), độ lệch cao (`deltaYUnits`), lực bắn (`power`), làm mượt EMA và đóng gói `TelemetryData`.
     public func buildTelemetry(
         frameId: Int,
         playerX: Double,
         playerY: Double,
         enemyX: Double,
         enemyY: Double,
+        enemies: [NormalizedPoint] = [],
+        lockedEnemyIndex: Int = 0,
+        cameraRect: NormalizedRect? = nil,
+        cameraWidthNorm: Double = 0.38,
+        minimapAspectHOverW: Double = 0.72,
         angle: Double,
         windMagnitude: Double,
-        windDir: Int
+        windDir: Int,
+        minimapJPEG: Data? = nil,
+        smoother: BallisticsEMASmoother? = nil,
+        targetSwitched: Bool = false
     ) -> TelemetryData {
+        let safeCamW = min(max(cameraWidthNorm, 0.08), 0.95)
+        let safeAspect = min(max(minimapAspectHOverW, 0.35), 2.5)
         let safeDir = windDir < 0 ? -1 : 1
-        let signedWind = abs(windMagnitude) * Double(safeDir)
-        let dx = enemyX - playerX
-        let dy = playerY - enemyY
+        let signedWind = min(max(abs(windMagnitude), 0.0), 5.0) * Double(safeDir)
+        let safeAngle = min(max(angle, 10.0), 85.0)
 
-        let power = calculatePower(
-            dx: dx,
-            dy: dy,
-            angle: angle,
-            signedWind: signedWind
+        let rawDistanceUnits = (abs(enemyX - playerX) / safeCamW) * Self.unitsPerScreen
+        let rawDeltaYUnits = ((playerY - enemyY) * safeAspect / safeCamW) * Self.unitsPerScreen
+        let shotSign = enemyX >= playerX ? 1.0 : -1.0
+        let rawPower = calculatePower(
+            distanceUnits: rawDistanceUnits,
+            deltaYUnits: rawDeltaYUnits,
+            angle: safeAngle,
+            directedWind: signedWind * shotSign
         )
 
-        let points = generateTrajectoryPoints(
-            playerX: playerX,
-            playerY: playerY,
-            enemyX: enemyX,
-            enemyY: enemyY,
-            angleDeg: angle,
+        let resolved: SmoothedBallistics
+        if let smoother {
+            resolved = smoother.smooth(
+                playerX: playerX,
+                playerY: playerY,
+                enemyX: enemyX,
+                enemyY: enemyY,
+                distanceUnits: rawDistanceUnits,
+                deltaYUnits: rawDeltaYUnits,
+                power: rawPower,
+                targetSwitched: targetSwitched
+            )
+        } else {
+            resolved = SmoothedBallistics(
+                playerX: playerX,
+                playerY: playerY,
+                enemyX: enemyX,
+                enemyY: enemyY,
+                distanceUnits: rawDistanceUnits,
+                deltaYUnits: rawDeltaYUnits,
+                power: rawPower
+            )
+        }
+
+        let points = generateMinimapTrajectoryPoints(
+            playerX: resolved.playerX,
+            playerY: resolved.playerY,
+            enemyX: resolved.enemyX,
+            enemyY: resolved.enemyY,
+            cameraWidthNorm: safeCamW,
+            minimapAspectHOverW: safeAspect,
+            angleDeg: safeAngle,
             signedWind: signedWind,
-            power: power
+            power: resolved.power
         )
+
+        let finalEnemies = enemies.isEmpty
+            ? [NormalizedPoint(x: resolved.enemyX, y: resolved.enemyY)]
+            : enemies
+        let clampedLockedIndex = min(max(lockedEnemyIndex, 0), max(finalEnemies.count - 1, 0))
 
         return TelemetryData(
             frameId: frameId,
-            playerX: playerX,
-            playerY: playerY,
-            enemyX: enemyX,
-            enemyY: enemyY,
-            angle: angle,
+            playerX: resolved.playerX,
+            playerY: resolved.playerY,
+            enemyX: resolved.enemyX,
+            enemyY: resolved.enemyY,
+            enemies: finalEnemies,
+            lockedEnemyIndex: clampedLockedIndex,
+            cameraRect: cameraRect,
+            cameraWidthNorm: safeCamW,
+            distanceUnits: resolved.distanceUnits,
+            deltaYUnits: resolved.deltaYUnits,
+            angle: safeAngle,
             wind: abs(windMagnitude),
             windDir: safeDir,
-            power: power,
-            trajectoryPoints: points
+            power: resolved.power,
+            trajectoryPoints: points,
+            minimapJPEG: minimapJPEG
         )
+    }
+
+    // MARK: - Projectile Motion Helpers
+
+    private func positionAt(
+        time t: Double,
+        power: Double,
+        angleDeg: Double,
+        directedWind: Double
+    ) -> (x: Double, y: Double) {
+        let theta = angleDeg * .pi / 180.0
+        let vx0 = power * cos(theta)
+        let vy0 = power * sin(theta)
+        let gamma = Self.dragGamma
+        let g = Self.gravity
+        let vw = (directedWind * Self.windAccelPerUnit) / gamma
+
+        let expFactor = 1.0 - exp(-gamma * t)
+        let x = ((vx0 - vw) / gamma) * expFactor + vw * t
+        let y = ((vy0 + g / gamma) / gamma) * expFactor - (g / gamma) * t
+        return (x, y)
+    }
+
+    private func simulateImpact(
+        power: Double,
+        angleDeg: Double,
+        directedWind: Double,
+        deltaYUnits: Double
+    ) -> (range: Double, flightTime: Double)? {
+        guard power > 0.0001 else { return nil }
+
+        let theta = angleDeg * .pi / 180.0
+        let vy0 = power * sin(theta)
+        let gamma = Self.dragGamma
+        let g = Self.gravity
+
+        let tPeak = log((gamma * vy0 + g) / g) / gamma
+        let peakPos = positionAt(time: tPeak, power: power, angleDeg: angleDeg, directedWind: directedWind)
+        guard peakPos.y >= deltaYUnits else {
+            return nil
+        }
+
+        var lo = tPeak
+        var hi = max(tPeak * 2.0, 0.20)
+        while positionAt(time: hi, power: power, angleDeg: angleDeg, directedWind: directedWind).y > deltaYUnits && hi < 40.0 {
+            hi *= 2.0
+        }
+
+        guard positionAt(time: hi, power: power, angleDeg: angleDeg, directedWind: directedWind).y <= deltaYUnits else {
+            return nil
+        }
+
+        for _ in 0..<45 {
+            let mid = 0.5 * (lo + hi)
+            if positionAt(time: mid, power: power, angleDeg: angleDeg, directedWind: directedWind).y > deltaYUnits {
+                lo = mid
+            } else {
+                hi = mid
+            }
+        }
+
+        let tImpact = 0.5 * (lo + hi)
+        let endPos = positionAt(time: tImpact, power: power, angleDeg: angleDeg, directedWind: directedWind)
+        return (endPos.x, tImpact)
     }
 }
